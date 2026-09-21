@@ -12,7 +12,7 @@
      （不需要任何 Bash xdotool/wmctrl）。
 
 运行（**期间不要动鼠标/键盘**，宿主指针零移动是断言前提）：
-  PYTHONNOUSERSITE=1 /home/liufei/anaconda3/envs/cc-comptuer-use/bin/python \
+  PYTHONNOUSERSITE=1 $HOME/anaconda3/envs/cc-computer-use/bin/python \
       tests/manual_sandbox_story.py
   （加 CC_CU_STORY_DIST=1 前缀改为驱动冻结产物 dist/computer-use-mcp）
 退出码 0=全过。real 模式（CC_CU_DISPLAY_MODE=real）下宿主断言无意义，脚本直接拒绝运行。

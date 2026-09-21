@@ -1,6 +1,6 @@
 """
 端到端真实任务测试：通过 MCP stdio 客户端驱动本项目冻结产物（dist/computer-use-mcp），
-完成「打开 gedit → 写一个约100字的故事 → 保存到 /home/liufei/data/temp」。
+完成「打开 gedit → 写一个约100字的故事 → 保存到 ~/data/temp」。
 
 实现逻辑：
   1. 用 mcp 客户端库以 stdio 方式连接冻结的 MCP server（真实协议链路，非进程内调用）。
@@ -19,7 +19,7 @@
   4. 轮询确认目标文件落盘且内容包含故事开头，最后关闭 gedit。
 
 运行：
-  PYTHONNOUSERSITE=1 /home/liufei/anaconda3/envs/cc-comptuer-use/bin/python \
+  PYTHONNOUSERSITE=1 $HOME/anaconda3/envs/cc-computer-use/bin/python \
       tests/manual_gedit_story.py
 """
 
@@ -33,7 +33,8 @@ import subprocess
 import sys
 import time
 
-SAVE_DIR = "/home/liufei/data/temp"
+# 保存目录：默认 ~/data/temp（用户目录随机器而变，勿写死绝对路径）
+SAVE_DIR = os.path.expanduser("~/data/temp")
 SAVE_PATH = os.path.join(SAVE_DIR, "story.txt")
 MCP_BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

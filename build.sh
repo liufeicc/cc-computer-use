@@ -20,7 +20,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 # conda 环境（可用 ENV_NAME 覆盖）
-ENV_NAME="${ENV_NAME:-cc-comptuer-use}"
+ENV_NAME="${ENV_NAME:-cc-computer-use}"
 CONDA_BASE="${CONDA_BASE:-$HOME/anaconda3}"
 PYBIN="$CONDA_BASE/envs/$ENV_NAME/bin"
 PY="$PYBIN/python"

@@ -10,14 +10,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 环境与命令（务必遵守，否则导入/打包必出错）
 
-固定用 conda 环境 `cc-comptuer-use` 的 python（下称 `$PY`）：`$HOME/anaconda3/envs/cc-comptuer-use/bin/python`——具体路径按本机 anaconda 安装位置推导。
+固定用 conda 环境 `cc-computer-use` 的 python（下称 `$PY`）：`$HOME/anaconda3/envs/cc-computer-use/bin/python`——具体路径按本机 anaconda 安装位置推导。
 
-**⚠️ 编译/打包/跑测试一律用这个 conda 环境，绝不用 base 环境**。base 里没有本项目依赖的 `pygobject`/`gi`/PyInstaller 版本组合，用它编译会得到启动即报错（或静默行为不一致）的产物——这类错误很难从报错信息反查到「用错环境」上。凡是调用 python，先显式指定 `$PY` 的绝对路径，或先 `conda activate cc-comptuer-use`，不要依赖当前 shell 的默认 python。
+**⚠️ 编译/打包/跑测试一律用这个 conda 环境，绝不用 base 环境**。base 里没有本项目依赖的 `pygobject`/`gi`/PyInstaller 版本组合，用它编译会得到启动即报错（或静默行为不一致）的产物——这类错误很难从报错信息反查到「用错环境」上。凡是调用 python，先显式指定 `$PY` 的绝对路径，或先 `conda activate cc-computer-use`，不要依赖当前 shell 的默认 python。
 
 **所有命令必须加 `PYTHONNOUSERSITE=1`**：`~/.local` 里装有另一份 `mcp`，会遮蔽 conda 包导致版本错乱（开发与打包都受影响）。
 
 ```bash
-PY=$HOME/anaconda3/envs/cc-comptuer-use/bin/python
+PY=$HOME/anaconda3/envs/cc-computer-use/bin/python
 
 # 自检（不进 stdio 循环，打印 backend 状态/工具/屏幕布局）
 # 注意：isolated 模式（默认）自检会自启 Xephyr 沙箱窗口，进程退出时 atexit 回收
@@ -49,7 +49,7 @@ bash build.sh
 PYTHONNOUSERSITE=1 ./dist/computer-use-mcp --selftest   # 验证冻结产物
 
 # 安装依赖（pygobject 必须走 conda-forge，pip 装不上 gi）
-conda install -n cc-comptuer-use -c conda-forge pygobject -y
+conda install -n cc-computer-use -c conda-forge pygobject -y
 PYTHONNOUSERSITE=1 "$PY" -m pip install -U mcp cryptography pyinstaller pytest python-xlib
 ```
 
@@ -219,7 +219,7 @@ GTK 对话框 `get_extents(SCREEN)` 常返回相对窗口原点的漂移坐标�
 - **`--collect-submodules Xlib` + 显式 `--hidden-import Xlib.ext.shape / Xlib.support.unix_connect`**（点击光圈用）：`Xlib.ext` 的扩展模块（shape 就在其中）是**按扩展名动态导入**的，不出现在任何静态 import 图里——漏了的表现是「开发态一切正常、**只有冻结产物里没有光圈**」。python-xlib 是纯 Python、走 socket 不链 `libX11`，故不引入产物库与系统库混装的风险。守卫测试 `test_ring_and_preview.py::test_build_sh_collects_xlib` 读 build.sh 源码兜住这一点。
 - 入口是根目录的 `entry.py` 而非 `server.py`：后者用相对导入（`from . import _bootstrap`）不能当脚本跑；`entry.py` 只做一件事——绝对导入并调 `server.main()`。
 - `build.sh` 开头 `rm -rf build dist computer-use-mcp.spec computer-use-mcp-bin.spec` 会**清掉整个 dist/**（wrapper 也在内，每次重建），别把它当"增量构建"用。**spec 名必须与 `--name` 一致**：PyInstaller 生成的 spec 是 `name + '.spec'`，故本仓库真正要清的是 **`computer-use-mcp-bin.spec`**——历史上那行只写了 `computer-use-mcp.spec`（**该文件从来不存在**，等于清理动作没做，实测残留的 spec 一直是 `-bin.spec`）；现已两个都删，兼容换过 `--name` 的旧工作区。（M-45）
-- 环境名/路径可用 `ENV_NAME` / `CONDA_BASE` 覆盖，默认 `cc-comptuer-use` + `$HOME/anaconda3`（换机器打包时用得上）。
+- 环境名/路径可用 `ENV_NAME` / `CONDA_BASE` 覆盖，默认 `cc-computer-use` + `$HOME/anaconda3`（换机器打包时用得上）。
 - **冻结产物仍依赖系统提供 `libatspi` / Atspi typelib / xdotool / Xephyr / tesseract** —— 这是已接受的 OS 级依赖，别试图全打进二进制。
 
 ## mcp SDK 版本兼容
