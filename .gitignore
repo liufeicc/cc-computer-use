@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.spec
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# venv
+.venv/
+venv/
+
+# 临时验证脚本
+_tmp_*.py
+
+# 日志
+*.log
+
+# 本机 Claude Code 权限配置（含个人路径与历史命令，不随仓库分发）
+.claude/
+
+# 内部文档：设计过程与代码审查记录，不在公开仓库中分发
+docs/开发计划.md
+docs/PR/
+docs/REVIEW/

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "computer-use-mcp"
+version = "0.1.0"
+description = "让 AGENT 直接使用 Linux 桌面的 MCP server：AT-SPI 无障碍结构化感知 + 元素级操作，替代截图+坐标点击"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "liufei" }]
+license = { text = "MIT" }
+
+# 运行时依赖（pygobject/Atspi 通过 conda-forge 安装，见 README；此处声明纯 Python 依赖）
+dependencies = [
+    "mcp>=1.2",
+    "cryptography",
+    "mss",
+    "pillow",
+    # 点击光圈用（backend/linux/ring.py）：纯 Python 的 X11 客户端，走 socket、不链 libX11，
+    # 故不引入「产物库与系统库混装」那类风险。缺包时只是光圈不显示，点击照常。
+    "python-xlib",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pyinstaller"]
+
+[project.scripts]
+computer-use-mcp = "computer_use_mcp.server:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# gi 的 Atspi 绑定对仍可用的旧 API（get_action_name/get_text）报 DeprecationWarning，
+# 功能正常且无等价新 API，针对性静音以免污染测试输出。
+filterwarnings = [
+    "ignore:.*get_action_name is deprecated:DeprecationWarning",
+    "ignore:.*get_text is deprecated:DeprecationWarning",
+]
