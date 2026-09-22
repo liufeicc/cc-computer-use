@@ -40,8 +40,9 @@ class _StubBackend:
     def list_apps(self): return []
     def screen_layout(self): return {}
     def list_windows(self, limit=100): return []
-    def click_at(self, x, y, button=1, focus_window=True):
+    def click_at(self, x, y, button=1, focus_window=True, **kw):
         self.calls.append(("click", x, y)); return True
+    def drag_at(self, x1, y1, x2, y2, button=1, **kw): return True
     def element_screen_rect(self, n): return None
     def invoke(self, n, action=None): return False
     def screenshot(self, *a, **k): return b"x", {"format": "jpeg"}

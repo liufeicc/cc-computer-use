@@ -56,7 +56,8 @@ class _StubBackend(Backend):
     def invoke(self, n, action=None): return False
     def set_value(self, n, t): return False
     def element_screen_rect(self, n): return None
-    def click_at(self, x, y, button=1, focus_window=True): return True
+    def click_at(self, x, y, button=1, focus_window=True, repeat=1, delay_ms=100): return True
+    def drag_at(self, x1, y1, x2, y2, button=1, steps=10, focus_window=True): return True
     def type_text(self, t): self.calls.append(("type", t)); return self.type_ok
     def press_key(self, c): self.calls.append(("key", c)); return self.key_ok
     def list_windows(self, limit=100): return []

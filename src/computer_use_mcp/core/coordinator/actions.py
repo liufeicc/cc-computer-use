@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ...utils.errors import (
@@ -22,21 +23,31 @@ from ...utils.errors import (
     LEVEL_KEY,
     LEVEL_NONE,
     ActionResult,
+    ComputerUseError,
     ElementNotFoundError,
     InvalidRefError,
 )
 from .hooks import _exclusive_screen, _needs_display
 
+# 连击次数的中文名：回报给模型时用它（「坐标级双击已执行」比「坐标级 2 连击已执行」好读）
+_CLICK_NAMES = {1: "点击", 2: "双击", 3: "三击"}
+
 
 class ActionMixin:
     """点击 / 输入 / 按键（三级降级）。"""
+
+    # 一次滚动最多多少格。滚轮同样走**持屏锁**的坐标通道：`amount=100000` 会让 xdotool
+    # 用 --repeat 发十万次滚轮事件（几十秒起步），把屏锁白白占死。
+    _SCROLL_MAX_AMOUNT = 200
+    # 拖拽插值步数上限。步与步之间还有 hold 秒停顿（见 injector.drag），步数过多会拖成秒级。
+    _DRAG_MAX_STEPS = 200
 
     # ================= 操作（三级降级）=================
     @_needs_display
     @_exclusive_screen
     def click_xy(
         self, x: int, y: int, button: int = 1, preview: bool | None = None,
-        expect: str | None = None,
+        expect: str | None = None, clicks: int = 1,
     ) -> ActionResult:
         """
         裸坐标点击（灰区应用专用：SWT/自绘等无元素树时，LLM 视觉定位后直点）。
@@ -54,6 +65,12 @@ class ActionMixin:
           4. 界面变化——点后同区域像素对比（这一下到底有没有被响应）。
         `preview=None` 跟随环境变量（默认抓）；`preview=False` 则连抓都不抓（零开销，
         代价是上述 1~4 全都没有）。
+
+        `clicks>1` 即连击（双击/三击，供 `double_click` 工具使用）。**双击只能走这条
+        坐标级通道**——AT-SPI 的 do_action 只有 activate/click，没有"双击"这个动作，
+        所以元素级再精准也表达不了它。连击的**间隔由注入层定时**（xdotool --repeat/
+        --delay），与这里的落点证据、OCR、变化对比等开销彻底解耦；本方法自身仍然照常
+        做证据链（双击比单击更怕点偏，反馈一个都不能少）。
         """
         warn = self._sandbox_guard()
         x, y = int(x), int(y)
@@ -71,17 +88,19 @@ class ActionMixin:
         if aim.get("landing_text"):
             ev["text"], ev["conf"] = aim["landing_text"], aim.get("landing_conf")
         payload = (shot.data, shot.meta) if shot is not None else None
+        action_name = _CLICK_NAMES.get(clicks, f"{clicks}连击")
         try:
-            ok = self.backend.click_at(x, y, button=button, focus_window=True)
+            ok = self.backend.click_at(x, y, button=button, focus_window=True,
+                                       repeat=int(clicks))
         except Exception as exc:  # noqa: BLE001
             # 失败恰恰最需要「它本来想点哪、那儿有什么」——评估文字照常给出
-            msg = f"坐标点击失败：{exc}"
+            msg = f"坐标{action_name}失败：{exc}"
             if aim_text:
                 msg += f"｜{aim_text}"
             return ActionResult(ok=False, level=LEVEL_COORD, message=msg,
                                 attempts=[{"level": LEVEL_COORD, "ok": False, "note": str(exc)}],
                                 data={"x": x, "y": y, **ev}, preview=payload)
-        msg = f"坐标级点击已执行 @({x},{y})"
+        msg = f"坐标级{action_name}已执行 @({x},{y})"
         landing = self._format_landing(ev, self._landing(self._INJECT_SETTLE), before_active)
         if landing:
             msg += f"｜{landing}"
@@ -195,6 +214,152 @@ class ActionMixin:
             ok=False, level=LEVEL_NONE,
             message="元素级与坐标级均失败。建议截图人工/视觉确认，或换 text/role 重新定位。",
             attempts=attempts, data={"ref": ref},
+        )
+
+    # ================= 滚动 / 拖拽（裸坐标动作）=================
+    @_needs_display
+    @_exclusive_screen
+    def scroll_xy(
+        self, direction: str = "down", amount: int = 5,
+        x: int | None = None, y: int | None = None,
+        preview: bool | None = None,
+    ) -> ActionResult:
+        """
+        滚动：把指针移到作用点，发 `amount` 格滚轮事件（一格 = 一次 button 4/5）。
+
+        几个刻意的取舍：
+          1. **作用点必须明确**：滚轮事件由 X 发给**指针下那个窗口**，所以「在哪儿滚」
+             决定滚谁。给了 x/y 就用它，否则取**活动窗口中心**——绝不沿用「指针恰好在哪」
+             （那是上一次操作留下的位置，不可预测，排查起来也毫无线索）。
+          2. 上滚=button 4、下滚=button 5；`amount` 格交给注入层的 `--repeat` 一次发出。
+          3. **不聚焦窗口**（focus_window=False）：滚动是在看内容，抢焦点纯属副作用。
+          4. 反馈只给**界面变化百分比**：滚动没有「落点」可言（指针只是作用点），而
+             「内容到底动没动」正是这一下唯一需要确认的事，也正好是不依赖意图的客观信号。
+
+        ⚠️ **滚多远不可预知，别指望一次到位**：一格滚多少内容由**应用**决定（GTK 约 3 行、
+        浏览器按比例、画布应用按像素），故 `amount` 只能给量级。正确用法是「滚一下 →
+        看结果 → 不够再滚」，配合 act_sequence 的 ui_tree/screenshot 步骤一次提交。
+        """
+        word = (direction or "down").strip().lower()
+        if word not in ("up", "down"):
+            raise ComputerUseError(
+                f"scroll 的 direction 只能是 'up' 或 'down'，实际给了 {direction!r}"
+            )
+        amount = int(amount)
+        if amount < 1:
+            raise ComputerUseError(f"scroll 的 amount 至少为 1 格，实际给了 {amount}")
+        if amount > self._SCROLL_MAX_AMOUNT:
+            raise ComputerUseError(
+                f"scroll 的 amount={amount} 超过上限 {self._SCROLL_MAX_AMOUNT} 格；"
+                f"滚动是持屏锁执行的坐标动作，一次滚这么多会长时间占屏"
+            )
+        x, y, src = self._scroll_point(x, y)
+        warn = self._sandbox_guard()
+        # 预览图（注入前抓）：它的**原始图**后面要做点后对比，故与 click_xy 一样只抓一次
+        shot = self._preview_image(x, y, preview)
+        try:
+            ok = self.backend.click_at(x, y, button=4 if word == "up" else 5,
+                                       focus_window=False, repeat=amount)
+        except Exception as exc:  # noqa: BLE001
+            return ActionResult(
+                ok=False, level=LEVEL_COORD, message=f"滚动失败：{exc}",
+                attempts=[{"level": LEVEL_COORD, "ok": False, "note": str(exc)}],
+                data={"x": x, "y": y, "direction": word, "amount": amount},
+            )
+        msg = (f"已向{'上' if word == 'up' else '下'}滚动 {amount} 格 @({x},{y})"
+               f"（作用点：{src}）")
+        time.sleep(self._INJECT_SETTLE)          # 给应用时间处理滚轮事件，再做点后对比
+        change = self._change_from_preview(shot)
+        if change:
+            msg += f"｜{change}"
+        else:
+            # 「没变化」**不等于滚失败**（可能已到列表尽头）。不写清楚的话，模型会把
+            # 它读成失败而反复重试——而重试同样不会有变化，于是白白耗尽轮数。
+            msg += "｜未检出界面变化（可能已到内容尽头，或该处本就无内容可滚）"
+        if warn:
+            msg += f"；{warn}"
+        return ActionResult(
+            ok=ok, level=LEVEL_COORD, message=msg,
+            attempts=[{"level": LEVEL_COORD, "ok": ok,
+                       "note": f"scroll {word} x{amount} @({x},{y})"}],
+            data={"x": x, "y": y, "direction": word, "amount": amount},
+            preview=(shot.data, shot.meta) if shot else None,
+        )
+
+    def _scroll_point(self, x: int | None, y: int | None) -> tuple[int, int, str]:
+        """滚动作用点：显式坐标优先，否则活动窗口中心。返回 (x, y, 来源说明)。"""
+        if x is not None and y is not None:
+            return int(x), int(y), "指定坐标"
+        rect = self.backend.active_window_rect()
+        if rect is not None and not rect.is_empty():
+            cx, cy = rect.center
+            return cx, cy, "活动窗口中心"
+        raise ComputerUseError(
+            "scroll 需要 x/y 指明「在哪儿滚」，或至少有一个可用的活动窗口；"
+            "当前既未给坐标、也取不到活动窗口矩形"
+        )
+
+    @_needs_display
+    @_exclusive_screen
+    def drag_xy(
+        self, x1: int, y1: int, x2: int, y2: int, button: int = 1,
+        steps: int = 10, preview: bool | None = None,
+    ) -> ActionResult:
+        """
+        拖拽：从 (x1,y1) 按下、拖到 (x2,y2) 抬起。
+
+        实现逻辑：
+          1. 起点**落点证据**（注入前抓）——拖拽最典型的失败是**抓错起点**（抓到别的控件、
+             或没抓住手柄），而终点由参数给定、不会有歧义，故证据只取起点。
+          2. 预览图（起点）→ 注入 → 点后变化对比：与 click_xy 同一套，且复用同一次抓屏。
+          3. 插值与节奏控制在 `injector.drag`（必须插值、必须拼成一条命令，理由见那里）。
+
+        ⚠️ 失败**不重试**（与 click_xy 的 M-34 分支不同）：重试一次拖拽 = 对同一目标
+        再拖一遍（文件移动两次、画两笔），后果不对称，故直接报失败让模型重新感知。
+        """
+        steps = int(steps)
+        if steps < 1:
+            raise ComputerUseError(f"drag 的 steps（插值步数）至少为 1，实际给了 {steps}")
+        if steps > self._DRAG_MAX_STEPS:
+            raise ComputerUseError(
+                f"drag 的 steps={steps} 超过上限 {self._DRAG_MAX_STEPS}；"
+                f"步数过多会让这次拖拽拖成秒级（每步之间还有停顿）"
+            )
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        if (x1, y1) == (x2, y2):
+            raise ComputerUseError("drag 的起点与终点相同，构不成拖拽（按住又原地松开）")
+        warn = self._sandbox_guard()
+        before_active = self._landing().get("active_window")
+        shot = self._preview_image(x1, y1, preview)
+        # 起点的落点文字由裁剪预览图 OCR 得出（同一份像素复用）；没有预览图时退回小块 OCR
+        ev = self._point_evidence(x1, y1, with_text=shot is None)
+        try:
+            ok = self.backend.drag_at(x1, y1, x2, y2, button=button, steps=steps)
+        except Exception as exc:  # noqa: BLE001
+            msg = f"拖拽失败：{exc}"
+            landing = self._format_landing(ev, {}, before_active)
+            if landing:
+                msg += f"｜{landing}"
+            return ActionResult(
+                ok=False, level=LEVEL_COORD, message=msg,
+                attempts=[{"level": LEVEL_COORD, "ok": False, "note": str(exc)}],
+                data={"x1": x1, "y1": y1, "x2": x2, "y2": y2, **ev},
+            )
+        msg = f"已拖拽 ({x1},{y1}) → ({x2},{y2})"
+        landing = self._format_landing(ev, self._landing(self._INJECT_SETTLE), before_active)
+        if landing:
+            msg += f"｜{landing}"
+        change = self._change_from_preview(shot)     # 必须在 settle 之后
+        if change:
+            msg += f"｜{change}"
+        if warn:
+            msg += f"；{warn}"
+        return ActionResult(
+            ok=ok, level=LEVEL_COORD, message=msg,
+            attempts=[{"level": LEVEL_COORD, "ok": ok,
+                       "note": f"drag ({x1},{y1})->({x2},{y2}) steps={steps}"}],
+            data={"x1": x1, "y1": y1, "x2": x2, "y2": y2, **ev},
+            preview=(shot.data, shot.meta) if shot else None,
         )
 
     @_needs_display

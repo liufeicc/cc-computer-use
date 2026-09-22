@@ -21,7 +21,7 @@ at the root:
 
 ---
 
-## 1. Capabilities (14 MCP tools)
+## 1. Capabilities (17 MCP tools)
 
 | Tool | Purpose |
 |------|---------|
@@ -33,7 +33,10 @@ at the root:
 | `get_last_click_image` | **Look back** at the most recent coordinate click (`index=-1` latest, `-2` before that). When a click produces no visible reaction, inspect where it actually landed before blindly clicking again |
 | `type_text` | Input: element-level `set_value` first, keyboard injection as fallback. Reports the active window after typing, so a stolen focus is immediately visible |
 | `press_key` | Key combos (`ctrl+s`, `alt+F4`, …); reports the active window afterwards |
-| `act_sequence` | Batch a run of actions in one call (click / type / key / wait / sleep / list_windows / **screenshot**), saving round trips. Putting `screenshot` last returns "what it looks like now" **inside the same call** |
+| `act_sequence` | Batch a run of actions in one call (click / type / key / wait / sleep / list_windows / **ui_tree** / **screenshot**) — the main round-trip saver. Putting `ui_tree` or `screenshot` last returns "what the screen looks like now" **inside the same call**. `click` also accepts a **list of candidate names** (`["Save","保存"]`): the first one that actually exists is clicked and the rest are never tried |
+| `double_click` | **Double click** — coordinate-level only, because element-level actions have no double-click semantics, so you must pass screen coordinates. The two clicks are timed server-side (100 ms, far below the ~400 ms system threshold), so it genuinely *is* a double click; two separate `click` calls never are |
+| `scroll` | Scroll at a point. `direction` is up/down; `amount` is in **detents** (one wheel event = one detent; there is no half detent). ⚠️ How far a detent scrolls is decided by the *app* (GTK ≈ 3 lines), so the pattern is scroll → look → scroll again — batch it with `ui_tree`/`screenshot` in one `act_sequence` |
+| `drag` | Drag from `(from_x,from_y)` to `(to_x,to_y)`. Interpolates a run of intermediate moves — a single teleporting move is not recognised as a drag by many apps |
 | `launch_app` | Launch an app on the target display (the proper way to get an app into the sandbox) |
 | `list_windows` | Visible windows (id / title / PID / geometry, largest first) |
 | `wait_window` | Wait until a window title matches (server-side polling, single call) |
@@ -54,9 +57,11 @@ at the root:
   call `get_last_click_image` before retrying — never repeat clicks blindly.
 - **Batch any predictable sequence into a single `act_sequence`.** Every extra call costs a
   model-think + read-result round trip (30–70 s measured). Split calls only when you need to branch
-  on the result.
+  on the result. Unsure what the target is called? Pass a **list of candidate names**
+  (`text: ["Save","保存"]`) — the server tries them in order and stops at the first one that exists,
+  instead of spending one round trip per guess.
 
-### Two mechanisms that save round trips
+### Three mechanisms that save round trips
 
 1. **Landing evidence** — the return value of a coordinate click or key injection only tells you the
    event was *sent* (xdotool has no idea what it hit). So clicks also report:
@@ -69,10 +74,17 @@ at the root:
    The model immediately knows it hit "OK" and the dialog really closed — **no confirming screenshot
    needed**. (Element-level `do_action` doesn't need this; there is no "did it hit" question.)
 
-2. **The `screenshot` step of `act_sequence`** — two thirds of screenshots in the measured session
-   existed purely to confirm a preceding sequence. Moving them into the last step of the same call
-   eliminates that round trip entirely. The image is returned as an extra image content block
-   alongside the step log.
+2. **The `ui_tree` and `screenshot` steps of `act_sequence`** — "open a menu → read what's in it"
+   used to take two calls. Two thirds of the screenshots in the measured session existed purely to
+   confirm a preceding sequence. Both now fold into the same call: **`ui_tree` for structure**
+   (text, cheap), **`screenshot` for pixels** (expensive — grey-area apps with no tree have only
+   this option). The image comes back as an extra image content block alongside the step log.
+
+3. **The server nudges the model to batch.** The MCP `instructions` handed to the model at session
+   start state the rule outright: one round trip costs 30–70 s while the action itself takes
+   fractions of a second, so consecutive actions that don't depend on the previous result belong in
+   one `act_sequence`. Without that nudge the model reads a step-by-step workflow and defaults to one
+   call per action — which is exactly what the 96% round-trip overhead above consists of.
 
 ### Click feedback: the ring, the crosshair, the computed offset
 
@@ -310,11 +322,11 @@ Once connected you can give natural-language tasks, for example:
 
 ```bash
 # Unit tests (no desktop needed): geometry calibration / ref mapping / serializer denoising /
-# injection and sandbox logic. 293 tests collected; without the e2e flag: 287 passed, 6 skipped
+# injection and sandbox logic. 308 tests collected; without the e2e flag: 302 passed, 6 skipped
 PYTHONNOUSERSITE=1 python -m pytest -q
 
 # End-to-end (needs X11 + zenity + Xephyr): runs INSIDE the sandbox by default, never touching the
-# real desktop; requires explicit opt-in. 293 passed
+# real desktop; requires explicit opt-in. 308 passed
 CC_CU_E2E=1 PYTHONNOUSERSITE=1 python -m pytest -q
 
 # Manual stories (6 of them; full list in docs/安装说明.md §5.4)
@@ -344,7 +356,7 @@ Claude Code / MCP client
         │ MCP protocol (stdio, JSON-RPC)
 ┌───────▼──────────────────────────────────────────┐
 │  server.py   (FastMCP/MCPServer entry)            │
-│  tools/          14 tool definitions (schema +    │
+│  tools/          17 tool definitions (schema +    │
 │                  guiding descriptions)            │
 │  core/coordinator   semantic orchestration: the   │
 │                     three-tier fallback           │
@@ -433,7 +445,7 @@ modules by responsibility. Their public namespaces are unchanged (`display.MANAG
 ## Roadmap
 
 - ✅ **Phase 0** Feasibility verification (`demo/`)
-- ✅ **Phase 1** Linux MVP (this project: 14 tools + backend + core + packaging)
+- ✅ **Phase 1** Linux MVP (this project: 17 tools + backend + core + packaging)
 - ✅ **Phase 1.5** Isolation sandbox (Xephyr virtual screen by default + private AT-SPI bus + `launch_app`)
 - ⬜ **Phase 2** Precision hardening + token optimization (tree diffing, uinput, focus handling)
 - ⬜ **Phase 3** Windows backend (UIA + SendInput)

@@ -27,6 +27,9 @@ class CoordinatorBase:
         # act_sequence 内的截图计数（M-46）。放在实例上而不是每个调用一个局部变量，
         # 是为了让直接调 _run_seq_step 的路径也受同一个上限约束（act_sequence 会重置它）。
         self._seq_shots = 0
+        # 同上的**读树**计数：`{op:"ui_tree"}` 每步都会把一整棵树塞进响应，
+        # 50 步 × 400 节点足够把一次响应撑爆，故与截图同一套思路单独设限。
+        self._seq_trees = 0
 
     def _require_sandbox(self, op: str) -> None:
         """

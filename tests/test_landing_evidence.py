@@ -54,7 +54,7 @@ def test_click_xy_reports_landing_evidence_with_text(monkeypatch):
     order: list[str] = []
     orig_dp, orig_click = backend.describe_point, backend.click_at
     backend.describe_point = lambda x, y, with_text=False: (order.append("describe"), orig_dp(x, y, with_text))[1]
-    backend.click_at = lambda x, y, button=1, focus_window=True: (order.append("click"), orig_click(x, y, button, focus_window))[1]
+    backend.click_at = lambda x, y, button=1, focus_window=True, **kw: (order.append("click"), orig_click(x, y, button, focus_window, **kw))[1]
 
     coord = Coordinator(backend=backend)
     r = coord.click_xy(875, 578)

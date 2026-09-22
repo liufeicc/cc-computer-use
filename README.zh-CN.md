@@ -17,7 +17,7 @@
 
 ---
 
-## 一、能力概览（14 个 MCP 工具）
+## 一、能力概览（17 个 MCP 工具）
 
 | 工具 | 作用 |
 |------|------|
@@ -29,7 +29,10 @@
 | `get_last_click_image` | **回看**最近一次坐标点击的准星小图与结论（`index=-1` 最近、`-2` 上上次）。点击后界面没反应时先用它看清「刚才点在哪、偏了多少、该点哪」，**别盲目重复点击** |
 | `type_text` | 输入：元素级 `set_value` 优先，键盘注入兜底。键盘注入会回报输入后的活动窗口（焦点被抢走时一眼可见） |
 | `press_key` | 快捷键（如 `ctrl+s`、`alt+F4`），回报按键后的活动窗口 |
-| `act_sequence` | 一次调用批量执行一串动作（click/type/key/wait/sleep/list_windows/**screenshot**），省往返。最后一步放 `screenshot` 可**在同一次调用里**拿到「做完之后长什么样」 |
+| `act_sequence` | 一次调用批量执行一串动作（click/type/key/wait/sleep/list_windows/**ui_tree**/**screenshot**），**省往返的主力**。最后一步放 `ui_tree` 或 `screenshot`，可**在同一次调用里**拿到「做完之后界面长什么样」。`click` 还支持**候选名列表**（`["保存","Save"]`）：按顺序找第一个真实存在的就点，后面的不再试 |
+| `double_click` | **双击**（**只能走坐标级**——元素级动作没有双击语义，所以要给屏幕绝对坐标）。两次点击的间隔由服务端定时（100ms，远小于系统约 400ms 的阈值），因此**必定构成双击**；用两次 `click` 代替则永远不是 |
+| `scroll` | 在指定点滚动。`direction` 为 up/down，`amount` 是**刻度数**（一次滚轮事件 = 一格，没有半格）。⚠️ 一格滚多远由**应用**决定（GTK 约 3 行），所以正解是「滚一下 → 看结果 → 不够再滚」，配合 `act_sequence` 与 `ui_tree`/`screenshot` 放进同一次调用 |
+| `drag` | 从 `(from_x,from_y)` 拖到 `(to_x,to_y)`。中间自动插值出一串连续移动——直接瞬移的话，很多应用判定不出「按住拖动」，表现为拖了但没反应 |
 | `launch_app` | 在目标 display 启动应用（隔离模式=把应用放进沙箱的正路） |
 | `list_windows` | 可见窗口清单（id/标题/PID/几何，按面积降序） |
 | `wait_window` | 等窗口标题满足条件（server 内轮询，单次调用完成） |
@@ -41,9 +44,9 @@
 - **有元素树的应用**：`launch_app` 起应用 → `get_ui_tree` 看结构 → 找到目标 `[ref]`（或 `find_element` 搜）→ `click(ref)` / `type_text(ref)`。
 - **灰区应用**（SWT/Java、自绘控件、游戏、远程桌面——无元素树）：`get_screen_text` 读出文字与坐标 → `click(ref)` 或 `click(x=..,y=..)`。**不要**默认截图让模型自己估坐标：实测一条 DBeaver 任务 8.3 分钟里，工具只占 21 秒，其余 478 秒全花在「看图 → 估像素 → 换算坐标」上。
 - **拿不准坐标时带上 `expect`**：`click(x=512, y=384, expect="保存")` —— 程序会算出「离『保存』中心偏了多少、该改点哪个坐标」，直接照抄建议坐标重试即可；点了没反应先 `get_last_click_image` 回看，别盲目重复点击。
-- **能预判的连续动作，一律一次 `act_sequence` 提交**。每多一次单独调用就多一个「模型思考 + 读结果」的来回（实测每轮 30~70 秒）；只有需要看结果做分支判断时才拆开。
+- **能预判的连续动作，一律一次 `act_sequence` 提交**。每多一次单独调用就多一个「模型思考 + 读结果」的来回（实测每轮 30~70 秒）；只有需要看结果做分支判断时才拆开。**不确定目标叫什么**时给**候选名列表**（`text: ["保存","Save"]`）——服务端按顺序找、命中即停，不必每个猜测各花一个来回。
 
-### 省往返的两条机制
+### 省往返的三条机制
 
 1. **落点证据**——坐标级点击/键盘注入的返回值只说明「事件发出去了」（xdotool 不关心点到了什么）。因此点击会一并回报：
 
@@ -55,7 +58,9 @@
    模型据此立刻知道「点中了『确定』、且窗口确实关了」，**不需要再截一张图确认**。
    （元素级 `do_action` 不需要这个——它不存在「点没点中」的疑问。）
 
-2. **`act_sequence` 的 `screenshot` 步骤**——实测任务里三分之二的截图纯粹是「确认刚才那串动作」，放到同一次调用的最后一步即可省掉整个来回。图像作为额外的 image content block 与步骤日志一起返回。
+2. **`act_sequence` 的 `ui_tree` / `screenshot` 步骤**——「点开菜单 → 读菜单里有什么」原先也得拆成两次调用；实测任务里另外三分之二的截图纯粹是「确认刚才那串动作」。现在两者都能折进同一次调用，分工是**看结构用 `ui_tree`（文本、便宜），看像素才用 `screenshot`（贵；无元素树的灰区应用只有这条路）**。图像作为额外的 image content block 与步骤日志一起返回。
+
+3. **服务端会主动引导模型批量提交**——会话开始时下发给模型的 MCP `instructions` 里写明了这条规则：一次往返要 30~70 秒而动作本身只要零点几秒，所以「下一步不依赖上一步结果」的连续动作就该放进一次 `act_sequence`。没有这段引导，模型读到的是逐步工作流，默认就会一个动作一次调用——那正是上面那 96% 往返开销的来源。
 
 ### 点击反馈：光圈（给人看）+ 准星图（给模型看）+ 程序算偏差
 
@@ -241,11 +246,11 @@ PYTHONNOUSERSITE=1 ./dist/computer-use-mcp --selftest
 
 ```bash
 # 单元测试（无需桌面）：geometry 校准 / refs 映射 / serializer 去噪 / 注入与沙箱逻辑
-# 全量收集 293 项；不带 e2e 开关时 287 passed / 6 skipped（端到端自动 skip）
+# 全量收集 308 项；不带 e2e 开关时 302 passed / 6 skipped（端到端自动 skip）
 PYTHONNOUSERSITE=1 python -m pytest -q
 
 # 端到端（需 X11 + zenity + Xephyr）：默认在**沙箱内**跑，不碰真实桌面；需显式 opt-in
-# 293 passed
+# 308 passed
 CC_CU_E2E=1 PYTHONNOUSERSITE=1 python -m pytest -q
 
 # 手动 story（共 6 个，完整清单见 docs/安装说明.md §5.4）
@@ -270,7 +275,7 @@ Claude Code / MCP 客户端
         │ MCP 协议 (stdio, JSON-RPC)
 ┌───────▼──────────────────────────────────────────┐
 │  server.py  (FastMCP/MCPServer 入口)               │
-│  tools/      14 个工具定义（schema + 引导 description）│
+│  tools/      17 个工具定义（schema + 引导 description）│
 │  core/coordinator   语义编排：三级降级               │
 │  core/serializer    树→紧凑文本（省 token）+ ref 分配 │
 │  core/geometry      坐标校准（窗口绝对 + 元素相对）    │

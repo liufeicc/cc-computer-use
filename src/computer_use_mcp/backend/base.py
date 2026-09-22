@@ -168,6 +168,12 @@ class QueryResult:
     notice: str = ""
 
 
+# X11 鼠标按钮号。工具层（tools/mouse.py）与 act_sequence 的 op 都收**语义名**
+# （left/middle/right），在这里统一翻译成按钮号——两处各写一份映射迟早漂移
+# （改了一处另一处不动，而 2=中键、3=右键这种编号没人记得住，错了也不显眼）。
+BUTTON_NUMBERS = {"left": 1, "middle": 2, "right": 3}
+
+
 class Backend(ABC):
     """平台后端抽象契约。"""
 
@@ -258,8 +264,31 @@ class Backend(ABC):
         """元素屏幕绝对矩形（已校准），供坐标兜底使用。"""
 
     @abstractmethod
-    def click_at(self, x: int, y: int, button: int = 1, focus_window: bool = True) -> bool:
-        """坐标点击（兜底）。focus_window=True 时先激活/聚焦所在窗口。"""
+    def click_at(
+        self, x: int, y: int, button: int = 1, focus_window: bool = True,
+        repeat: int = 1, delay_ms: int = 100,
+    ) -> bool:
+        """
+        坐标点击（兜底）。focus_window=True 时先激活/聚焦所在窗口。
+
+        `repeat>1` = 连击（双击/三击），`delay_ms` 是连击间隔；滚轮走同一条通道
+        （button 4=上滚 / 5=下滚，`repeat` 即格数）。**连击间隔必须由注入层定时**
+        （xdotool `--repeat/--delay`），不能让调用方连调两次——理由见
+        `linux/inject/pointer.py` 的 click_at：两次独立调用之间必然夹着 0.5s 级的
+        落点证据开销，超过双击阈值，系统会认成两次单击。
+        """
+
+    @abstractmethod
+    def drag_at(
+        self, x1: int, y1: int, x2: int, y2: int, button: int = 1,
+        steps: int = 10, focus_window: bool = True,
+    ) -> bool:
+        """
+        坐标拖拽：起点按下 → 插值分步移动 → 终点抬起。
+
+        `steps` 是中间插值点数，**不能省**：只发一个移动事件时很多应用判定不出
+        「按住拖动」，表现是「拖了但没反应」而底层 rc=0（看着成功）。
+        """
 
     @abstractmethod
     def type_text(self, text: str) -> bool:

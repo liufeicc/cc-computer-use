@@ -26,8 +26,8 @@ PY=$HOME/anaconda3/envs/cc-computer-use/bin/python
 #    现已改走 X11 才真正安全——**改动时务必不要把 AT-SPI 应用枚举加回 selftest**。
 PYTHONNOUSERSITE=1 "$PY" -m computer_use_mcp.server --selftest
 
-# 全量测试（共 293 项；单测无需桌面，端到端需 X11 + zenity + Xephyr，不满足自动 skip）
-# ✅ 两条路径都全绿：默认 287 passed / 6 skipped；下面带 e2e 开关的 293 passed
+# 全量测试（共 309 项；单测无需桌面，端到端需 X11 + zenity + Xephyr，不满足自动 skip）
+# ✅ 两条路径都全绿：默认 303 passed / 6 skipped；下面带 e2e 开关的 309 passed
 PYTHONNOUSERSITE=1 "$PY" -m pytest -q
 
 # e2e 需显式 opt-in（默认在沙箱内跑、不碰真实桌面）
@@ -82,7 +82,14 @@ SWT/Java、自绘控件、游戏、远程桌面**没有无障碍树**（或树�
 
 - **`get_screen_text`（首选）**：`ocr.py` 用 tesseract 把屏幕变成「`[ref] 文字 @ (x,y)`」文本，模型读文字即可定位，坐标是**算出来的不是猜的**；文本块注册进同一张 `RefTable`（`backend/base.py` 的 `TextBlock`），故 `click(ref=N)` 与元素级 ref 用法一致。**`element_info`（返回 `ElementDetail`）与 `element_screen_rect` 都对 TextBlock 做了分支**——它没有元素级动作，`invoke/set_value` 一律返回 False，**让 coordinator 正常降级到坐标点击**（`element_screen_rect` 直接返回它自带的 rect，即屏幕绝对坐标，**不套用 geometry 校准**，那套是给 GTK 相对坐标漂移用的）。`screenshot` **没有** `native` 参数，本不需要分支。（D-2/M-29）
   - **范围默认 `scope='window'`（只识别活动窗口）**：实测全屏密集文字 8~10s，而对话框大小只要 0.3~3s。别默认全屏。
-  - **耗时**：全屏 8~10s、对话框 0.3s（视文字量）。这是 OCR 的固有成本，换的是模型侧从 30~70s 降到几秒。
+  - **耗时**：全屏 8~10s（**1600x1000 沙箱屏**）、对话框 0.3s（视文字量）。这是 OCR 的固有成本，换的是模型侧从 30~70s 降到几秒。⚠️ 该数值**只对小屏成立**：耗时随面积超线性增长，宿主 3840x1200 全屏实测 30s。别拿它估算大屏。
+  - **tesseract 必须限单线程（`OMP_THREAD_LIMIT=1`，2026-09-22 实测）**：加这一条白捡约 **2 倍**，且**识别结果逐字不变**（对照实验里词数完全相同）。原因是 tesseract 内部用 OpenMP `num_threads()` 子句并行流水线的一段，而**该子句会覆盖 `OMP_NUM_THREADS`**——只设 NUM_THREADS 拦不住，只有 `OMP_THREAD_LIMIT` 这个硬上限能。线程数扫描（1/2/4/8/22）显示**线程越多越慢**（22 线程慢一倍）：单张图是有状态流水线（二值化 → 连通域 → 版面分析 → 逐行识别），只有末段可并行，多给的线程只换来同步开销。实测宿主全屏 47.1s → 29.9s（真实代码路径 ABBA 对照）。
+    - **它还消掉一个失败模式**：`_TIMEOUT=60s` 在改前**会被撞到**（实测第二轮就超时抛错），改后 30s 有充裕余量。
+    - **⚠️ 别改成「并行跑多个 tesseract 子进程」提速**：那是另一条路，需先解决重叠区去重与稀疏内容丢字（实测稀疏图分块丢 30% 的词），收益不稳，**未落地**。
+    - 守卫 `test_tesseract_is_invoked_single_threaded` 断言的是**实际传给 subprocess 的 env 取值**（不是「模块里有个常量」），故「常量还在、调用点没用它」也拦得住。注意 `test_spawn_env.py` 的反射扫描只认 `env=` **直接源自** `env_for`/`app_env`——所以这条必须在**调用点**叠加，不能藏进 `_tess_env()` 之类的包装函数里（实测会被那条结构性守卫打红）。
+  - **喂给 tesseract 的 PNG 必须以 `compress_level=1` 编码（`_PNG_COMPRESS_LEVEL`，2026-09-22 实测）**：`img.save(buf, format="PNG")` 用的是 **Pillow 默认的 6**，而这一步**不比 tesseract 本体便宜**——真实桌面截图（2x 放大后 3192x1922）7.42s → 1.18s，全屏那张 8.89s → 5.15s；端到端 ABBA 四组配对中位 **2.20x**。**PNG 的 zlib 是无损压缩，等级只影响「压多久/压多小」，解出的像素逐位相同**——两级编码后的 tesseract stdout **md5 完全一致**（验过两张图），所以这行是纯赚。体积会大 1.13~1.19 倍，但它走 stdin、**从不落盘**，零代价。
+    - **⚠️ 别向外宣称「省 N 秒」或「PNG 占 OCR 的百分之几」**：编码耗时**随画面内容变化极大**——像素数差 5.8 倍的两张图，耗时只差 1.2 倍（纯色/规则线条压得飞快，照片、渐变、抗锯齿小字慢得多）；实测区间 0.6s（合成线稿）~6.2s（真实截图）。能稳定说出口的只有「level=1 永不慢于 level=6，且结果一模一样」。反过来说，**「OCR 慢」不能一概归给 tesseract**——查下一步优化前，先把这一次 `img.save` 量出来（历史教训：正是把总耗时整个记在 tesseract 账上，才让上面那条 OMP 优化只打在了三成的工作量上）。
+    - 守卫 `test_ocr_png_is_encoded_at_low_compression` 判据同样取**实际传给 `img.save` 的 kwargs**（顺带断言仍是 PNG——换 JPEG 虽快但有损，块效应正落在笔画边缘上）。
   - ️ OCR 坐标是**快照**：界面变化后必须重新调用，不能复用旧 ref。`_native_alive` 对 TextBlock 直接判活（它是纯数据对象，不存在"失效"），`get_screen_text` 返回文本里也写明了这一点。
 - **`screenshot`（兜底）**：确实需要像素级判断时才用。链路已优化：**抓屏 → 缩放 → 编码一次**（历史实现是「全尺寸 PNG 编码 → 解码 → 缩放 → 再编码」，同一张图压两遍，全尺寸那次纯属浪费，实测 266ms）；默认 **JPEG(q=85)** 而非 PNG——实测 JPEG 编码 14ms/334KB vs PNG 266ms/3065KB。
   - **自动落盘路径（`inline=false` 不带 `save_path`）由 `utils/temps.py` 回收**：按 LRU 只留最近 5 张，文件名带 pid 作归属标记，**别的会话的文件只在主人进程已死时才删**（`/tmp` 是全局的，按前缀无差别裁剪等于误杀别的会话）。刻意不用 atexit——会话被强杀时 atexit 根本不跑，而那正是残留的主要来源（实测手工清掉过 118 个）。`act_sequence` 拿不到 MCP `Image` 类型时的退化落盘（`cc-cu-seq-*`）走同一套。要长期留存必须显式传 `save_path`（工具描述里写明了）。
@@ -126,7 +133,8 @@ SWT/Java、自绘控件、游戏、远程桌面**没有无障碍树**（或树�
     - 验证：`PYTHONNOUSERSITE=1 "$PY" tests/manual_a11y_isolation.py`（内含**安全闸**：先断言 reader 绑在私有总线且看不到宿主应用，才继续遍历）。
   - **为什么用总线地址而不是 `NO_AT_BRIDGE`（实测教训，别改回去）**：`NO_AT_BRIDGE` 只是 GTK3 的开关（GTK4 用 `GTK_A11Y`），而 SWT（DBeaver 这类 Java 应用）**两个都不认** —— 其 `libswt-atk-gtk` 里没有任何相关字符串。`AT_SPI_BUS_ADDRESS` 则**工具链无关**（GTK3/GTK4/SWT/Qt/Electron 的 a11y 都走 libatspi）。实测（dbus-monitor 观察会话总线上 `org.a11y.Bus` 调用）：不设变量=1 次，指向死地址=**0 次**（**尊重该变量且不回落**）。
   - **另注（2026-09-20 实测修正）**：DBeaver **不是**灰区应用（a11y 树确实存在），但**能读到的只有菜单栏**——`get_ui_tree(app="DBeaver")` 的 150+ 节点**全是菜单**（菜单项、弹窗按钮齐全，`click(ref)` 元素级可用），而 **Database Navigator 里的连接/表列表根本不是 a11y 节点**（该面板只暴露两个 `scroll bar`）。所以**连接列表必须走 OCR + 坐标点击**，`find_element(text="开发环境")` 这类搜索对它一律无效。
-    - **连库用 Enter，别用双击**：选中连接节点后按 `Return` 即可建立连接并展开（出现 `> 数据库 / > 管理员 / > 系统信息`）。**双击在 `act_sequence` 里做不到**——它的 click 步不支持 `preview`（`sequences.py:110` 只传 `button`），每次点击都拖着抓图 + OCR + 变化对比（~0.5s），两次点击间隔必超双击阈值。
+    - **连库优先用 Enter**：选中连接节点后按 `Return` 即可建立连接并展开（出现 `> 数据库 / > 管理员 / > 系统信息`）。双击**现已支持**（`double_click` 工具 / `{op:"double_click",x,y}`），但那是 2026-09-22 才加的，见下文「三个鼠标动作」。
+      ⚠️ **别再用「两次 click」拼双击，也别以为加个 `preview` 参数就能双击**：本文件原先记的归因（「click 步不支持 preview，所以点两次间隔必超阈值」）**只对了一半**——`preview=false` 只省掉抓图，落点证据的小块 OCR 照走（`with_text=shot is None` → True，约 0.3s），步骤之间还有调度开销，间隔仍不可控。双击的要害是「间隔必须极短」，那只能交给 X 侧定时。
     - **SWT 菜单项 `do_action` 报成功 ≠ 菜单真的展开**（实测「数据库(D) → 连接」元素级点击无效、节点图标仍是未连接的灰柱），别在菜单这条路上耗时间。
     - 连上后开编辑器的路径（都经坐标/键盘，不依赖 a11y）：工具栏「SQL」按钮（坐标 ~`(240,75)`）→ 菜单里按 **F3** 打开 SQL 编辑器 → **Alt+N** 新建脚本 → 编辑器里输入 SQL → **Ctrl+Enter** 执行。
 - 用户可把键鼠伸进 Xephyr 窗口亲自操作（Xephyr 默认把宿主输入路由进嵌套屏）；坐标点击/键盘注入前 `coordinator._sandbox_guard` 轮询礼让（`wait_until_user_leaves`），超时带警告继续。元素级 do_action 与只读工具不检查。
@@ -135,9 +143,25 @@ SWT/Java、自绘控件、游戏、远程桌面**没有无障碍树**（或树�
 ### 三级降级（coordinator.click 的灵魂）
 ① **element**：`backend.invoke()` → AT-SPI `do_action`，零坐标，首选；② **coord**：`geometry` 校准出屏幕绝对坐标 → xdotool 先聚焦窗口再点击；③ **screenshot**：找不到元素（灰区）时提示走截图。返回的 `ActionResult` 会标明实际生效层级——demo 证明 GTK 对话框坐标即使校准精确、合成点击仍会被「激活窗口」吃掉，所以**永远优先 element 级**。
 
-### 省往返：落点证据 + `act_sequence` 的 screenshot 步骤（实测数据支撑，改前先读）
+### 省往返：`act_sequence` 是默认形态 + 落点证据 + 把观察折进来（实测数据支撑，改前先读）
 **为什么这才是大头**：解析一条真实 DBeaver 任务（499s）得到——**工具自身执行 21s（4%），模型侧空档 478s（96%）**。工具（截图 0.2s / 点击 0.2s / list_windows 0.3s）根本不是瓶颈，**「模型每轮要看什么、要看几次」才是**。故一切优化都应指向「减少模型必须看的量 × 轮数」。
 
+- **`act_sequence` 是模型该用的默认形态，不是可选加速器**——这条必须在**两个地方同时**说，缺一不可：
+  - `server.py` 的 MCP `instructions`（模型**开箱必读**）：它的「标准工作流」天然会写成单步形式（`get_ui_tree → find_element → click`），**那等于教模型一步一次往返**。只把鼓励写在工具描述里是不够的——工具描述要等模型**已经决定用它**才读得到，而 instructions 在决定**之前**就把它带偏了。（历史版本正是这样：工具描述里喊着「省往返的关键工具」，instructions 却教单步。）
+  - `tools/action.py` 的工具描述（模型决定用不用它时的唯一依据）。
+  - 两处都**必须带判据**（「下一步不依赖上一步结果才合并」「需要看结果做分支判断就拆开」）。只鼓励不看判据会退化成盲跑长序列：界面一旦没按预期变，后续步骤全打偏，回头收拾比省下的还贵。
+  - 守卫 `test_server_instructions_urge_act_sequence` 读 `create_server` 源码，断言 instructions 里既有 `act_sequence`、**也有**判据字样。删掉引导**不会报错**，只会让每个任务慢几倍——所以用测试钉住。
+- **`{op:"ui_tree"}` 与 `{op:"screenshot"}`：把「下一步的观察」折进同一次调用**。分工是**看结构用 ui_tree（文本、便宜），看像素才用 screenshot（贵）**；灰区应用没有元素树，只有 screenshot 这条路。
+  - `ui_tree`：补的是同一类浪费的**另一半**——「点开菜单 → 读菜单里有什么」原先也得拆成两次调用。树走 `message`（纯文本，天然可 JSON 序列化），**不**走截图那条 `_images` 旁路（别照抄 screenshot 的分支）。
+  - `screenshot`：实测任务里三分之二的截图纯粹是「确认刚才那串动作对不对」。图像**不走 JSON**：挂在返回值的 `_images`（`[(bytes, meta)]`）下，`tools/action.py` 先 `pop` 再 `json.dumps`，然后作为额外 content block 追加（顺序：文本日志 → image → meta 文本）。
+  - `_images` 是私有键，`coordinator` 之外的调用方序列化前**必须** pop 掉（测试 `test_act_sequence_screenshot_op_returns_image` 兜住）。
+  - 锁可重入，故 `act_sequence` 持屏锁时再调 `screenshot_image` / `get_ui_tree`（前者挂了 `@_exclusive_screen`）不会自锁。
+- **`click` 的 `text` 支持候选名列表**（`["保存","Save"]`，**命中即停**）：解决「不确定目标叫什么」（中英文界面按钮名不同）。原先只能点一个、失败再开一次调用试下一个，每个候选一次往返。
+  - ⚠️ **语义是「命中即停」，不是「失败继续」**——这是设计要害，别改回去：`stop_on_error=false` 那种「失败就试下一个」在这里恰恰是**错的**。中文界面上第一个候选已经点中、对话框都关了，程序若还接着去找「Save」，运气好是白搜一次，运气差就点到别的窗口上。候选列表表达的是「同一个意图的几种写法」，故找到了就不该再看后面的。
+  - ⚠️ **判定标准只能是「找不找得到」**：那是程序**自己**能确定的事实（在树文本里做字符串匹配），不需要判断力，所以放服务端做是安全的。反过来「点了保存、弹出『文件已存在，是否覆盖』」**判定不了**（属于「执行了但不对」），只能把结果交回模型。**别指望它替代分支判断**——那是能力边界，越界就等于要在 server 里塞一个大脑，而我们没有也不该有。
+  - 命中后返回 **ref** 而非名字：调用方 `click(ref=...)` 走 `_resolve_native` 快路径、**不再重搜一次树**。全失败时**列出试过的每个名字**（只报最后一个会让模型以为只搜了一次，据此判断「这界面是英文的」就是错的）。
+  - 守卫判据是**「搜了哪些名字」**而不是 `ok is True`：把实现改成「全搜一遍、取第一个成功的」照样能过 `ok` 断言，只有断言 `searched == ["保存"]` 才拦得住（`test_seq_click_candidate_names_stops_at_first_hit`）。
+- **序列内的规模上限**（M-46，整串**持屏锁**执行，故步数/sleep/观察类步数都必须有界）：步数 50、单步 sleep 60s、wait 60s、截图 8 张、**读树 5 棵**。`ui_tree.max_nodes` 默认 **150**（刻意小于工具的 400——序列里读树是「顺手确认」不是全量分析），越界**当场报错**、不静默截断或降级（与 `screenshot.region` 的 M-41、`tools/ui_tree.py` 用 `Literal` 而非裸 `str` 同口径）。
 - **落点证据**（`describe_point` / `active_window_title`）：坐标级点击与键盘注入的 `ok=True` **只说明「事件发出去了」**——xdotool 不关心点到了什么，所以模型只能再截一张图确认，那是整整一个来回。现改为回报 `落点：窗口「X」 WxH ｜ 落点文字：「确定」 ｜ 点后活动窗口：无（原「X」已消失）`。
   - **必须在点击之前取**（`_point_evidence` 会 mousemove 去问 X「那儿是哪个窗口」，点完弹窗可能已盖住原位置）。
   - **⚠️ 先读活动窗口再取落点证据**：顺序**不能反**（`describe_point` 会挪指针）。但要注意归因——沙箱里的 i3 配置**已显式** `focus_follows_mouse no`（`display.py` 的 `_SANDBOX_I3_CONFIG`），**挪指针并不会切换焦点**；这里坚持「先读后取」是**刻意不依赖那条配置**（`CC_CU_SANDBOX_WM=none` 时沙箱内根本没有 WM，X 退回 `PointerRoot` 语义，此时指针位置**确实**决定键盘去向）。**排查「活动窗口不符」时别往 `focus_follows_mouse` 上想**（D-1/M-8）。
@@ -145,10 +169,6 @@ SWT/Java、自绘控件、游戏、远程桌面**没有无障碍树**（或树�
   - 裸坐标点击（灰区）带 `with_text=True`（OCR 落点周围 320x64 小块，约 0.3s）；带 ref 的坐标兜底带 `with_text=False`（元素名已知，省那 0.3s）。
   - **落点证据一律不得让主操作失败**：`describe_point`/`active_window_title` 出错只记 debug 日志、返回空 dict。
   - 元素级 `do_action` **不需要**它——不存在「点没点中」的疑问。
-- **`act_sequence` 的 `{op:"screenshot"}`**：实测任务里三分之二的截图纯粹是「确认刚才那串动作对不对」。放进同一次调用的最后一步即可省掉整个来回。
-  - 图像**不走 JSON**：挂在返回值的 `_images`（`[(bytes, meta)]`）下，`tools/action.py` 先 `pop` 再 `json.dumps`，然后作为额外 content block 追加（顺序：文本日志 → image → meta 文本）。
-  - `_images` 是私有键，`coordinator` 之外的调用方序列化前**必须** pop 掉（测试 `test_act_sequence_screenshot_op_returns_image` 兜住）。
-  - 锁可重入，故 `act_sequence` 持屏锁时再调 `screenshot_image`（同样挂了 `@_exclusive_screen`）不会自锁。
 
 ### 点击反馈三件套：光圈（给人看）+ 准星图（给模型看）+ 程序算偏差 + 回看
 
@@ -178,6 +198,20 @@ SWT/Java、自绘控件、游戏、远程桌面**没有无障碍树**（或树�
 - **回看通道**（`get_last_click_image`）：`landing._CLICK_LOG` 是**模块级** deque(maxlen=8)，记最近 8 次坐标点击（含 `act_sequence` 内的，**只记录不附图**——逐张 attach 是 token 反模式），带坐标、评估文字与准星图。
   - 该方法是**纯读本进程内存**，故在 `test_coordinator_hooks` 的 `needs_display` 与 `_EXCLUSIVE_EXEMPT` 两处都显式登记了豁免（挂钩子会让「看一眼上次点了哪」去拉起 Xephyr）。
   - 它同时解决了「点完发现不对但界面已变」这个盲区，以及「盲目重复点击」这个最糟的应对（工具描述里写明了先回看再修坐标）。
+
+### 三个鼠标动作：双击 / 滚动 / 拖拽（**全是坐标级**）
+
+`double_click` / `scroll` / `drag` 三个独立工具（同时接进 `act_sequence` 的三个同名 op——独立工具负责「模型能发现」，op 负责「批量时不掉回慢路径」）。**它们都只能走坐标级**：AT-SPI 的 `do_action` 只有 activate/click，没有双击、没有滚轮、没有拖拽。故反馈链路沿用 `click_xy` / `drag_xy`（拖拽只取**起点**的落点证据——终点由参数给定不会有歧义，抓错起点才是这类操作的典型失败）。
+
+- **双击的间隔必须交给 X 侧定时**（`xdotool click --repeat 2 --delay 100`）。实测用 `xev` 量过真实事件时间戳：两次 ButtonPress 相差**正好 100ms**，远小于系统约 400ms 的双击阈值。
+  ⚠️ **绝不要改成「调用方连调两次 `click_at`」**——那正是它历史上做不到的原因：两次独立调用之间夹着落点证据、OCR、变化对比与步骤调度（约 0.5s），必然被认成两次单击。也别指望「关掉那些副作用就能压进阈值」——那只是把间隔压到另一个同样不受控的值。守卫 `test_seq_op_double_click_sends_repeat_not_two_calls` 断言的是**传给 backend 的 `repeat`**，不是 `ok`（改成连调两次照样能过 `ok`）。
+- **拖拽必须插值分步移动**：X 只发一个 MotionNotify 时，很多应用判定不出「按住拖动」（拖放目标不激活、画布不跟随、滚动条回弹），表现是「拖了但没反应」而 xdotool rc=0、看着完全成功。故起点与终点之间插 `steps` 个中间点、每点之间停顿 hold 秒。**整条链拼成一条 xdotool 命令**（含 `sleep` 子命令）——分成 N 次 `_run` 时每次进程启动开销（5~10ms）会盖过 hold 本身，节奏失真。失败**不重试**：重试一次拖拽 = 再拖一遍（文件移动两次、画两笔），后果不对称。
+- **滚动的最小单位是「刻度」，没有半格**：一次滚轮事件就是一格（button 4=上 / 5=下，`amount` 走 `--repeat`）。
+  ⚠️ **别引入「圈」这类单位**——那是物理鼠标的转数，X11 里根本不存在，「一圈几格」只能靠我们拍脑袋约定（还取决于鼠标型号）；而且「一格滚多少内容」由**应用**决定（GTK 约 3 行、浏览器按比例、画布应用按像素），所以**无论用什么单位，模型都预测不出滚完会到哪**。既然都没有预测力，就用与底层一致的那个，少一层可能算错的换算。**正确用法是「滚一下 → 看结果 → 不够再滚」**，配合 `act_sequence` 的 `ui_tree`/`screenshot` 一次提交。
+  - 作用点必须有明确来源：给了 `x/y` 就用它，否则取**活动窗口中心**——绝不沿用「指针恰好在哪」（那是上次操作留下的位置，不可预测，排查时也毫无线索）。滚动**不聚焦窗口**（`focus_window=False`）：看内容而已，抢焦点纯属副作用。
+- **按钮名的映射只有一份**（`backend/base.py::BUTTON_NUMBERS`：left=1 / middle=2 / right=3）：工具层与 `act_sequence` 都收**语义名**，两处共用同一张表。
+  ⚠️ **别让模型记数字**：X11 里 **2 是中键、3 是右键**，写反不会有任何报错，只会右键变中键。工具层用 `Literal` 在**参数校验阶段**就挡下非法值（实测报错原文会列出可选集合）。
+- 规模上限沿用坐标动作那一套：单次滚动 `amount ≤ _SCROLL_MAX_AMOUNT`、拖拽 `steps ≤ _DRAG_MAX_STEPS`（都是持屏锁执行的坐标动作，无上限时能长时间占屏）。
 
 ### ref 机制（关键隐含假设）
 MCP server 是**单个长驻进程**，故 `utils/refs.py` 的 `RefTable` 直接缓存「活的」AT-SPI Accessible 对象（`UINode.native`），`ref(int) → 活对象`。`get_ui_tree`/`find_element` 分配 ref，`click(ref)`/`type_text(ref)` 用 ref 定位。**这依赖同进程内存**——不可跨进程/序列化传递 native 对象。ref 失效时（界面变化）`coordinator._resolve_native` 会用 meta(role+name+app) 重定位。
@@ -232,7 +266,7 @@ GTK 对话框 `get_extents(SCREEN)` 常返回相对窗口原点的漂移坐标�
 
 | 文件 | 类别 | 说明 |
 |------|------|------|
-| `test_geometry.py`（9） / `test_refs.py`（8） / `test_serializer.py`（13） / `test_spawn_env.py`（2） / `test_i7_i8_i10.py`（11） / `test_atspi_guards.py`（24） / `test_d_guards.py`（15） / `test_e_guards.py`（17） / `test_f_guards.py`（12） / `test_g_guards.py`（21） / `test_h_guards.py`（8） / **`test_coordinator_hooks.py`（15）** / **`test_inject_layer.py`（15）** / **`test_coordinator_seq.py`（8）** / **`test_landing_evidence.py`（7）** / **`test_ocr_and_text.py`（10）** / **`test_display_lifecycle.py`（20）** / **`test_refs_and_values.py`（8）** / **`test_tools_and_backend.py`（24）** / **`test_ring_and_preview.py`（39）** | pytest 单测 | 不需要桌面，`conftest.py` 会强制 `CC_CU_DISPLAY_MODE=real` 以免弹 Xephyr。`test_spawn_env.py` 是**结构性防漏**：枚举 `src/` 下每一处 subprocess spawn 点，要求 `env=` 源自 `env_for`/`app_env`；`test_i7_i8_i10.py` 是 review 报告那三条的回归集。**加粗的 8 个**由原 `test_optimizations.py`（2238 行）在 2026-09-18 按被测模块拆分而来，跨文件共享的辅助（`_StubBackend` / `_proc` / `_reset_display`）在 `_helpers.py`。**`test_ring_and_preview.py` 守住点击反馈的四条硬契约**：准星必须用「裁剪后原点」反算（屏边裁剪会改原点，写死半宽 = 越靠边指得越离谱）、准星只画在副本上（原始图要复用给 OCR 与点前后对比）、bytes 绝不进 `ActionResult.data`、`click` 工具返回注解必须是 `Any`（`str` 会让 mcp 生成 outputSchema，带图那次返回列表就 ValidationError）。**`conftest.py` 里那个 autouse 夹具 `isolate_at_spi_bus_env` 不能改成依赖 monkeypatch**：`AtspiReader` 会直接写**进程级** `os.environ`（libatspi 只能从那儿读），而 monkeypatch 的 `delenv` 对「本就不存在的键」**不入账**，记下的反而是用例自己写进去的假地址；autouse 夹具**最先实例化**、收尾回调**最后**执行，才排得进 monkeypatch 的 undo 之后 |
+| `test_geometry.py`（9） / `test_refs.py`（8） / `test_serializer.py`（13） / `test_spawn_env.py`（2） / `test_i7_i8_i10.py`（11） / `test_atspi_guards.py`（24） / `test_d_guards.py`（15） / `test_e_guards.py`（17） / `test_f_guards.py`（12） / `test_g_guards.py`（21） / `test_h_guards.py`（8） / **`test_coordinator_hooks.py`（15）** / **`test_inject_layer.py`（15）** / **`test_coordinator_seq.py`（23）** / **`test_landing_evidence.py`（7）** / **`test_ocr_and_text.py`（11）** / **`test_display_lifecycle.py`（20）** / **`test_refs_and_values.py`（8）** / **`test_tools_and_backend.py`（24）** / **`test_ring_and_preview.py`（39）** | pytest 单测 | 不需要桌面，`conftest.py` 会强制 `CC_CU_DISPLAY_MODE=real` 以免弹 Xephyr。`test_spawn_env.py` 是**结构性防漏**：枚举 `src/` 下每一处 subprocess spawn 点，要求 `env=` 源自 `env_for`/`app_env`；`test_i7_i8_i10.py` 是 review 报告那三条的回归集。**加粗的 8 个**由原 `test_optimizations.py`（2238 行）在 2026-09-18 按被测模块拆分而来，跨文件共享的辅助（`_StubBackend` / `_proc` / `_reset_display`）在 `_helpers.py`。**`test_ring_and_preview.py` 守住点击反馈的四条硬契约**：准星必须用「裁剪后原点」反算（屏边裁剪会改原点，写死半宽 = 越靠边指得越离谱）、准星只画在副本上（原始图要复用给 OCR 与点前后对比）、bytes 绝不进 `ActionResult.data`、`click` 工具返回注解必须是 `Any`（`str` 会让 mcp 生成 outputSchema，带图那次返回列表就 ValidationError）。**`conftest.py` 里那个 autouse 夹具 `isolate_at_spi_bus_env` 不能改成依赖 monkeypatch**：`AtspiReader` 会直接写**进程级** `os.environ`（libatspi 只能从那儿读），而 monkeypatch 的 `delenv` 对「本就不存在的键」**不入账**，记下的反而是用例自己写进去的假地址；autouse 夹具**最先实例化**、收尾回调**最后**执行，才排得进 monkeypatch 的 undo 之后 |
 | `test_env_isolation.py`（1） | pytest 单测（**起子进程**） | 守「测试之间不留下进程级副作用」：自己起一个 pytest 子进程、挂探针插件在 `pytest_sessionfinish` 打印 `AT_SPI_BUS_ADDRESS` 的真实取值，断言为 `None`。**为什么必须起子进程**：判据是「跑完之后环境是否干净」，而那只在**那个会话收尾时**才观测得到——在会话内断言，观测到的是本会话自己的状态，何况 `conftest.py` 的守卫夹具已把本会话擦干净了（等于在测那把本来就该生效的扫帚） |
 | `test_e2e_zenity.py`（6） | pytest 端到端 | 需 X11 + zenity + Xephyr，需 `CC_CU_E2E=1` opt-in，默认在沙箱内跑。**「等应用上树」一律用 `_wait_app_on_tree()` 轮询，别改回固定 `sleep`**：实测沙箱内 zenity 上树耗时 1.60~2.54 秒，**正好跨过**历史上的 2.5 秒魔数，于是同一份代码会在「全绿」与「全红」之间随机翻转（实现在 2026-09-17 的 I-17 修的）。**收尾同理，用 `_wait_window_gone(title)` 轮询等窗口真的从 X 上消失，不要 `terminate()` 完就走人**：SIGTERM 只是请求进程退出，X 端窗口要等客户端断开才被回收——下一个用例开头读到的「活动窗口」于是还是上一个用例**正在死**的对话框，而它会在随后几秒里消失。实测就是这样把 `test_ring_visible_has_hole_and_autoclears` 的「画圈不改变活动窗口」打成偶发红（`assert 'E2EPreview' == None`，3 轮里红 2 轮）；根因不在光圈，在收尾提前离场 |
 | `manual_*.py`（6 个） | **手动 story**（不进 pytest） | 用 MCP stdio 客户端驱动**真实 server/冻结产物**，跑完整任务链路，退出码 0 = 全过 |

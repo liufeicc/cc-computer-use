@@ -86,6 +86,102 @@ def test_ocr_reader_reports_missing_tesseract(monkeypatch):
 
 
 
+def test_tesseract_is_invoked_single_threaded(monkeypatch):
+    """
+    调 tesseract 时必须带 `OMP_THREAD_LIMIT=1`——实测白捡约 2 倍，且识别结果逐字不变。
+
+    为什么这条要钉住：漏掉它**不会报错**，只会让每次 OCR 都白跑一倍的时间（22 核机器
+    上 tesseract 默认会开多线程，而它那条流水线除末段外无法并行，多给的线程纯是同步
+    开销）。这是那种「删掉一行、全绿、只是慢一倍」的改动，只能靠测试兜。
+
+    判据取**传给 subprocess 的 env 实际取值**，而不是「模块里存在某个常量」——
+    后者拦不住「常量还在、调用点没用它」。
+    """
+    from PIL import Image as _PILImage
+
+    from computer_use_mcp.backend.linux import ocr as ocr_mod
+
+    captured: dict = {}
+
+    class _Done:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["env"] = kw.get("env")
+        return _Done()
+
+    monkeypatch.setattr(ocr_mod.shutil, "which", lambda n: "/usr/bin/tesseract")
+    monkeypatch.setattr(ocr_mod.subprocess, "run", fake_run)
+
+    reader = ocr_mod.OcrReader()
+    assert reader.is_available()
+    reader.read_image(_PILImage.new("RGB", (40, 20), "white"), (0, 0))
+
+    assert captured.get("env") is not None, "必须显式传 env（否则继承冻结产物库路径）"
+    assert captured["env"]["OMP_THREAD_LIMIT"] == "1", (
+        "tesseract 必须限单线程：OMP_NUM_THREADS 会被 tesseract 内部的 num_threads() "
+        "子句覆盖，只有 OMP_THREAD_LIMIT 这个硬上限拦得住（实测差约 2 倍）"
+    )
+
+
+def test_ocr_png_is_encoded_at_low_compression(monkeypatch):
+    """
+    喂给 tesseract 的 PNG 必须以 `compress_level=1` 编码（Pillow 默认是 6）。
+
+    为什么这条要钉住：PNG 编码是与 tesseract 本体同量级、有时更大的一笔开销。实测真实桌面
+    截图（2x 放大后 3192x1922）默认等级要 7.42s、改成 1 只要 1.18s，端到端 ABBA 四组配对
+    中位提速 2.20x；换一张全屏图则是 8.89s→5.15s。而 PNG 是无损格式，等级只影响
+    「压多久/压多小」，解出的像素逐位相同（同一图两级喂给 tesseract，stdout 的 md5 完全
+    一致：`4cd6432f3fee` / `578410ce627b`）。
+    所以这是**纯赚**的一行——但漏掉它不报错、不错结果，只是每次 OCR 都白烧一截时间，
+    只能靠测试兜（与 test_tesseract_is_invoked_single_threaded 同一类问题）。
+
+    判据取**实际传给 img.save 的 kwargs**，而不是「模块里存在某个常量」——
+    后者拦不住「常量还在、调用点没用它」。顺带断言仍是 PNG：换成 JPEG 虽然也快，
+    但它有损，块效应与振铃正好落在笔画边缘上，会伤识别率。
+    """
+    from PIL import Image as _PILImage
+
+    from computer_use_mcp.backend.linux import ocr as ocr_mod
+
+    captured: dict = {}
+
+    class _Done:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(cmd, **kw):
+        captured["input"] = kw.get("input")
+        return _Done()
+
+    monkeypatch.setattr(ocr_mod.shutil, "which", lambda n: "/usr/bin/tesseract")
+    monkeypatch.setattr(ocr_mod.subprocess, "run", fake_run)
+
+    # 包住 Image.save 记账后再原样放行，故不改变被测代码的行为。
+    real_save = _PILImage.Image.save
+
+    def spy_save(self, fp, *a, **kw):
+        captured["save_kw"] = kw
+        return real_save(self, fp, *a, **kw)
+
+    monkeypatch.setattr(_PILImage.Image, "save", spy_save)
+
+    ocr_mod.OcrReader().read_image(_PILImage.new("RGB", (40, 20), "white"), (0, 0))
+
+    kw = captured.get("save_kw") or {}
+    assert kw.get("format") == "PNG", "OCR 输入必须无损：JPEG 的块效应会伤笔画边缘"
+    assert kw.get("compress_level") == 1, (
+        "PNG 必须显式 compress_level=1：Pillow 默认 6 在本机让编码比 tesseract 本体"
+        "还慢 2.4 倍（实测 7.4s vs 1.18s），而 PNG 无损，降等级不改变任何像素"
+    )
+    assert (captured.get("input") or b"").startswith(b"\x89PNG"), \
+        "传给 tesseract 的 stdin 应当就是这段 PNG 字节"
+
+
 def test_text_block_is_not_element_actionable():
     """
     TextBlock 必须「可点但不可元素级操作」：

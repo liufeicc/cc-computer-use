@@ -59,6 +59,12 @@ class _StubBackend(Backend):
         # focus 单独记账（不塞进 calls）：调用方 type_text 会在赋值前聚焦，
         # 记进 calls 会打乱既有的「第 N 个调用是什么」类断言（见 I-10 的回归测试）
         self.focused: list = []
+        # 最近一次坐标点击/拖拽的**完整**参数（含 repeat/delay/steps）。
+        # 单独记而不塞进 calls：calls 是 ("click", x, y) 这样的定长元组，既有断言
+        # （如 `("click", 5, 6) in backend.calls`）依赖它的形状，改元组长度会连带崩一片；
+        # 而连击/滚动的断言只需要看最近一次，不需要历史。
+        self.last_click: dict | None = None
+        self.last_drag: dict | None = None
         # 落点证据的默认返回值（测试里按需覆盖）
         self.point: dict = {"x": 0, "y": 0, "window_id": "1", "window_title": "Stub Window",
                             "window_rect": [0, 0, 800, 600], "text": None, "conf": None}
@@ -79,8 +85,16 @@ class _StubBackend(Backend):
     def element_screen_rect(self, n):
         # TextBlock 自带屏幕绝对坐标（OCR 算好的），走快路径、不套 geometry 校准
         return n.rect if isinstance(n, TextBlock) else None
-    def click_at(self, x, y, button=1, focus_window=True):
-        self.calls.append(("click", x, y)); return True
+    def click_at(self, x, y, button=1, focus_window=True, repeat=1, delay_ms=100):
+        self.calls.append(("click", x, y))
+        self.last_click = {"x": x, "y": y, "button": button, "repeat": repeat,
+                           "delay_ms": delay_ms, "focus_window": focus_window}
+        return True
+    def drag_at(self, x1, y1, x2, y2, button=1, steps=10, focus_window=True):
+        self.calls.append(("drag", x1, y1, x2, y2))
+        self.last_drag = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "button": button,
+                          "steps": steps, "focus_window": focus_window}
+        return True
     def type_text(self, t): self.calls.append(("type", t)); return True
     def press_key(self, c): self.calls.append(("key", c)); return not self.fail_key
     def window_screen_pos(self, n): return None

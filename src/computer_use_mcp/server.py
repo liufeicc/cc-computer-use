@@ -33,7 +33,7 @@ from .backend.base import Backend, get_backend  # noqa: E402
 from .core import display  # noqa: E402
 from .core.coordinator import Coordinator  # noqa: E402
 from .tools import (  # noqa: E402
-    action, apps, find, layout, screen_text, screenshot, ui_tree, windows,
+    action, apps, find, layout, mouse, screen_text, screenshot, ui_tree, windows,
 )
 from .utils.errors import BackendUnavailableError  # noqa: E402
 from .utils.logging import get_logger  # noqa: E402
@@ -107,7 +107,12 @@ class _UnavailableBackend(Backend):
     def element_screen_rect(self, native):  # noqa: ANN001, ANN201
         self._raise()
 
-    def click_at(self, x, y, button=1, focus_window=True):  # noqa: ANN001, ANN201
+    def click_at(self, x, y, button=1, focus_window=True,  # noqa: ANN001, ANN201
+                 repeat=1, delay_ms=100):
+        self._raise()
+
+    def drag_at(self, x1, y1, x2, y2, button=1,  # noqa: ANN001, ANN201
+                steps=10, focus_window=True):
         self._raise()
 
     def type_text(self, text):  # noqa: ANN001, ANN201
@@ -154,6 +159,18 @@ def create_server() -> FastMCP:
             "用元素级 do_action 操作（零坐标），替代『截图+坐标点击』。"
             "标准工作流：① get_ui_tree 看结构 → ② 找到目标元素的 [ref]（或用 find_element 搜）"
             "→ ③ click(ref)/type_text(ref)。"
+            # ⚠️ 这段「效率约定」是**行为引导**，不是补充说明，删掉它会显著拖慢每一次任务：
+            # 上面那三行标准工作流写的全是**单步**工具，模型照做就是「一步一次往返」。
+            # 而实测（一次 DBeaver 任务 499s）工具自身只占 21s（4%），模型侧往返空档占
+            # 478s（96%）——真正贵的是往返。故必须在此处把 act_sequence 明确成默认形态，
+            # 只在工具描述里喊是不行的：工具描述要等模型**已经决定用它**才读得到。
+            # 同时保留判据（「需要分支判断才拆开」），否则会退化成盲跑长序列，
+            # 界面一旦没按预期变，后续步骤全打偏，回头收拾比省下的还贵。
+            "**关键效率约定**：一次 MCP 往返本身要 30~70 秒，而工具执行只要零点几秒——"
+            "**慢的是往返，不是操作**。所以凡是**下一步不依赖上一步结果**的连续动作，"
+            "一律用 act_sequence 一次提交（它还能把 ui_tree / screenshot 作为最后一步，"
+            "把「这一串做完之后界面长什么样」一并带回来，省掉专门确认的那次调用）；"
+            "只有**需要看结果做分支判断**时才拆成多次调用。"
             "**灰区应用**（无元素树，如 SWT/Java、自绘控件、游戏、远程桌面）：优先用 "
             "get_screen_text（OCR 出带坐标的文本，读文字即可定位）；确实需要像素级判断时才用 "
             "screenshot——它费 token 且要你自己估算坐标。"
@@ -166,6 +183,7 @@ def create_server() -> FastMCP:
     ui_tree.register(mcp, coord)
     find.register(mcp, coord)
     action.register(mcp, coord)
+    mouse.register(mcp, coord)
     layout.register(mcp, coord)
     screenshot.register(mcp, coord)
     screen_text.register(mcp, coord)

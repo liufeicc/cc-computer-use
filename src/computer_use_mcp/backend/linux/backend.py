@@ -344,7 +344,10 @@ class LinuxBackend(Backend):
             )
         return rect
 
-    def click_at(self, x: int, y: int, button: int = 1, focus_window: bool = True) -> bool:
+    def click_at(
+        self, x: int, y: int, button: int = 1, focus_window: bool = True,
+        repeat: int = 1, delay_ms: int = 100,
+    ) -> bool:
         """
         坐标点击（兜底）。focus_window=True 时先聚焦落点所在窗口（修复 demo 路径B）。
 
@@ -354,6 +357,9 @@ class LinuxBackend(Backend):
         人看不到任何痕迹，而失败恰恰最需要知道它想点哪。
         ⚠️ 本方法是**全部坐标点击的唯一漏斗**，光圈挂在这里一处即全覆盖（新增坐标路径
         不可能漏画）；元素级 do_action 不经过这里，故天然不画（它零坐标、不存在「瞄哪」）。
+
+        `repeat>1` 为连击（双击用 2）、滚轮用 button 4/5 + repeat=N，光圈同样只画一次
+        （连击是**一次**操作，画 N 个圈反而看不出落点）。
         """
         if not self.injector.is_available():
             from ...utils.errors import InjectionError
@@ -362,7 +368,31 @@ class LinuxBackend(Backend):
         wid = None
         if focus_window:
             wid = self.injector.window_id_under(x, y)
-        return self.injector.click_at(x, y, button=button, focus_wid=wid)
+        return self.injector.click_at(x, y, button=button, focus_wid=wid,
+                                      repeat=repeat, delay_ms=delay_ms)
+
+    def drag_at(
+        self, x1: int, y1: int, x2: int, y2: int, button: int = 1,
+        steps: int = 10, focus_window: bool = True,
+    ) -> bool:
+        """
+        坐标拖拽（兜底）。起点按下 → 插值移动 → 终点抬起。
+
+        光圈画在**起点**（`ring.show(x1,y1)`）：拖拽最需要确认的是「从哪儿开始抓」——
+        终点由参数决定、不会有歧义，起点抓错才是这类操作最典型的失败（抓到了别的控件、
+        或没抓住手柄）。与 click_at 同理，画在注入之前，注入抛异常也留得下痕迹。
+
+        中间插值与节奏控制在 injector.drag 里（见那里的说明：必须插值、必须一条命令）。
+        """
+        if not self.injector.is_available():
+            from ...utils.errors import InjectionError
+            raise InjectionError("xdotool 不可用，无法执行拖拽")
+        ring.show(int(x1), int(y1))
+        wid = None
+        if focus_window:
+            wid = self.injector.window_id_under(x1, y1)
+        return self.injector.drag(x1, y1, x2, y2, button=button, steps=steps,
+                                  focus_wid=wid)
 
     # ---------- 键盘 ----------
     def type_text(self, text: str) -> bool:

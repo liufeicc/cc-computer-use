@@ -9,10 +9,21 @@ DBeaver 任务 8.3 分钟里，工具只占 21 秒，其余 478 秒全花在这�
 本模块把「屏幕上有哪些字、各自在哪」直接变成**文本**：模型读到 `[ref] 文字 @ (x,y)`
 就能点，既不用看图、也不用估算坐标（坐标是识别时算出来的，不是猜的）。
 
-实测耗时（1600x1000，psm=11，chi_sim+eng）：
+实测耗时（1600x1000 沙箱屏，psm=11，chi_sim+eng）：
   - 全屏密集文字界面：8~10s
   - 一个对话框大小的区域（约 700x250）：2~3s
 故**默认只识别活动窗口那块区域**，而不是全屏——见 coordinator.get_screen_text。
+
+⚠️ 上表的绝对值**只对 1600x1000 成立**，别拿它估算大屏：tesseract 对单张图是一条
+有状态的串行流水线，耗时随**面积**超线性增长。实测宿主 3840x1200 全屏（2x 放大后
+7680x2400）单次要 **30s**（本模块已限单线程，见 `_OMP_THREAD_LIMIT`；不限则 47s 以上，
+且会撞上下面那个 60s 超时）。所以「别默认全屏」这条在大屏上更要紧。
+
+⚠️ **上面这个总耗时里，有一笔随时可省的纯开销：喂给 tesseract 前的那次 PNG 编码**
+（2026-09-22 查明，详见 `_PNG_COMPRESS_LEVEL`）。它**不便宜**——量级与 tesseract 本体相当，
+高熵画面下更大。这条极容易看错：把总耗时整个当成「tesseract 有多慢」去想优化方向，
+就会一路扑空，真正能动的那行 `img.save` 反被漏掉。要量 tesseract 自己快不快，
+得先把编码那一段扣掉。
 
 实现选择：直接 subprocess 调 `tesseract` 命令行，而不是 pytesseract——
   - 少一个 Python 依赖，PyInstaller 不必加 hidden-import；
@@ -61,6 +72,53 @@ _MIN_CONF = 40.0
 # 把图放大再识别：小字号中文（12~14px）在 1x 下错误率明显偏高。
 # 实测放大 2x 的代价约 +20% 耗时，换来显著更准，划算。
 _UPSCALE = 2
+
+# tesseract 子进程**只许单线程**（在 env_for 之上再叠这一条）。
+#
+# 为什么（2026-09-22 实测，机器 22 核）：tesseract 内部用 OpenMP `num_threads()`
+# 子句并行了流水线的一段，而这个子句会**覆盖 `OMP_NUM_THREADS`** —— 所以只设
+# `OMP_NUM_THREADS=1` 拦不住它，只有 `OMP_THREAD_LIMIT`（硬上限）能。实测同一张图，
+# A/B 对称序列各两轮（消掉负载漂移）：
+#     不设 OMP              21.1s / 22.0s
+#     OMP_THREAD_LIMIT=1    10.2s / 10.9s    ⇒ 稳定快 ~2 倍
+# **识别结果逐字一致**（词数在全部对照里完全相同），纯粹是调度开销。
+# 线程数扫描（1/2/4/8/22）进一步显示「线程越多越慢」：22 线程要慢一倍 ——
+# tesseract 对单张图是一条**有状态的流水线**（二值化 → 连通域 → 版面分析 → 逐行识别），
+# 只有末段能并行，前面每一步都在等上一步的输出，多给的线程只换来同步开销。
+#
+# ⚠️ 别用「并行跑多个 tesseract 子进程」来提速：那是另一条路径，需先解决重叠区去重
+# 与内容稀疏时的丢字问题（实测稀疏图分块会丢 30% 的词），收益不稳，未落地。
+_OMP_THREAD_LIMIT = "1"
+
+# PNG 编码的压缩等级。**必须是 1**（Pillow 默认 6）——不改的话，每次 OCR 都在这一步白烧
+# 与 tesseract 本体同量级、有时更多的时间，且**不会报错、不会改变识别结果**，只能靠读代码发现。
+#
+# 为什么编码 PNG：tesseract 只吃图片，图要从 stdin 喂过去。**为什么不能像截图那样用
+# JPEG**：JPEG 有损，其块效应与振铃恰好落在笔画边缘上，而笔画正是 tesseract 的判据。
+# 所以这里只能无损，PNG 是自然选择。**但「无损」是格式属性，与压缩等级无关**——
+# PNG 的 zlib 压缩是无损压缩，level 0~9 只影响「压多久 / 压多小」，解出来的像素**逐位相同**。
+#
+# 故这一行是**纯赚**：省的是时间，赔的是体积，而体积根本无所谓——它走 stdin，**从不落盘**。
+#
+# 2026-09-22 实测（同一台机器，ABBA 相邻交替，只比同组内相邻两次以消掉负载漂移）：
+#   ① DBeaver 窗口 1596x961（2x 后 3192x1922）——编码本身的 ABBA（6,1,1,6）：
+#         level=6  7.42s / 4459KB      level=1  1.18s / 5316KB
+#      端到端（read() 全路径）四组配对中位 **2.20x**、单次省约 5.6s（组内倍数 1.89~2.74x）
+#   ② 宿主全屏 1920x1200（2x 后 7680x2400）——编码本身同样 ABBA：
+#         level=6  8.89s / 4195KB      level=1  5.15s / 4748KB      ⇒ 省 3.74s
+# 两级**输出逐字节相同**：①md5 `4cd6432f3fee`、②md5 `578410ce627b`，两次对照里 tesseract
+# 的 stdout 都完全一致 —— 无损不是推断，是验过的。
+#
+# ⚠️ **别把「省多少」当成固定值，它随画面内容变化很大**：同一压缩等级下，②的像素数是①的
+# 5.8 倍，编码耗时却只多 1.2 倍——**画的是什么比有多大更要紧**（大块纯色/规则线条压得飞快，
+# 照片、渐变、抗锯齿小字则慢得多）。实测区间：0.6s（合成线稿）~6.2s（真实桌面截图）。
+# 也因此**不要**在别处写「PNG 占 OCR 耗时的百分之多少」这种话——那个比例不稳定。
+# 能稳定说出口的只有一句：**level=1 永远不慢于 level=6，且结果一模一样**。
+#
+# ⚠️ 别把这里的结论套回 `backend.screenshot`：那条路默认 JPEG（截图是给人/模型看的，
+# 不需要无损），它自己那份 PNG 分支也早已是 level=1（见 backend.py 的实测注释），
+# 两处结论同源、各自独立，别把任一处改回默认等级。
+_PNG_COMPRESS_LEVEL = 1
 
 
 def _upscale_image(img):
@@ -140,15 +198,20 @@ class OcrReader:
         if _UPSCALE != 1:
             img = _upscale_image(img)
         buf = io.BytesIO()
-        img.save(buf, format="PNG")   # OCR 输入要无损，这里不能省成 JPEG
+        # OCR 输入要无损，这里不能省成 JPEG；但压缩等级必须显式给 1 ——
+        # Pillow 默认是 6，会让这一步白烧一截与 tesseract 同量级的时间（见 _PNG_COMPRESS_LEVEL）。
+        img.save(buf, format="PNG", compress_level=_PNG_COMPRESS_LEVEL)
 
         cmd = [self._exe, "stdin", "stdout", "--psm", _PSM, "-l", self.lang, "tsv"]
+        # 走 env_for 而非继承 os.environ：tesseract 也是系统二进制，而产物里打包了
+        # 它需要的同名库（libjpeg.so.8 / libpng16.so.16 / libtiff.so.6 / libwebp.so.7
+        # / libz.so.1，SONAME 精确命中）—— 不剥就会让它用产物内那份图片解码库。
+        # 再叠 OMP_THREAD_LIMIT=1 限单线程，见 _OMP_THREAD_LIMIT 处的实测数据。
+        tess_env = display.env_for()
+        tess_env["OMP_THREAD_LIMIT"] = _OMP_THREAD_LIMIT
         try:
-            # 走 env_for 而非继承 os.environ：tesseract 也是系统二进制，而产物里打包了
-            # 它需要的同名库（libjpeg.so.8 / libpng16.so.16 / libtiff.so.6 / libwebp.so.7
-            # / libz.so.1，SONAME 精确命中）—— 不剥就会让它用产物内那份图片解码库。
             p = subprocess.run(cmd, input=buf.getvalue(), capture_output=True,
-                               timeout=_TIMEOUT, env=display.env_for())
+                               timeout=_TIMEOUT, env=tess_env)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"tesseract 超时(>{_TIMEOUT}s)，区域可能过大") from exc
         if p.returncode != 0:

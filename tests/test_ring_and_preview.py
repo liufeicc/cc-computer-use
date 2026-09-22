@@ -717,7 +717,7 @@ def test_ring_drawn_before_injection(monkeypatch):
     class _FakeInjector:
         def is_available(self): return True
         def window_id_under(self, x, y): return "1"
-        def click_at(self, x, y, button=1, focus_wid=None):
+        def click_at(self, x, y, button=1, focus_wid=None, **kw):
             order.append("inject")
             return True
 
