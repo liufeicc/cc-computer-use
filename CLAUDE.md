@@ -262,14 +262,17 @@ GTK 对话框 `get_extents(SCREEN)` 常返回相对窗口原点的漂移坐标�
 三种产物：**本机 `build.sh`**（开发用）、**`.deb`**（Ubuntu 用户）、**`.mcpb`**（Claude Desktop）。后两者共用 `packaging/build-in-container.sh` 一次产出，**必须在 ubuntu:22.04 容器里跑**（24.04 上取到的系统二进制要求 GLIBC 2.38，会恰好排除掉 22.04 这个最低档）。
 
 ```bash
-docker run --rm -v "$PWD":/src -v /tmp/out:/out \
+# 输出目录刻意不用 /tmp（重启即失，且容器以 root 写入、属主是 root 删不掉）；
+# 用 -v "$HOME/dist:/out" 指定一个仓库外的固定位置。
+mkdir -p ~/dist
+docker run --rm -v "$PWD":/src -v "$HOME/dist":/out \
   -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
   -e CC_CU_MINIFORGE_SH=/miniforge.sh \
   ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'
-# → /tmp/out/cc-computer-use_0.1.0-1_amd64.deb（实测 68MB，96 个随包库 64.7MB）+ cc-computer-use-0.1.0.mcpb（98MB）
+# → ~/dist/cc-computer-use_0.1.0-1_amd64.deb（实测 68MB，96 个随包库 64.7MB）+ cc-computer-use-0.1.0.mcpb（98MB）
 
-bash packaging/deb/verify-install.sh /tmp/out/*.deb ubuntu:22.04   # 干净容器验收（10 步）
-bash packaging/deb/verify-install.sh /tmp/out/*.deb ubuntu:24.04   # 高版本再验一遍
+bash packaging/deb/verify-install.sh ~/dist/*.deb ubuntu:22.04   # 干净容器验收（10 步）
+bash packaging/deb/verify-install.sh ~/dist/*.deb ubuntu:24.04   # 高版本再验一遍
 ```
 
 **验收状态（2026-09-23）：22.04 与 24.04 两个干净容器各跑一遍，10 步全过。** 另实测产物中所有 ELF 的最高 `GLIBC_*` 需求 = **2.35**（正好是 22.04 的基线；`Xephyr` 与 `libXfont2.so.2` 是最高那两个）—— 这是「在 22.04 里构建」这个约束要保住的东西，换构建基座前先重新量。

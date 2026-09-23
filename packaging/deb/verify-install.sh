@@ -4,7 +4,7 @@
 #
 # 用法:
 #   bash packaging/deb/verify-install.sh <deb 文件> [基座镜像]
-#   例: bash packaging/deb/verify-install.sh /tmp/out/cc-computer-use_0.1.0-1_amd64.deb ubuntu:22.04
+#   例: bash packaging/deb/verify-install.sh ~/dist/cc-computer-use_0.1.0-1_amd64.deb ubuntu:22.04
 #
 # 宿主机上跑 doctor 跑得再绿也说明不了问题：宿主装过全套 apt 依赖，产物缺件时会被
 # **宿主自己的系统库和命令**悄悄补上。目标机器没这层兜底 —— 而本包的分发前提恰恰是

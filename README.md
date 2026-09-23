@@ -302,14 +302,15 @@ Unlike `build.sh` above (which uses this machine's 24.04 base and therefore cann
 22.04 user), this path builds inside a container pinned to the oldest supported base:
 
 ```bash
-docker run --rm -v "$PWD":/src -v /tmp/out:/out \
+mkdir -p ~/dist
+docker run --rm -v "$PWD":/src -v "$HOME/dist":/out \
   -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
   -e CC_CU_MINIFORGE_SH=/miniforge.sh \
   ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'
-# → /tmp/out/cc-computer-use_0.1.0-1_amd64.deb  (68 MB measured)
+# → ~/dist/cc-computer-use_0.1.0-1_amd64.deb  (68 MB measured)
 
 # Accept it in a clean container (install → run → click → uninstall; run it on both 22.04 and 24.04)
-bash packaging/deb/verify-install.sh /tmp/out/*.deb ubuntu:22.04
+bash packaging/deb/verify-install.sh ~/dist/*.deb ubuntu:22.04
 ```
 
 On the target machine, `sudo apt install ./cc-computer-use_*.deb` is all it takes — **nothing else
