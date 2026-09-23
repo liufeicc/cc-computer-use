@@ -145,6 +145,19 @@ echo "=== [8/8] 打 .deb（Ubuntu 用户的主要分发形态）==="
 # 版本号可由 CC_CU_VERSION 覆盖（与 assemble.sh 同源）。
 bash /src/packaging/deb/build-deb.sh /out/dist/cc-computer-use /out/dist
 
+# ── 把产物交还给宿主用户 ─────────────────────────────────────────────────
+# 容器以 root 运行，而 /out 是**从宿主挂进来的目录** —— 不加这一步，产物在宿主上
+# 属主是 root：包文件本身还能删（删文件只看父目录的写权限），但中间目录
+# （computer-use-mcp-bin/ 里几百个 root 所有的文件）**没有 sudo 删不掉**，
+# 于是「把产物挪出 /tmp」这个动作等于把同一个麻烦换了个地方。
+# 传 CC_CU_CHOWN=<uid>:<gid> 即可让产物归宿主用户所有：
+#     -e CC_CU_CHOWN="$(id -u):$(id -g)"
+# 不传就保持原样（在 CI 里挂匿名卷时无所谓）。
+if [ -n "${CC_CU_CHOWN:-}" ]; then
+  echo "=== 收尾：把产物属主改回 $CC_CU_CHOWN（容器内是 root，宿主上不是）==="
+  chown -R "$CC_CU_CHOWN" /out
+fi
+
 echo
 echo "=== 构建完成，产物在 /out/dist ==="
 ls -lh /out/dist/*.deb /out/dist/*.mcpb 2>/dev/null

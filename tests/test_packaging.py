@@ -158,6 +158,38 @@ def test_both_build_paths_embed_atspi():
         assert "embed-atspi.sh" in src, f"{'/'.join(path)} 没有调 embed-atspi.sh"
 
 
+def test_container_build_returns_output_ownership():
+    """
+    容器构建**必须**支持把产物属主交还给宿主用户（`CC_CU_CHOWN`）。
+
+    为什么这条值得一个测试：容器以 root 运行，而 `/out` 是从宿主挂进来的目录。
+    少了这一步，产物在宿主上属主是 root —— 包文件本身还能删（删文件只看父目录的
+    写权限），但 `computer-use-mcp-bin/` 里那几百个 root 所有的文件**没有 sudo 删不掉**。
+    于是「把输出目录从 /tmp 挪到 ~/dist」这个动作，等于把同一个麻烦换了个地方，
+    而且**要等到用户想清理时才发现**（实测踩到）。
+
+    判据是「有没有这一步」，不是「有没有这个变量名」：所以断言 `chown -R` 真的在脚本里，
+    且**必须落在一行真实命令上**（注释里的不算 —— 第一版忘了排除注释，把 `chown` 注释掉
+    守卫照样全绿，等于没测）。
+    """
+    src = _read("packaging", "build-in-container.sh")
+    assert "CC_CU_CHOWN" in src, "容器构建没有交还产物属主的机制"
+
+    # 只看非注释行：# 开头的整行注释与行尾注释都要排除
+    live = []
+    for ln in src.splitlines():
+        code = ln.split("#", 1)[0]
+        if code.strip():
+            live.append(code)
+    assert any(re.search(r'chown -R\s+"\$CC_CU_CHOWN"', ln) for ln in live), \
+        "CC_CU_CHOWN 只在注释里出现，没有真的 chown -R（等于没生效）"
+
+    # 四份文档给的构建命令都必须带上它 —— 漏了的那份会把用户带坑里。
+    for doc in ("README.md", "README.zh-CN.md", "CLAUDE.md",
+                os.path.join("docs", "安装说明.md")):
+        assert "CC_CU_CHOWN" in _read(doc), f"{doc} 的构建命令没带 CC_CU_CHOWN"
+
+
 # ==================== ② 分发清单不许泄漏库路径 ====================
 
 def test_mcpb_manifest_does_not_leak_library_paths():

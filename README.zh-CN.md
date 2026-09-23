@@ -216,7 +216,12 @@ PYTHONNOUSERSITE=1 ./dist/computer-use-mcp --selftest
 
 ```bash
 mkdir -p ~/dist
-docker run --rm -v "$PWD":/src -v "$HOME/dist":/out \
+# 挂到容器内的 /out/dist（而不是 /out）—— 脚本的产物路径就是 /out/dist，
+# 这样产物直接落在 ~/dist 下，不需要事后搬运。
+# CC_CU_CHOWN 是必要的：容器以 root 写入宿主目录，不交还属主的话中间目录
+# 在宿主上没有 sudo 删不掉。
+docker run --rm -v "$PWD":/src -v "$HOME/dist":/out/dist \
+  -e CC_CU_CHOWN="$(id -u):$(id -g)" \
   -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
   -e CC_CU_MINIFORGE_SH=/miniforge.sh \
   ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'

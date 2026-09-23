@@ -262,10 +262,13 @@ GTK 对话框 `get_extents(SCREEN)` 常返回相对窗口原点的漂移坐标�
 三种产物：**本机 `build.sh`**（开发用）、**`.deb`**（Ubuntu 用户）、**`.mcpb`**（Claude Desktop）。后两者共用 `packaging/build-in-container.sh` 一次产出，**必须在 ubuntu:22.04 容器里跑**（24.04 上取到的系统二进制要求 GLIBC 2.38，会恰好排除掉 22.04 这个最低档）。
 
 ```bash
-# 输出目录刻意不用 /tmp（重启即失，且容器以 root 写入、属主是 root 删不掉）；
-# 用 -v "$HOME/dist:/out" 指定一个仓库外的固定位置。
+# 输出目录刻意不用 /tmp（重启即失，且容器以 root 写入、属主是 root 删不掉）。
+# 挂载点是容器内的 /out/dist（脚本的产物路径就是它），于是产物直接落在 ~/dist 下。
+# CC_CU_CHOWN 把产物属主交还宿主用户 —— 否则中间目录（几百个 root 所有的文件）
+# 在宿主上没有 sudo 删不掉，等于把 /tmp 那个麻烦换了个地方。
 mkdir -p ~/dist
-docker run --rm -v "$PWD":/src -v "$HOME/dist":/out \
+docker run --rm -v "$PWD":/src -v "$HOME/dist":/out/dist \
+  -e CC_CU_CHOWN="$(id -u):$(id -g)" \
   -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
   -e CC_CU_MINIFORGE_SH=/miniforge.sh \
   ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'
