@@ -2,29 +2,49 @@
 # ============================================================
 # 把 PyInstaller 产物 + 随包系统组件组装成可分发形态
 #
-# 产出：
-#   <dist>/cc-computer-use/            ← 完整可分发目录（onedir + vendor/）
-#   <dist>/cc-computer-use-<ver>.mcpb  ← Claude Desktop 一键安装包（ZIP）
+# 用法:
+#   bash packaging/assemble.sh <pyinstaller 产物父目录> [输出目录]
+#     <pyinstaller 产物父目录>  内含 computer-use-mcp-bin/（build.sh 或容器构建的 onedir）
+#     [输出目录]                默认与第一个参数相同
 #
-# 调用方：packaging/build-in-container.sh 的第 7 步
+# 产出（都在「输出目录」下）：
+#   cc-computer-use/            ← 完整可分发目录（onedir + vendor/），.deb 的输入
+#   cc-computer-use-<ver>.mcpb  ← Claude Desktop 一键安装包（ZIP）——**默认不产**，见下
+#
+# 为什么入参拆成两个目录（2026-09-23 改）：
+#   容器构建把 PyInstaller 的中间产物放在**容器内**（/out/work），只有最终产物才落到
+#   挂载出来的宿主目录。原先两者共用同一个 dist，于是容器构建产出的 computer-use-mcp-bin/
+#   会和宿主 build.sh 的同名产物**互相覆盖** —— 两个包基于不同的 Ubuntu 基座（22.04 vs
+#   24.04），谁覆盖谁完全取决于最后跑了哪个，而 `dist/computer-use-mcp`（已注册的 MCP
+#   路径）指向的正是那个目录，出了问题根本看不出是哪个基座在跑。
+#
+# 为什么 .mcpb 默认不产（2026-09-23 改）：
+#   本次分发只针对 Ubuntu 用户，.deb 是唯一在用的形态。而 zip 那个 300MB 的目录实测要
+#   2 分钟（占整条流水线约 1/9），天天白跑。要 Claude Desktop 的包时显式开：
+#       CC_CU_MCPB=1 bash packaging/assemble.sh ...
 # ============================================================
 set -euo pipefail
 
-DIST="${1:?用法: assemble.sh <dist_dir>}"
+IN_DIST="${1:?用法: assemble.sh <pyinstaller 产物父目录> [输出目录]}"
+DIST="${2:-$IN_DIST}"
 VERSION="${CC_CU_VERSION:-0.1.0}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+[ -d "$IN_DIST/computer-use-mcp-bin" ] || {
+  echo "❌ $IN_DIST/computer-use-mcp-bin 不存在 —— 第一个参数应是含 PyInstaller onedir 的目录" >&2
+  exit 1; }
+
 PKG="$DIST/cc-computer-use"
 rm -rf "$PKG"
-mkdir -p "$PKG/server" "$PKG/vendor"
+mkdir -p "$PKG/server" "$PKG/vendor" "$DIST"
 
 echo "=== [组装 1/4] 搬运 PyInstaller 产物 ==="
-cp -a "$DIST/computer-use-mcp-bin/." "$PKG/server/"
+cp -a "$IN_DIST/computer-use-mcp-bin/." "$PKG/server/"
 # 顶层 wrapper 不再需要（.mcpb 直接指向 server/computer-use-mcp-bin）
 rm -f "$PKG/server/computer-use-mcp"
 
 echo "=== [组装 2/4] 随包系统组件（vendor/） ==="
-python3 "$HERE/vendor_libs.py" "$DIST" "$PKG/vendor"
+python3 "$HERE/vendor_libs.py" "$IN_DIST" "$PKG/vendor"
 
 echo "=== [组装 3/4] 生成 manifest.json ==="
 # 注意 server.type = binary：MCPB 规范里 binary 用 entry_point 指向可执行文件。
@@ -96,10 +116,16 @@ cat > "$PKG/manifest.json" <<EOF
 EOF
 
 echo "=== [组装 4/4] 打包 .mcpb ==="
-MCPB="$DIST/cc-computer-use-${VERSION}.mcpb"
-rm -f "$MCPB"
-( cd "$PKG" && zip -qr9 "$MCPB" . )
-echo "  $MCPB  ($(du -h "$MCPB" | cut -f1))"
+# 默认不产（理由见文件头）：本次分发只针对 Ubuntu 用户，.deb 是唯一在用的形态，
+# 而这个 zip 要 2 分钟。需要 Claude Desktop 的包时显式 CC_CU_MCPB=1。
+if [ -z "${CC_CU_MCPB:-}" ]; then
+  echo "  跳过（未设 CC_CU_MCPB=1）—— 本次只出 .deb"
+else
+  MCPB="$DIST/cc-computer-use-${VERSION}.mcpb"
+  rm -f "$MCPB"
+  ( cd "$PKG" && zip -qr9 "$MCPB" . )
+  echo "  $MCPB  ($(du -h "$MCPB" | cut -f1))"
+fi
 
 echo
 echo "=== 组装完成 ==="

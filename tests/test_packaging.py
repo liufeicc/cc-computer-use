@@ -158,6 +158,98 @@ def test_both_build_paths_embed_atspi():
         assert "embed-atspi.sh" in src, f"{'/'.join(path)} 没有调 embed-atspi.sh"
 
 
+# ==================== ①b 容器构建的路径分工与产物范围 ====================
+
+def _live_lines(src: str) -> list[str]:
+    """去掉整行注释与行尾注释，只留**真正会执行**的行。
+
+    好几条守卫都要用它：注释里写一句「本该如此」是挡不住问题的
+    （见 test_container_build_returns_output_ownership 的教训）。
+    """
+    out = []
+    for ln in src.splitlines():
+        code = ln.split("#", 1)[0]
+        if code.strip():
+            out.append(code)
+    return out
+
+
+def test_container_build_separates_work_from_output():
+    """
+    容器构建必须把**中间产物**放在容器内（`$WORK`），只有最终产物落到挂载出来的
+    `$OUT`（宿主 `dist/`）。
+
+    合并成一个目录的后果（2026-09-23 实测）：宿主 `dist/` 里住着 `build.sh` 的
+    `dist/computer-use-mcp-bin/`（**24.04 基座**的本地开发构建），而容器构建的
+    PyInstaller 也叫 `computer-use-mcp-bin`（**22.04 基座**）。共用同一个 dist 时两者
+    互相覆盖，而宿主的 `dist/computer-use-mcp`（**已注册的 MCP 启动脚本**）正指向那个
+    目录 —— 于是「现在跑的是哪个基座」完全取决于最后跑了谁，出问题时看不出来。
+
+    判据是「PyInstaller 的 distpath 指向 WORK、且它与 OUT 不是同一个值」，而不是
+    「文件里有 OUT 这个词」。
+    """
+    src = _read("packaging", "build-in-container.sh")
+    live = _live_lines(src)
+
+    def _var(name: str) -> str:
+        m = next((re.match(rf"\s*{name}=(\S+)\s*$", ln) for ln in live
+                  if re.match(rf"\s*{name}=", ln)), None)
+        assert m, f"没有在真实命令行上定义 {name}"
+        return m.group(1)
+
+    assert _var("OUT") != _var("WORK"), "OUT 与 WORK 是同一个目录，等于没分"
+
+    distpath = next((ln for ln in live if "--distpath" in ln), None)
+    assert distpath, "没找到 --distpath"
+    assert "$WORK" in distpath, \
+        f"PyInstaller 的产物没落到 WORK（会覆盖宿主的同名开发构建）: {distpath.strip()}"
+
+
+def test_container_build_defaults_to_deb_only():
+    """
+    默认**只出 .deb**，不打 .mcpb。
+
+    理由：本次分发只针对 Ubuntu 用户，`.deb` 是唯一在用的形态；而 zip 那 300MB 的组装
+    目录实测要 2 分钟（占整条流水线约 1/9），每次构建都白跑。
+
+    判据取「zip 那行处在 CC_CU_MCPB 的条件分支里」——只断言「文件里有 CC_CU_MCPB」
+    挡不住「变量在、但 zip 照跑无条件跑」（同款漏法见 test_build_sh_collects_xlib）。
+    """
+    src = _read("packaging", "assemble.sh")
+    live = _live_lines(src)
+
+    assert any("CC_CU_MCPB" in ln for ln in live), "没有任何控制 .mcpb 的开关"
+    zip_ln = next((i for i, ln in enumerate(live) if re.search(r"\bzip\b", ln)), None)
+    assert zip_ln is not None, "没找到打 .mcpb 的 zip 调用（脚本被大改？）"
+
+    # zip 必须出现在某个 `if [ -z "${CC_CU_MCPB:-}" ]`（或等价的反向判断）之后
+    guard = next((i for i, ln in enumerate(live)
+                  if "CC_CU_MCPB" in ln and re.search(r"\bif\b|\bcase\b|\|\|", ln)), None)
+    assert guard is not None, "CC_CU_MCPB 没有被用在条件判断里"
+    assert guard < zip_ln, "zip 在开关判断之前就跑了（等于开关无效，.mcpb 还是会产）"
+
+
+def test_build_sh_does_not_wipe_the_whole_dist():
+    """
+    `build.sh` 的清理动作**只许删自己的两个产物**，不许 `rm -rf dist`。
+
+    `dist/` 现在同时住着两种东西：`build.sh` 的（`computer-use-mcp-bin/` + wrapper
+    `computer-use-mcp`）与容器构建的（`.deb` + 组装目录）。整目录清掉会把 68MB 的包
+    连同 300MB 的组装目录一起抹掉 —— 而用户不会预期「跑一次本机开发构建」会顺手删掉
+    分发产物。
+
+    判据是**非注释行**上的 `rm -rf dist`（脚本里有一段注释专门解释为什么不这么做，
+    不能把那段注释也算成违规）。
+    """
+    live = _live_lines(_read("build.sh"))
+    bad = [ln.strip() for ln in live
+           if re.search(r"\brm\s+-rf\b", ln) and re.search(r"(^|\s)dist(\s|$)", ln)]
+    assert not bad, f"build.sh 又在整目录删 dist 了: {bad}"
+    # 但确实要清掉自己的产物，否则 PyInstaller 会往旧目录里叠加
+    assert any("dist/computer-use-mcp-bin" in ln for ln in live), \
+        "build.sh 没有清理自己的 dist/computer-use-mcp-bin"
+
+
 def test_container_build_returns_output_ownership():
     """
     容器构建**必须**支持把产物属主交还给宿主用户（`CC_CU_CHOWN`）。

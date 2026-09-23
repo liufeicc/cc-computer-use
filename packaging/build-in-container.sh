@@ -13,9 +13,21 @@
 #   .tar.gz），pip 安装会走源码编译。conda-forge 提供真二进制，且把 gtk/GI 栈
 #   一起带进环境，不碰系统 Gi。
 #
-# 产物：/out/dist/（onedir + wrapper + vendor/ 系统组件 + manifest 用 JSON）
+# 产物：/out/dist/（挂载到宿主的 dist/）—— 最终产物。中间产物在 /out/work（容器内）。
 # ============================================================
 set -euo pipefail
+
+# ── 两个输出路径，别再合并（2026-09-23 改）────────────────────────────────
+#   OUT  = 挂载宿主 dist/ 的目录，**只放最终产物**：组装目录 + .deb
+#   WORK = 容器内的临时目录，放全部的中间产物（PyInstaller 的 onedir、build、spec）
+#
+# 为什么必须分开：宿主 dist/ 里已经有 build.sh 的产物 dist/computer-use-mcp-bin/
+# （24.04 基座的开发构建），而本脚本的 PyInstaller 也叫 computer-use-mcp-bin。
+# 两者共用同一个 dist 时会**互相覆盖**，且宿主的 dist/computer-use-mcp（已注册的
+# MCP 启动脚本）正指向那个目录 —— 于是「现在跑的是 22.04 那份还是 24.04 那份」
+# 完全取决于最后跑了谁，出问题根本看不出来。
+OUT=/out/dist
+WORK=/out/work
 
 MAMBA_VER="26.7.2-0"
 # pygobject 3.50 需要 Python >=3.12（与本项目 requires-python 一致）
@@ -117,9 +129,9 @@ cd /src
   --onedir \
   --name computer-use-mcp-bin \
   --paths src \
-  --distpath /out/dist \
-  --workpath /out/build \
-  --specpath /out/build \
+  --distpath "$WORK" \
+  --workpath "$WORK/build" \
+  --specpath "$WORK/build" \
   --collect-submodules gi \
   --collect-data gi \
   --collect-binaries gi \
@@ -155,31 +167,31 @@ cd /src
 # 那边可能既没装 libatspi2.0-0 也没装 gir1.2-atspi-2.0。
 # 落在 _internal 之下还顺带保住了安全不变量——_strip_frozen_lib_path 只剥
 # _MEIPASS 之下的路径，所以它会被自动从子进程 env 里剥掉。详见脚本注释。
-bash /src/packaging/embed-atspi.sh /out/dist/computer-use-mcp-bin
+bash /src/packaging/embed-atspi.sh "$WORK/computer-use-mcp-bin"
 
-_step "7/8" "组装可分发目录（.mcpb / 通用目录）"
-bash /src/packaging/assemble.sh /out/dist
+_step "7/8" "组装可分发目录（.deb 的输入）"
+bash /src/packaging/assemble.sh "$WORK" "$OUT"
 
 _step "8/8" "打 .deb（Ubuntu 用户的主要分发形态）"
 # 在容器里打而不是在宿主打：这边的 dpkg 就是 22.04 的那一份，打出来的包天然与
 # 最低目标平台一致，不需要额外假设宿主的 dpkg-deb 行为。
 # 版本号可由 CC_CU_VERSION 覆盖（与 assemble.sh 同源）。
-bash /src/packaging/deb/build-deb.sh /out/dist/cc-computer-use /out/dist
+bash /src/packaging/deb/build-deb.sh "$OUT/cc-computer-use" "$OUT"
 
 # ── 把产物交还给宿主用户 ─────────────────────────────────────────────────
-# 容器以 root 运行，而 /out 是**从宿主挂进来的目录** —— 不加这一步，产物在宿主上
-# 属主是 root：包文件本身还能删（删文件只看父目录的写权限），但中间目录
-# （computer-use-mcp-bin/ 里几百个 root 所有的文件）**没有 sudo 删不掉**，
-# 于是「把产物挪出 /tmp」这个动作等于把同一个麻烦换了个地方。
+# 容器以 root 运行，而 $OUT 是**从宿主挂进来的目录** —— 不加这一步，产物在宿主上
+# 属主是 root。包文件本身还能删（删文件只看父目录的写权限），但组装目录
+# （cc-computer-use/ 里几百个 root 所有的文件）**没有 sudo 删不掉**，
+# 于是「把产物放到 dist/」这个动作等于换个地方踩同一个坑。
 # 传 CC_CU_CHOWN=<uid>:<gid> 即可让产物归宿主用户所有：
 #     -e CC_CU_CHOWN="$(id -u):$(id -g)"
 # 不传就保持原样（在 CI 里挂匿名卷时无所谓）。
 if [ -n "${CC_CU_CHOWN:-}" ]; then
   echo "=== 收尾：把产物属主改回 $CC_CU_CHOWN（容器内是 root，宿主上不是）==="
-  chown -R "$CC_CU_CHOWN" /out
+  chown -R "$CC_CU_CHOWN" "$OUT"
 fi
 
 _finish
 echo
-echo "=== 构建完成，产物在 /out/dist ==="
-ls -lh /out/dist/*.deb /out/dist/*.mcpb 2>/dev/null
+echo "=== 构建完成，产物在 $OUT（挂载到宿主 dist/）==="
+ls -lh "$OUT"/*.deb 2>/dev/null

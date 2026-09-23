@@ -215,21 +215,25 @@ PYTHONNOUSERSITE=1 ./dist/computer-use-mcp --selftest
 ### 打成 `.deb` 分发给 Ubuntu 用户（推荐）
 
 ```bash
-mkdir -p ~/dist
-# 挂到容器内的 /out/dist（而不是 /out）—— 脚本的产物路径就是 /out/dist，
-# 这样产物直接落在 ~/dist 下，不需要事后搬运。
-# CC_CU_CHOWN 是必要的：容器以 root 写入宿主目录，不交还属主的话中间目录
+mkdir -p dist
+# 挂到容器内的 /out/dist（脚本的最终产物路径就是它），于是包直接落在本仓库的 dist/ 下。
+# 中间产物走 /out/work，留在容器里 —— 分开是为了不覆盖 build.sh 的同名产物
+# dist/computer-use-mcp-bin/（两者基座不同：22.04 vs 本机 24.04）。
+# CC_CU_CHOWN 是必要的：容器以 root 写入宿主目录，不交还属主的话组装目录
 # 在宿主上没有 sudo 删不掉。
-docker run --rm -v "$PWD":/src -v "$HOME/dist":/out/dist \
+docker run --rm -v "$PWD":/src -v "$PWD/dist":/out/dist \
   -e CC_CU_CHOWN="$(id -u):$(id -g)" \
   -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
   -e CC_CU_MINIFORGE_SH=/miniforge.sh \
   ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'
-# → ~/dist/cc-computer-use_0.1.0-1_amd64.deb（实测 68 MB）
+# → dist/cc-computer-use_0.1.0-1_amd64.deb（实测 68 MB）
 
 # 在干净容器里验收（装、跑、点、卸全链路；22.04 与 24.04 各跑一遍）
-bash packaging/deb/verify-install.sh ~/dist/*.deb ubuntu:22.04
+bash packaging/deb/verify-install.sh dist/*.deb ubuntu:22.04
 ```
+
+只产 `.deb`，**不打 `.mcpb`**（Claude Desktop 那个包要额外 zip 两分钟，本次分发用不到；
+需要时加 `CC_CU_MCPB=1`）。
 
 目标机 `sudo apt install ./cc-computer-use_*.deb` 即可，**不需要装任何东西**：
 xdotool / Xephyr / i3 / tesseract 等 9 个系统二进制、它们的依赖闭包、Atspi typelib

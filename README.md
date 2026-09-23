@@ -302,20 +302,32 @@ Unlike `build.sh` above (which uses this machine's 24.04 base and therefore cann
 22.04 user), this path builds inside a container pinned to the oldest supported base:
 
 ```bash
-mkdir -p ~/dist
-# 挂到容器内的 /out/dist（而不是 /out）—— 脚本的产物路径就是 /out/dist，
-# 这样产物直接落在 ~/dist 下，不需要事后搬运。
-# CC_CU_CHOWN 是必要的：容器以 root 写入宿主目录，不交还属主的话中间目录
+mkdir -p dist
+# 挂到容器内的 /out/dist（脚本的最终产物路径就是它），于是包直接落在本仓库的 dist/ 下。
+# 中间产物走 /out/work，留在容器里 —— 分开是为了不覆盖 build.sh 的同名产物
+# dist/computer-use-mcp-bin/（两者基座不同：22.04 vs 本机 24.04）。
+# CC_CU_CHOWN 是必要的：容器以 root 写入宿主目录，不交还属主的话组装目录
 # 在宿主上没有 sudo 删不掉。
-docker run --rm -v "$PWD":/src -v "$HOME/dist":/out/dist \
+docker run --rm -v "$PWD":/src -v "$PWD/dist":/out/dist \
   -e CC_CU_CHOWN="$(id -u):$(id -g)" \
   -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
   -e CC_CU_MINIFORGE_SH=/miniforge.sh \
   ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'
-# → ~/dist/cc-computer-use_0.1.0-1_amd64.deb  (68 MB measured)
+# → dist/cc-computer-use_0.1.0-1_amd64.deb  (68 MB measured)
 
 # Accept it in a clean container (install → run → click → uninstall; run it on both 22.04 and 24.04)
-bash packaging/deb/verify-install.sh ~/dist/*.deb ubuntu:22.04
+bash packaging/deb/verify-install.sh dist/*.deb ubuntu:22.04
+```
+
+Only the `.deb` is produced — the `.mcpb` (Claude Desktop bundle) is opt-in via `CC_CU_MCPB=1`,
+since it costs ~2 minutes of zipping and isn't part of this distribution.
+
+**Re-packaging without the 19-minute rebuild**: `dist/cc-computer-use/` is the assembled tree the
+`.deb` is built from, so a change to the packaging scripts alone takes ~1 minute:
+
+```bash
+docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/d -v /tmp/o:/o ubuntu:22.04 \
+  bash -c 'bash /src/packaging/deb/build-deb.sh /d/cc-computer-use /o'
 ```
 
 On the target machine, `sudo apt install ./cc-computer-use_*.deb` is all it takes — **nothing else

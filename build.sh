@@ -49,7 +49,13 @@ echo "=== 清理旧产物 ==="
 # 历史那行写的是 `computer-use-mcp.spec`，那个文件**从来不存在**：上一轮的 spec 一直
 # 留在仓库里（虽然 .gitignore 挡住了它，不影响构建，但这个清理动作等于没做）。
 # 同时删掉两种名字：换过 --name 的旧工作区里可能残留任一种。
-rm -rf build dist computer-use-mcp.spec computer-use-mcp-bin.spec
+rm -rf build computer-use-mcp.spec computer-use-mcp-bin.spec
+# ⚠️ 只删**本脚本自己的两个产物**，不要写回 `rm -rf dist`（2026-09-23 改）：
+#   dist/ 现在同时放着容器构建打出来的 .deb 与组装目录（见 CLAUDE.md「分发形态」一节）。
+#   整目录清掉会把那个 68MB 的包连同 300MB 的组装目录一起删掉 —— 而这两个都不是
+#   本脚本产的，用户根本不会预期「跑一次本机开发构建」会顺手把分发产物抹了。
+#   本脚本在 dist/ 下的产物只有下面这两个，精确删它们即可。
+rm -rf dist/computer-use-mcp-bin dist/computer-use-mcp
 
 echo "=== 开始打包（onedir，冷启动快）==="
 # ⚠️ 不要改回 `--collect-all gi`（2026-09-23 实测）：

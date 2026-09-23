@@ -262,21 +262,37 @@ GTK 对话框 `get_extents(SCREEN)` 常返回相对窗口原点的漂移坐标�
 三种产物：**本机 `build.sh`**（开发用）、**`.deb`**（Ubuntu 用户）、**`.mcpb`**（Claude Desktop）。后两者共用 `packaging/build-in-container.sh` 一次产出，**必须在 ubuntu:22.04 容器里跑**（24.04 上取到的系统二进制要求 GLIBC 2.38，会恰好排除掉 22.04 这个最低档）。
 
 ```bash
-# 输出目录刻意不用 /tmp（重启即失，且容器以 root 写入、属主是 root 删不掉）。
-# 挂载点是容器内的 /out/dist（脚本的产物路径就是它），于是产物直接落在 ~/dist 下。
-# CC_CU_CHOWN 把产物属主交还宿主用户 —— 否则中间目录（几百个 root 所有的文件）
-# 在宿主上没有 sudo 删不掉，等于把 /tmp 那个麻烦换了个地方。
-mkdir -p ~/dist
-docker run --rm -v "$PWD":/src -v "$HOME/dist":/out/dist \
+# 产物落在**本仓库的 dist/**（不是 /tmp：重启即失，且容器以 root 写入、属主是 root）。
+# 两个路径分工，别合并：OUT=/out/dist（挂宿主 dist/，只放最终产物）
+#                          WORK=/out/work（容器内，PyInstaller 的中间产物）
+# 分开的理由：宿主 dist/ 里已有 build.sh 的 dist/computer-use-mcp-bin/（24.04 基座），
+# 与本脚本的 PyInstaller 同名 —— 共用会把两边互相覆盖，而 dist/computer-use-mcp
+# （已注册的 MCP 路径）正指向它，出问题看不出跑的是哪个基座。
+# CC_CU_CHOWN 交还产物属主：容器以 root 写宿主目录，否则组装目录没有 sudo 删不掉。
+mkdir -p dist
+docker run --rm -v "$PWD":/src -v "$PWD/dist":/out/dist \
   -e CC_CU_CHOWN="$(id -u):$(id -g)" \
   -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
   -e CC_CU_MINIFORGE_SH=/miniforge.sh \
   ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'
-# → ~/dist/cc-computer-use_0.1.0-1_amd64.deb（实测 68MB，96 个随包库 64.7MB）+ cc-computer-use-0.1.0.mcpb（98MB）
+# → dist/cc-computer-use_0.1.0-1_amd64.deb（实测 68MB，96 个随包库 64.7MB）
+#   外加 dist/cc-computer-use/（组装目录，.deb 的输入，留着可直接重打）
+# ⚠️ 默认**只出 .deb**，不打 .mcpb（zip 那 300MB 要 2 分钟，本次分发用不到）；
+#    要 Claude Desktop 的包就加 `-e CC_CU_MCPB=1`。
 
-bash packaging/deb/verify-install.sh ~/dist/*.deb ubuntu:22.04   # 干净容器验收（10 步）
-bash packaging/deb/verify-install.sh ~/dist/*.deb ubuntu:24.04   # 高版本再验一遍
+bash packaging/deb/verify-install.sh dist/*.deb ubuntu:22.04   # 干净容器验收（10 步）
+bash packaging/deb/verify-install.sh dist/*.deb ubuntu:24.04   # 高版本再验一遍
+
+# 只改了打包脚本/control 文件时**别重跑上面那 19 分钟**——组装目录已经有了，
+# 直接重打 deb 只要约 1 分钟（实测 1m07s）：
+docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/d -v /tmp/o:/o ubuntu:22.04 \
+  bash -c 'bash /src/packaging/deb/build-deb.sh /d/cc-computer-use /o'
 ```
+
+⚠️ **`dist/` 现在同时住着两种产物**：`build.sh` 的（`computer-use-mcp-bin/` + wrapper
+`computer-use-mcp`）与容器构建的（`.deb` + `cc-computer-use/`）。**`build.sh` 的清理动作
+已改成只删自己那两个**——别写回 `rm -rf dist`，那会把 68MB 的包和 300MB 的组装目录一起抹掉，
+而用户不会预期「跑一次本机开发构建」会顺手删掉分发产物。
 
 **验收状态（2026-09-23）：22.04 与 24.04 两个干净容器各跑一遍，10 步全过。** 另实测产物中所有 ELF 的最高 `GLIBC_*` 需求 = **2.35**（正好是 22.04 的基线；`Xephyr` 与 `libXfont2.so.2` 是最高那两个）—— 这是「在 22.04 里构建」这个约束要保住的东西，换构建基座前先重新量。
 
