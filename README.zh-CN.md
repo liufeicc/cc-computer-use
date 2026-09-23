@@ -2,14 +2,32 @@
 
 **中文** | [English](README.md)
 
-让 AGENT（Claude Code 等）**直接使用 Linux 桌面**的 MCP server。
+让 AGENT（Claude Code 等）**直接使用 Linux 桌面**的 MCP server —— 而且**不抢你的鼠标**。
 
-核心理念：用**无障碍接口（AT-SPI）结构化感知 + 元素级操作**，替代传统「截图 + 坐标点击」，从根上解决两个痛点：
+别的 computer-use server 都做同一件事：运行期间**接管**你的鼠标、键盘和屏幕。本项目默认把
+Agent 放进**它自己的一块私有虚拟屏**，你可以同时继续用电脑。确实需要它操作真实桌面时，
+一个环境变量即可切换。
+
+| | 传统 computer-use MCP | 本项目 |
+|---|---|---|
+| Agent 工作时 | 鼠标/键盘/屏幕被**独占**，你没法用电脑 | **零干扰** —— Agent 在私有 Xephyr 虚拟屏里 |
+| 隔离 Agent | 得自己搭 VM / 容器 | **默认开启**，无需额外配置 |
+| 沙箱不可用 | 静默回落到你的真实桌面 | **拒绝执行**并说明原因 |
+| 无障碍树 | 与你的桌面共用一条 AT-SPI 总线 | **私有 AT-SPI 总线**，宿主总线看不到沙箱内应用 |
+
+> Anthropic 官方的 computer-use 参考实现原话：跑在虚拟机之外是 *"strongly discouraged"*，
+> 且 *"no safeguards"*（没有任何防护）。本项目认真对待这一点 —— 隔离在这里是**默认值**，
+> 而不是一个你得自己配对的选项。
+
+## 感知方式
+
+感知走**无障碍接口（AT-SPI）结构化读取**、操作走**元素级动作**，替代传统「截图 + 坐标点击」，
+再从根上解决另外两个问题：
 
 | 痛点 | 传统方案 | 本项目方案 |
 |------|----------|-----------|
-| ① 截图费 token | 每轮截图 1000+ token | 读无障碍树 / OCR 文本（都是紧凑文本，省 token） |
-| ② 鼠标点不准 | LLM 从截图估算坐标，DPI/多屏层层丢精度 | 元素级 `do_action`，**零坐标**、不受焦点/分辨率/DPI 影响 |
+| 截图费 token | 每轮截图 1000+ token | 读无障碍树 / OCR 文本（都是紧凑文本，省 token） |
+| 鼠标点不准 | LLM 从截图估算坐标，DPI/多屏层层丢精度 | 元素级 `do_action`，**零坐标**、不受焦点/分辨率/DPI 影响 |
 
 > 可行性由 [`demo/`](demo/README.md) 实测确立：**元素级操作完胜坐标点击**——本项目执行层即「元素级优先，坐标点击仅兜底」。
 >
@@ -246,11 +264,11 @@ PYTHONNOUSERSITE=1 ./dist/computer-use-mcp --selftest
 
 ```bash
 # 单元测试（无需桌面）：geometry 校准 / refs 映射 / serializer 去噪 / 注入与沙箱逻辑
-# 全量收集 308 项；不带 e2e 开关时 302 passed / 6 skipped（端到端自动 skip）
+# 全量收集 310 项；不带 e2e 开关时 304 passed / 6 skipped（端到端自动 skip）
 PYTHONNOUSERSITE=1 python -m pytest -q
 
 # 端到端（需 X11 + zenity + Xephyr）：默认在**沙箱内**跑，不碰真实桌面；需显式 opt-in
-# 308 passed
+# 310 passed
 CC_CU_E2E=1 PYTHONNOUSERSITE=1 python -m pytest -q
 
 # 手动 story（共 6 个，完整清单见 docs/安装说明.md §5.4）
@@ -348,18 +366,14 @@ cc-computer-use/
 ## 路线图
 
 - ✅ **Phase 0** 可行性验证（`demo/`）
-- ✅ **Phase 1** Linux MVP（本项目：14 工具 + backend + core + 打包）
+- ✅ **Phase 1** Linux MVP（本项目：17 工具 + backend + core + 打包）
 - ✅ **Phase 1.5** 隔离沙箱（Xephyr 虚拟屏默认隔离 + 私有 AT-SPI 总线 + `launch_app`，宿主零干扰）
 - ⬜ **Phase 2** 精度加固 + token 优化（树 diff、uinput、焦点处理）
 - ⬜ **Phase 3** Windows backend（UIA + SendInput）
-- ⬜ **Phase 4** 灰区兜底 + 视觉解析 + 扩展工具（scroll/drag）
+- ⬜ **Phase 4** 视觉解析 + 进一步的灰区兜底
 
 ---
 
 ## 许可证
 
-[GNU Affero 通用公共许可证 v3.0](LICENSE) —— Copyright (C) 2026 刘飞 (liufei)
-
-本程序是自由软件：你可以依据自由软件基金会发布的 GNU Affero 通用公共许可证条款（第 3 版或你选择的任何更新版本）重新发布和/或修改它。
-
-由于 AGPL 是**网络 copyleft** 许可证：若你运行本软件的修改版并通过网络提供服务，你必须向该服务的用户提供对应的源代码。
+[MIT](LICENSE) —— Copyright (c) 2026 刘飞 (liufei)

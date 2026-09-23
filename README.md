@@ -2,16 +2,35 @@
 
 [中文文档](README.zh-CN.md) | **English**
 
-An MCP server that lets an AGENT (Claude Code, etc.) **drive a Linux desktop directly**.
+An MCP server that lets an AGENT (Claude Code, etc.) drive a Linux desktop — **without taking over
+yours**.
 
-Core idea: perceive the UI through the **accessibility tree (AT-SPI)** and act through **element-level
-actions** — instead of the conventional "screenshot + coordinate click". This removes two pain points
-at the root:
+Most computer-use servers do the same thing: they seize your mouse, your keyboard and your screen for
+the whole run. This one puts the agent on **its own private virtual screen** by default, so you keep
+working while it does. When you *do* want it driving the real desktop, one environment variable
+switches it over.
+
+| | Conventional computer-use MCP | This project |
+|---|---|---|
+| While the agent works | Mouse / keyboard / screen are **seized** — you can't use your machine | **Untouched** — the agent gets a private Xephyr virtual screen |
+| Isolating the agent | You build the VM or container yourself | **On by default**, zero setup |
+| Sandbox unavailable | Silently falls back to your real desktop | **Refuses to run** and says why |
+| The a11y tree | One AT-SPI bus shared with your desktop | **Private AT-SPI bus** — the host bus cannot see sandboxed apps |
+
+> Anthropic's own computer-use reference says running such an agent outside a VM is
+> *"strongly discouraged"* and that there are *"no safeguards"*. This server takes that seriously —
+> isolation is the default here, not a setting you have to get right.
+
+## How it perceives
+
+Perception goes through the **accessibility tree (AT-SPI)** and action through **element-level
+operations**, instead of the conventional "screenshot + coordinate click". That removes two more
+problems at the root:
 
 | Pain point | Conventional approach | This project |
 |---|---|---|
-| ① Screenshots burn tokens | 1000+ tokens per screenshot, every round | Read the a11y tree / OCR text — both compact text |
-| ② Clicks miss the target | LLM estimates coordinates from pixels; DPI and multi-monitor stack up the error | Element-level `do_action`: **zero coordinates**, immune to focus / resolution / DPI |
+| Screenshots burn tokens | 1000+ tokens per screenshot, every round | Read the a11y tree / OCR text — both compact text |
+| Clicks miss the target | LLM estimates coordinates from pixels; DPI and multi-monitor stack up the error | Element-level `do_action`: **zero coordinates**, immune to focus / resolution / DPI |
 
 > Feasibility was established by measurement in [`demo/`](demo/README.md) — the conclusion there was
 > that **element-level actions beat coordinate clicking outright**, which is why the execution layer
@@ -322,11 +341,11 @@ Once connected you can give natural-language tasks, for example:
 
 ```bash
 # Unit tests (no desktop needed): geometry calibration / ref mapping / serializer denoising /
-# injection and sandbox logic. 308 tests collected; without the e2e flag: 302 passed, 6 skipped
+# injection and sandbox logic. 310 tests collected; without the e2e flag: 304 passed, 6 skipped
 PYTHONNOUSERSITE=1 python -m pytest -q
 
 # End-to-end (needs X11 + zenity + Xephyr): runs INSIDE the sandbox by default, never touching the
-# real desktop; requires explicit opt-in. 308 passed
+# real desktop; requires explicit opt-in. 310 passed
 CC_CU_E2E=1 PYTHONNOUSERSITE=1 python -m pytest -q
 
 # Manual stories (6 of them; full list in docs/安装说明.md §5.4)
@@ -449,17 +468,10 @@ modules by responsibility. Their public namespaces are unchanged (`display.MANAG
 - ✅ **Phase 1.5** Isolation sandbox (Xephyr virtual screen by default + private AT-SPI bus + `launch_app`)
 - ⬜ **Phase 2** Precision hardening + token optimization (tree diffing, uinput, focus handling)
 - ⬜ **Phase 3** Windows backend (UIA + SendInput)
-- ⬜ **Phase 4** Grey-area fallbacks + visual parsing + extra tools (scroll/drag)
+- ⬜ **Phase 4** Visual parsing + further grey-area fallbacks
 
 ---
 
 ## License
 
-[GNU Affero General Public License v3.0](LICENSE) — Copyright (C) 2026 刘飞 (liufei)
-
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU
-Affero General Public License as published by the Free Software Foundation, either version 3 of the
-License, or (at your option) any later version.
-
-Because this is an AGPL network-copyleft license, if you run a modified version of this software to
-provide a service over a network, you must offer the corresponding source to that service's users.
+[MIT](LICENSE) — Copyright (c) 2026 刘飞 (liufei)

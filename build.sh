@@ -9,7 +9,7 @@
 #   为不破坏 ~/.claude.json 已注册的 dist/computer-use-mcp 路径，
 #   在该路径放一个 shell wrapper 转发到目录内真实可执行文件。
 #
-# 关键约束（见 docs/开发计划.md 与 _bootstrap.py）：
+# 关键约束（见 _bootstrap.py）：
 #   - AT-SPI 依赖系统库（libatspi / Atspi typelib / xdotool），无法打进二进制；
 #     冻结后由 _bootstrap 在运行时设 GI_TYPELIB_PATH 指向系统，属 OS 级运行时依赖。
 #   - 全程 PYTHONNOUSERSITE=1，避免 ~/.local 的 mcp 遮蔽 conda 包导致打错版本。
