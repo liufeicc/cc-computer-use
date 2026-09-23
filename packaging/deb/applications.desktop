@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Set up Computer Use MCP for this user
+Comment=Register the Computer Use MCP server in Claude Code and enable the accessibility switch
+# 用 x-terminal-emulator（Debian alternatives，任何桌面都有）而不是 Terminal=true：
+# 后者在 GNOME 上命令一结束就关窗，用户根本看不到输出。
+Exec=x-terminal-emulator -e /usr/bin/cc-computer-use-setup
+Icon=utilities-terminal
+Terminal=false
+# 只放**一个**主分类：Category 里并列两个主分类（Settings 与 Utility 都算）会让
+# 应用菜单里出现两份，desktop-file-validate 也会提示。Settings 更贴切。
+Categories=Settings;
+Keywords=mcp;claude;computer-use;accessibility;

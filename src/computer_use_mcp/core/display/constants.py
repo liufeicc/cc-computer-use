@@ -70,6 +70,12 @@ ENV_SANDBOX_WM = "CC_CU_SANDBOX_WM"
 
 ENV_SANDBOX_AT_SPI_BUS = "CC_CU_SANDBOX_AT_SPI_BUS"
 
+# 随包自带的 AT-SPI 总线配置路径（.deb / .mcpb 的 wrapper 会设它）。
+# 为什么需要这个变量、而不是往 _AT_SPI_CONF_CANDIDATES 里再加一条常量：自带那份的路径
+# 取决于安装前缀（如 `/opt/cc-computer-use/vendor/at-spi2/accessibility.conf`），
+# 编译期写不进常量表；而系统那三个候选是 Debian 布局的硬编码，两者不是一回事。
+ENV_AT_SPI_CONF = "CC_CU_AT_SPI_CONF"
+
 # 死地址：语法合法但不存在。libatspi 连不上、也不会回落（实测）。
 _DEAD_AT_SPI_BUS = "unix:path=/nonexistent/cc-cu-no-at-spi-bus"
 
@@ -127,10 +133,26 @@ def _resolve_at_spi_deps() -> tuple[str | None, str | None]:
     """
     定位 `accessibility.conf` 与 `at-spi2-registryd`（M-10①）。
 
-    返回 `(conf, registryd)`，找不到的为 None。registryd 再多走一层 `shutil.which`：
-    它在有些发行版上是在 PATH 里的，硬编码路径只是最常见的那个。
+    返回 `(conf, registryd)`，找不到的为 None。
+
+    **conf 的第一优先是环境变量 `CC_CU_AT_SPI_CONF`**，系统候选表降为兜底。为什么：
+    随包分发（.deb / .mcpb）时必须自带一份 conf —— 系统那份
+    `/usr/share/defaults/at-spi2/accessibility.conf` **属 at-spi2-core**，随包再写一份
+    就是 dpkg 文件冲突（安装直接失败）；而目标机可能根本没装 at-spi2-core，没有 conf
+    就起不了私有总线 → 沙箱内 a11y 整体消失。变量指向不存在的位置时**告警并回退**，
+    不静默降级。
+
+    registryd 再多走一层 `shutil.which`：它在有些发行版上是在 PATH 里的，硬编码路径
+    只是最常见的那个（Amazon Linux / Fedora 布局不同）。随包分发的形态也正是靠这一层
+    找到 `vendor/bin/at-spi2-registryd`——wrapper 把 vendor/bin 前置进了 PATH。
     """
-    conf = next((p for p in _AT_SPI_CONF_CANDIDATES if os.path.exists(p)), None)
+    conf = (os.environ.get(ENV_AT_SPI_CONF) or "").strip() or None
+    if conf is not None and not os.path.exists(conf):
+        log.warning("%s 指向的 %s 不存在，回退到系统候选路径", ENV_AT_SPI_CONF, conf)
+        conf = None
+    if conf is None:
+        conf = next((p for p in _AT_SPI_CONF_CANDIDATES if os.path.exists(p)), None)
+
     reg = next((p for p in _AT_SPI_REGISTRYD_CANDIDATES if os.path.exists(p)), None)
     if reg is None:
         reg = shutil.which("at-spi2-registryd")
@@ -148,7 +170,17 @@ def _strip_frozen_lib_path(env: dict) -> None:
          份文件，混装后堆损坏）；
       2. 它的 a11y 注册泄漏到宿主总线 —— 私有总线隔离失效。
     而我们启动的子进程（沙箱应用、xdotool、i3、Xephyr、dbus-daemon、registryd、
-    tesseract）**全是系统二进制**，依赖一律应由系统提供，与用户手动启动它们的行为一致。
+    tesseract）依赖一律应由系统提供，与用户手动启动它们的行为一致。
+
+    ⚠️ 本函数剥的是「**PyInstaller 产物目录之下**的路径」，不是「所有产物相关路径」——
+    判据是 `sys._MEIPASS`，只认它及其子目录。随包分发（.deb / .mcpb）时还用目录外的
+    `vendor/bin` 提供那批二进制，它们**靠 patchelf 写死的 RPATH `$ORIGIN/../lib` 自定位、
+    根本不经过环境变量**（见 packaging/vendor_libs.py 开头那段），所以不在剥离范围内也
+    安全。反过来说：**任何形如「把 vendor/lib 塞进 LD_LIBRARY_PATH」的做法都会绕开这里**
+    （它不在 _MEIPASS 下，剥不掉），而那会把约 50 个构建基座的库（libxml2/libcrypto/
+    libicu* 等）泄漏给沙箱应用 —— 正是上面那两条事故的同一类路径。AT-SPI 的
+    libatspi.so.0 因此刻意嵌在 `_internal/` 里（见 packaging/embed-atspi.sh），
+    而不是放进 vendor/lib。
 
     ⚠️ 唯一调用点是 `env_for()`（`app_env` 经它再叠加 a11y 开关）。所有 spawn 点都必须
     经这两个通道取 env —— `tests/test_spawn_env.py` 枚举全部 spawn 点来兜住这一点。

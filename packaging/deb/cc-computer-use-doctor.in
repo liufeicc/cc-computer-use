@@ -1,0 +1,163 @@
+#!/bin/bash
+# ============================================================
+# cc-computer-use —— 体检脚本
+#
+# 回答一个问题：**这台机器上，它到底能不能用？**
+#
+# 为什么值得单独写一个（而不是让用户自己试）：
+#   本包是「自包含」分发的 —— 目标机可能取不到 apt 源，装不上任何东西。
+#   于是所有检查都必须**自己动手、并把失败讲成人话**：哪一项缺了、会导致什么现象、
+#   现在还能做什么。否则一旦出问题，用户看到的现象只是「读不到界面」，
+#   而从现象到原因之间隔着好几层（Xephyr 起没起、私有 a11y 总线起没起、
+#   OCR 语言包在不在…），完全无法自助排查。
+#
+# 用法: cc-computer-use-doctor
+# 退出码: 0 = 关键项全过；1 = 有硬伤（照上面标 ❌ 的那几条处理）
+# ============================================================
+
+readonly PREFIX="@PREFIX@"
+# 布局：assemble.sh 把 PyInstaller onedir 的**内容**摊进 server/，
+# 所以可执行文件与 _internal/ 在 server/ 下平级。
+readonly SERVER="$PREFIX/server"
+readonly EXE="$SERVER/computer-use-mcp-bin"
+readonly VENDOR="$PREFIX/vendor"
+readonly WRAPPER="@MCP_BIN@"
+
+fails=0
+warns=0
+ok()   { printf '  ✅ %s\n' "$*"; }
+bad()  { printf '  ❌ %s\n' "$*"; fails=$((fails + 1)); }
+soft() { printf '  ⚠️  %s\n' "$*"; warns=$((warns + 1)); }
+head_() { printf '\n%s\n' "$*"; }
+
+echo "cc-computer-use 体检"
+echo "安装前缀: $PREFIX"
+
+# ── 1. 载荷完整性 ─────────────────────────────────────────────────────
+head_ "[1/6] 随包文件"
+
+missing=0
+for exe in xdotool Xephyr xclip wmctrl xrandr i3 dbus-daemon at-spi2-registryd tesseract; do
+  if [ ! -x "$VENDOR/bin/$exe" ]; then bad "缺可执行文件: vendor/bin/$exe"; missing=1; fi
+done
+[ "$missing" = 0 ] && ok "9 个外部命令齐全且可执行"
+
+for f in "$SERVER/_internal/libatspi.so.0" \
+         "$SERVER/_internal/gi_typelibs/Atspi-2.0.typelib" \
+         "$VENDOR/at-spi2/accessibility.conf" \
+         "$VENDOR/tessdata/eng.traineddata" \
+         "$VENDOR/tessdata/chi_sim.traineddata" \
+         "$EXE"; do
+  [ -s "$f" ] && ok "$(printf '%-52s' "${f#$PREFIX/}")" || bad "缺失或为空: $f"
+done
+
+# ── 2. 动态库依赖（自包含分发最实际的失败模式）────────────────────────
+head_ "[2/6] 动态库依赖"
+#
+# 随包二进制靠 patchelf 写死的 RPATH `$ORIGIN/../lib` 自定位；但**基线库**
+# （glibc / libstdc++ / libX11 / GLib 栈 …）刻意不打包 —— 假定任何装了桌面的
+# Ubuntu 都必然有。所以这里专门查「找不到」的那些：它们在精简系统 / 容器里
+# 才会暴露，而这正是自包含分发最容易被漏掉的一环。
+if command -v ldd >/dev/null 2>&1; then
+    broken=""
+    for exe in "$VENDOR"/bin/*; do
+      if ldd "$exe" 2>/dev/null | grep -q "not found"; then
+        broken="$broken $(basename "$exe")"
+      fi
+    done
+    if [ -z "$broken" ]; then
+      ok "随包二进制的依赖全部可解析"
+    else
+      bad "以下命令有解析不到的库:$broken"
+      echo "      常见原因：目标机没装桌面库（libX11 / libglib / libstdc++）。"
+      echo "      查具体缺哪个：  ldd $VENDOR/bin/$(echo $broken | awk '{print $1}') | grep 'not found'"
+    fi
+else
+    soft "没有 ldd，跳过依赖检查"
+fi
+
+# ── 3. AT-SPI 可用性（本项目最核心的能力）─────────────────────────────
+head_ "[3/6] AT-SPI 无障碍（决定「能不能用元素级操作」）"
+if [ "$(id -u)" -eq 0 ]; then
+  soft "以 root 运行，跳过 gsettings 检查（本脚本的正常用法是普通用户）"
+elif ! command -v gsettings >/dev/null 2>&1; then
+  soft "没有 gsettings（apt install libglib2.0-bin）—— 不影响沙箱内使用"
+elif [ "$(gsettings writable org.gnome.desktop.interface toolkit-accessibility 2>/dev/null)" != "true" ]; then
+  soft "本会话无 GSettings 后端 / 无该 schema（XFCE、KDE、纯 SSH 都正常）"
+elif [ "$(gsettings get org.gnome.desktop.interface toolkit-accessibility 2>/dev/null)" = "true" ]; then
+  ok "无障碍开关已打开"
+else
+  bad "无障碍开关**未打开** —— GTK 应用不会上报无障碍树，get_ui_tree 会返回空"
+  echo "      修复：  gsettings set org.gnome.desktop.interface toolkit-accessibility true"
+fi
+
+# ── 4. 自检（真正把 server 拉起来跑一遍）──────────────────────────────
+head_ "[4/6] 服务自检"
+if [ -z "${DISPLAY:-}" ]; then
+  # 没有 DISPLAY 时**跳过**而不是报错：沙箱（isolated 模式）是一个嵌在已有 X server 上的
+  # Xephyr，没有父显示就起不来 —— 但那是**环境**的限制，不是安装的问题。纯 SSH、
+  # 纯容器、CI 里都会命中这里，报成 ❌ 只会制造假故障。
+  soft "当前没有 DISPLAY，跳过（SSH / 容器里的正常现象）"
+  echo "      本项需要一个图形会话。想在无桌面环境里验证：xvfb-run -a cc-computer-use-doctor"
+elif [ ! -x "$WRAPPER" ]; then
+  bad "$WRAPPER 不存在或不可执行"
+else
+  out="$(env PYTHONNOUSERSITE=1 timeout 90 "$WRAPPER" --selftest 2>&1)"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    bad "--selftest 退出码 $rc"
+    printf '%s\n' "$out" | tail -20 | sed 's/^/      /'
+  elif printf '%s' "$out" | grep -q "✅ OK"; then
+    # 自检会在 isolated 模式下**惰性拉起一个 Xephyr 沙箱**，退出时 atexit 回收 ——
+    # 这一步过了，等于「沙箱 + 私有 a11y 总线 + i3」整条链路都验证过了。
+    ok "--selftest 通过（含沙箱启动）"
+    printf '%s\n' "$out" | grep -E "^\[selftest\] (backend|display)" | sed 's/^/      /'
+  else
+    bad "--selftest 没报 OK，输出如下："
+    printf '%s\n' "$out" | tail -20 | sed 's/^/      /'
+  fi
+fi
+
+# ── 5. OCR（灰区应用唯一的感知通道）───────────────────────────────────
+head_ "[5/6] OCR"
+if ! command -v tesseract >/dev/null 2>&1 && [ ! -x "$VENDOR/bin/tesseract" ]; then
+  bad "没有 tesseract —— WPS / Apifox / Remmina 这类没有无障碍树的应用将无法感知"
+else
+  langs="$(TESSDATA_PREFIX="$VENDOR/tessdata" "$VENDOR/bin/tesseract" --list-langs 2>/dev/null | tail -n +2 | tr '\n' ' ')"
+  case "$langs" in
+    *chi_sim*) ok "tesseract 可用，语言包: $langs" ;;
+    *)         soft "tesseract 可用，但**没有 chi_sim** → 中文界面会识别成乱码（语言包: $langs）" ;;
+  esac
+fi
+
+# ── 6. Claude Code 注册 ───────────────────────────────────────────────
+head_ "[6/6] Claude Code 注册"
+claude_bin="$(command -v claude 2>/dev/null)"
+if [ -z "$claude_bin" ]; then
+  soft "未找到 claude 命令 —— 装上 Claude Code 后跑一次: cc-computer-use-setup"
+else
+  # 与 setup 脚本同源：登录 shell 里才有的 PATH 也要兜住
+  [ -n "$claude_bin" ] || claude_bin="$(bash -lc 'command -v claude' 2>/dev/null)"
+  if timeout 20 "$claude_bin" mcp get cc-computer-use >/dev/null 2>&1; then
+    ok "已在 Claude Code 中注册"
+    timeout 20 "$claude_bin" mcp get cc-computer-use 2>&1 | sed 's/^/      /'
+  else
+    bad "Claude Code 里还没有 cc-computer-use —— 修复：  cc-computer-use-setup"
+  fi
+fi
+
+# ── 汇总 ─────────────────────────────────────────────────────────────
+head_ "汇总"
+if [ $fails -eq 0 ] && [ $warns -eq 0 ]; then
+  echo "  🎉 全部通过，可以直接用。"
+elif [ $fails -eq 0 ]; then
+  echo "  基本可用，但有 $warns 项提示（见上面的 ⚠️）。"
+else
+  echo "  有 $fails 项硬伤（见上面的 ❌），照它给的命令处理。"
+fi
+echo
+echo "  默认沙箱模式：agent 在自己的虚拟屏里操作，不会抢占你的鼠标键盘。"
+echo "  要让它操作**真实桌面**：给 MCP 加环境变量 CC_CU_DISPLAY_MODE=real"
+echo "  （或临时: CC_CU_DISPLAY_MODE=real $WRAPPER --selftest）"
+
+exit $([ $fails -eq 0 ] && echo 0 || echo 1)

@@ -10,8 +10,11 @@
 #   在该路径放一个 shell wrapper 转发到目录内真实可执行文件。
 #
 # 关键约束（见 _bootstrap.py）：
-#   - AT-SPI 依赖系统库（libatspi / Atspi typelib / xdotool），无法打进二进制；
-#     冻结后由 _bootstrap 在运行时设 GI_TYPELIB_PATH 指向系统，属 OS 级运行时依赖。
+#   - AT-SPI 的 **Python 侧运行库**（libatspi.so.0 与 Atspi-2.0.typelib）现已**随产物
+#     嵌入**（见下面 packaging/embed-atspi.sh 那一步）——.deb 要发给不能访问 apt 源的
+#     机器，那边可能根本没装 libatspi2.0-0 / gir1.2-atspi-2.0。
+#     剩下仍是 OS 级运行时依赖、不内嵌的只有**外部命令**：xdotool / Xephyr / i3 /
+#     dbus-daemon / at-spi2-registryd / tesseract 等（.deb 里由 vendor/ 提供）。
 #   - 全程 PYTHONNOUSERSITE=1，避免 ~/.local 的 mcp 遮蔽 conda 包导致打错版本。
 # ============================================================
 set -euo pipefail
@@ -101,6 +104,11 @@ for d in dist/computer-use-mcp-bin/_internal/share/icons dist/computer-use-mcp-b
     rm -rf "$d"
   fi
 done
+
+# 把 AT-SPI 的 Python 侧运行库嵌进产物（libatspi.so.0 → _internal/，
+# Atspi-2.0.typelib → _internal/gi_typelibs/）。落点与理由见脚本头部注释——
+# 这是 .deb / .mcpb 能「装完就能用、不需要 apt」的前提。
+bash "$ROOT/packaging/embed-atspi.sh" dist/computer-use-mcp-bin
 
 echo
 echo "=== 生成兼容 wrapper（保持已注册路径 dist/computer-use-mcp 不变）==="

@@ -273,19 +273,54 @@ order of magnitude slower. The wrapper exists to **preserve the registered path*
 points at `dist/computer-use-mcp`) — do not delete it.
 
 Key points baked into `build.sh`:
-- `--collect-all gi` + `--hidden-import gi.repository.Atspi/GLib/GObject` to package PyGObject.
+- **Targeted `gi` collection** (`--collect-submodules/--collect-data/--collect-binaries gi`) plus
+  explicit `--exclude-module` for the GTK family: `--collect-all gi` drags in `Gtk`, which trips
+  PyInstaller's GTK hook into collecting 185 MB of icons and 42 MB of themes — none of which this
+  project ever imports.
 - `--collect-submodules mcp.server` (**not** all of `mcp`, which would pull in `mcp.cli` and its
   `typer` dependency).
 - `--copy-metadata`: mcp/pydantic and friends read versions via `importlib.metadata`.
 - **`LD_LIBRARY_PATH` must prepend conda's `lib`**: otherwise PyInstaller pairs the system's old
   `libcrypto` with conda's new `libssl` and fails at runtime with `OPENSSL_3.3.0 not found`.
-- The `Atspi` typelib / `libatspi` are not bundled; `_bootstrap` points at the system copies at runtime.
+- **`packaging/embed-atspi.sh` bundles `libatspi.so.0` and the `Atspi-2.0.typelib`** (into
+  `_internal/` and `_internal/gi_typelibs/`), so the artifact no longer needs the target machine to
+  have `libatspi2.0-0` / `gir1.2-atspi-2.0`. Both locations are forced: the latter is the only place
+  PyInstaller's `pyi_rth_gi` hook looks (it *assigns* `GI_TYPELIB_PATH`, not appends), and the former
+  sits under `_MEIPASS` so the subprocess-env stripping logic removes it automatically. The script
+  also **walks the typelib dependency closure** — `Atspi-2.0` depends on `DBus-1.0`, which comes from
+  `gir1.2-freedesktop`; copying just the one file works fine on a dev box and fails on the target.
 - `--collect-submodules Xlib` plus explicit `--hidden-import Xlib.ext.shape`: the click ring's X
   extension modules are imported dynamically by name, so they appear in no static import graph. Omit
   them and the ring silently works in development but **vanishes from the frozen build**.
 
 **Distributing to another machine** requires the whole `dist/` directory; the target machine still
 needs the system dependencies installed (`xdotool` / `xserver-xephyr` / `tesseract` / AT-SPI, etc.).
+
+### Building a self-contained `.deb` (recommended for Ubuntu users)
+
+Unlike `build.sh` above (which uses this machine's 24.04 base and therefore cannot be handed to a
+22.04 user), this path builds inside a container pinned to the oldest supported base:
+
+```bash
+docker run --rm -v "$PWD":/src -v /tmp/out:/out \
+  -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
+  -e CC_CU_MINIFORGE_SH=/miniforge.sh \
+  ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'
+# → /tmp/out/cc-computer-use_0.1.0-1_amd64.deb  (68 MB measured)
+
+# Accept it in a clean container (install → run → click → uninstall; run it on both 22.04 and 24.04)
+bash packaging/deb/verify-install.sh /tmp/out/*.deb ubuntu:22.04
+```
+
+On the target machine, `sudo apt install ./cc-computer-use_*.deb` is all it takes — **nothing else
+needs installing**. The nine system binaries (xdotool / Xephyr / i3 / tesseract / …), their
+dependency closure, the Atspi typelib and the OCR language data all ship inside. Afterwards
+`cc-computer-use-setup` flips the accessibility switch and registers the MCP server if Claude Code
+is present (existing config is never overwritten); `cc-computer-use-doctor` reports on every piece.
+
+The build must run inside **ubuntu:22.04**: the binaries collected on 24.04 require GLIBC 2.38,
+which would exclude 22.04 — the oldest supported base. See
+[`docs/安装说明.md`](docs/安装说明.md) section 7 for the details.
 
 ---
 
@@ -434,7 +469,13 @@ cc-computer-use/
 ├── demo/                    # Phase 0 feasibility verification
 ├── docs/                    # deployment guide
 ├── entry.py                 # PyInstaller entry point
-├── build.sh                 # packaging script
+├── build.sh                 # local packaging script (onedir + wrapper)
+├── packaging/               # distribution: .deb / .mcpb
+│   ├── build-in-container.sh  #   whole pipeline, runs inside ubuntu:22.04
+│   ├── assemble.sh            #   lay out the distributable tree + manifest
+│   ├── vendor_libs.py         #   dependency closure for the 9 bundled binaries, RPATH
+│   ├── embed-atspi.sh         #   libatspi + Atspi typelib closure → _internal/
+│   └── deb/                   #   control files, postinst, setup/doctor scripts, verification
 └── pyproject.toml
 ```
 

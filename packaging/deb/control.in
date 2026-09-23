@@ -1,0 +1,28 @@
+Package: cc-computer-use
+Version: @VERSION@
+Architecture: amd64
+Maintainer: @MAINTAINER@
+Installed-Size: @INSTALLED_SIZE@
+Depends: libc6 (>= 2.34)
+Section: utils
+Priority: optional
+Homepage: https://github.com/liufeicc/cc-computer-use
+Description: Computer-Use MCP server - drive a Linux desktop over MCP
+ Lets an AI agent operate a Linux/X11 desktop. It perceives the UI through the
+ AT-SPI accessibility tree and acts with element-level operations, instead of
+ the usual "take a screenshot, guess pixel coordinates, click there".
+ .
+ By default the agent runs on its own Xephyr virtual screen with a private
+ AT-SPI bus, so your real desktop keeps working and sandboxed applications stay
+ invisible to the host accessibility bus. Set CC_CU_DISPLAY_MODE=real to drive
+ the actual desktop instead.
+ .
+ Everything it needs at runtime is bundled - xdotool, Xephyr, xclip, wmctrl,
+ xrandr, i3, dbus-daemon, at-spi2-registryd, tesseract, the OCR language data
+ and the Atspi typelib - so no network or apt access is required on the target
+ machine. The only dependency is a glibc-based desktop system (the bundle uses
+ no host library that every Ubuntu 22.04+ desktop does not already have).
+ .
+ After installing, run "cc-computer-use-setup" as your normal user (not root):
+ it enables the GNOME accessibility switch and registers the server in Claude
+ Code if that is installed. "cc-computer-use-doctor" then verifies everything.

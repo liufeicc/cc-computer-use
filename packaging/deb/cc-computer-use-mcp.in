@@ -1,0 +1,55 @@
+#!/bin/sh
+# ============================================================
+# cc-computer-use MCP server 启动器
+# （由 .deb 安装到 @PREFIX@/bin/，/usr/bin 下有同名软链）
+#
+# 为什么需要这一层，而不是让客户端直接指向 server/ 里的可执行文件
+# --------------------------------------------------------------
+# 随包自带的 9 个外部命令（xdotool / Xephyr / i3 / tesseract …）在
+# @PREFIX@/vendor/bin 下，而代码是用 `shutil.which("xdotool")` 之类**按 PATH** 找它们的。
+# 把 PATH 写进 MCP 注册项不仅啰嗦，还会与用户环境漂移（`${PATH}` 这类展开在不同客户端
+# 行为并不一致）。把环境固定在这一层之后，注册项就只是一条路径。
+#
+# ⚠️ 这里**刻意不设** LD_LIBRARY_PATH 与 GI_TYPELIB_PATH —— 两个原因各不相同：
+#
+#   GI_TYPELIB_PATH：设了也没用。PyInstaller 的 pyi_rth_gi 运行时钩子在进程启动时
+#     **无条件赋值** GI_TYPELIB_PATH = <产物目录>/gi_typelibs（不是追加），这里设的值
+#     会被直接覆盖掉。Atspi 的 typelib 已随产物嵌在 _internal/gi_typelibs/ 之下，
+#     走那条钩子即可（见 packaging/embed-atspi.sh）。
+#
+#   LD_LIBRARY_PATH：指向 @PREFIX@/vendor/lib 是**有害的**。
+#     core/display/constants.py 的 _strip_frozen_lib_path() 只剥 sys._MEIPASS（即产物
+#     目录）**之下**的路径，vendor/lib 不在其下、剥不掉 —— 于是它会被**沙箱内应用**
+#     （app_env 启动的 JVM/Electron 等）继承，而 vendor/lib 里有约 50 个构建基座的库
+#     （libxml2 / libcrypto / libicu* …）。那正是 2026-09-15/16 两次「产物库与系统库
+#     混装」事故的同一类路径（一次把 DBeaver 的 JVM 打崩、一次让 a11y 隔离失效）。
+#     而 vendor/bin 里那 9 个二进制是靠 patchelf 写死的 RPATH `$ORIGIN/../lib` 自定位的，
+#     本来就**不经过环境变量**（见 packaging/vendor_libs.py 开头那段）。
+#
+#   同理，MCP server 自己要的 libatspi.so.0 是嵌在 _internal/ 里的：它在 _MEIPASS 之下，
+#   既会被引导器找到，又会被 _strip_frozen_lib_path 从子进程 env 里剥掉，
+#   安全不变量由构造保证。
+# ============================================================
+
+PREFIX="@PREFIX@"
+
+# 清掉用户 site-packages 的干扰（~/.local 里若另有一份 mcp，会遮蔽产物内的版本）。
+# 冻结产物本不读它，设上是零代价的保险，也与既有注册项的写法保持一致。
+export PYTHONNOUSERSITE=1
+
+# 让 shutil.which 找到随包的 9 个外部命令。**前置**：用户机器上若另装了同名命令，
+# 我们优先用随包那份 —— 版本可控，且不依赖目标机装过什么。
+export PATH="$PREFIX/vendor/bin:$PATH"
+
+# tesseract 的语言包（eng + chi_sim）。不设的话它去 /usr/share/tesseract-ocr 找，
+# 目标机没装 tesseract-ocr-chi-sim 就没法识别中文。
+export TESSDATA_PREFIX="$PREFIX/vendor/tessdata"
+
+# 随包自带的 AT-SPI 总线配置。系统那份属 at-spi2-core，我们不能覆盖，
+# 而目标机可能压根没装它 —— 没有 conf 就起不了私有总线，沙箱内 a11y 会整体消失。
+export CC_CU_AT_SPI_CONF="$PREFIX/vendor/at-spi2/accessibility.conf"
+
+# 注意布局：assemble.sh 是把 PyInstaller 那个 onedir 目录的**内容**摊进 server/ 的
+# （`cp -a .../computer-use-mcp-bin/. server/`），所以可执行文件与 _internal/ 是**平级**
+# 的兄弟，不是 server/computer-use-mcp-bin/ 下再套一层。
+exec "$PREFIX/server/computer-use-mcp-bin" "$@"

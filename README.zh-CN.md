@@ -203,14 +203,35 @@ PYTHONNOUSERSITE=1 ./dist/computer-use-mcp --selftest
 
 `build.sh` 关键点（已固化）：
 
-- `--collect-all gi` + `--hidden-import gi.repository.Atspi/GLib/GObject`：打包 PyGObject。
+- **定向收集 `gi`**（`--collect-submodules/--collect-data/--collect-binaries gi`）+ 显式排除 GTK 家族：`--collect-all gi` 会连 `Gtk` 一起收，触发 PyInstaller 的 GTK hook 去收集 185MB 图标 + 42MB 主题，而本项目从不 import Gtk/Gdk。
 - `--collect-submodules mcp.server`（**不用** `mcp` 全量，避免拉进需 `typer` 的 `mcp.cli`）。
 - `--copy-metadata`：mcp/pydantic 等用 `importlib.metadata` 读版本，需带上元数据。
 - **`LD_LIBRARY_PATH` 前置 conda 的 `lib`**：否则 PyInstaller 会用系统旧 `libcrypto` 配 conda 新 `libssl`，运行时报 `OPENSSL_3.3.0 not found`。
-- `Atspi` typelib / `libatspi` 不打包，运行时由 `_bootstrap` 指向系统。
+- **`Atspi-2.0.typelib` 与 `libatspi.so.0` 由 `packaging/embed-atspi.sh` 嵌进产物**（`_internal/` 与 `_internal/gi_typelibs/`），使分发形态不再依赖目标机装过 `gir1.2-atspi-2.0` / `libatspi2.0-0`。落点有硬约束：前者是 PyInstaller 的 `pyi_rth_gi` 钩子**无条件赋值** `GI_TYPELIB_PATH` 的唯一落点；后者放在 `_MEIPASS` 之下才能被子进程 env 剥离逻辑自动剥掉。该脚本还会**遍历 typelib 的依赖闭包**（`Atspi-2.0` 依赖 `DBus-1.0`，而它来自 `gir1.2-freedesktop`）—— 只拷一个文件的话，开发机上照样能用，目标机却会 `import Atspi` 失败。
 - **`--collect-submodules Xlib` + 显式 `--hidden-import Xlib.ext.shape`**（点击光圈用）：`Xlib.ext` 的扩展模块是按扩展名动态导入的，不出现在任何静态 import 图里——漏了的表现是「开发态一切正常、**只有冻结产物里没有光圈**」。
 
-**分发到另一台机器**必须带上整个 `dist/` 目录；目标机器仍需自行安装系统依赖（`xdotool`/`xserver-xephyr`/`tesseract`/AT-SPI 等）。
+**分发到另一台机器**（老办法）必须带上整个 `dist/` 目录；目标机器仍需自行安装系统依赖（`xdotool`/`xserver-xephyr`/`tesseract`/AT-SPI 等）。
+
+### 打成 `.deb` 分发给 Ubuntu 用户（推荐）
+
+```bash
+docker run --rm -v "$PWD":/src -v /tmp/out:/out \
+  -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
+  -e CC_CU_MINIFORGE_SH=/miniforge.sh \
+  ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'
+# → /tmp/out/cc-computer-use_0.1.0-1_amd64.deb（实测 68 MB）
+
+# 在干净容器里验收（装、跑、点、卸全链路；22.04 与 24.04 各跑一遍）
+bash packaging/deb/verify-install.sh /tmp/out/*.deb ubuntu:22.04
+```
+
+目标机 `sudo apt install ./cc-computer-use_*.deb` 即可，**不需要装任何东西**：
+xdotool / Xephyr / i3 / tesseract 等 9 个系统二进制、它们的依赖闭包、Atspi typelib
+与 OCR 语言包全部随包。装完由 `cc-computer-use-setup` 打开无障碍开关、并在检测到
+Claude Code 时自动注册 MCP（不覆盖已有配置）；`cc-computer-use-doctor` 逐项体检。
+
+必须在 **ubuntu:22.04 容器**里构建：24.04 上取到的那批二进制要求 GLIBC 2.38，
+直接打包会恰好排除掉 22.04 这个最低档。详见 [`docs/安装说明.md`](docs/安装说明.md) 第七节。
 
 ---
 
@@ -345,7 +366,13 @@ cc-computer-use/
 ├── demo/                    # Phase 0 可行性验证
 ├── docs/                    # 部署与排错手册
 ├── entry.py                 # PyInstaller 入口
-├── build.sh                 # 打包脚本
+├── build.sh                 # 本机打包脚本（onedir + wrapper）
+├── packaging/               # 分发：.deb / .mcpb
+│   ├── build-in-container.sh  #   整套流水线，在 ubuntu:22.04 容器里跑
+│   ├── assemble.sh            #   组装可分发目录 + manifest
+│   ├── vendor_libs.py         #   9 个随包二进制的依赖闭包与 RPATH
+│   ├── embed-atspi.sh         #   libatspi + Atspi typelib 闭包 → _internal/
+│   └── deb/                   #   control 文件、postinst、setup/doctor 脚本、验收脚本
 └── pyproject.toml
 ```
 

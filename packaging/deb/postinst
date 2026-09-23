@@ -1,0 +1,67 @@
+#!/bin/sh
+# ============================================================
+# postinst —— 以 **root** 运行，所以这里只做两件事：
+#   ① 尽力而为地"替安装者当场跑一次"用户级配置（用 $SUDO_USER）；
+#   ② 打印一句人能照做的提示。
+#
+# ⚠️ 三条铁律（违反任何一条，代价都比它换来的收益大得多）
+# ------------------------------------------------------------------
+#   1. **绝不 exit 1。** postinst 失败 = 包停在 unconfigured 态，而本包的目标机器
+#      **取不到 apt 源**，用户没有"重来一次"的余地。所以下面每一处外部调用都带
+#      `|| true`，脚本本身也**刻意不用 `set -e`**。
+#   2. **绝不在这里写用户的东西。** `gsettings` 写的是走会话总线的 dconf，
+#      root 写进去只落在 /root；`~/.claude.json` 同理会写进 /root。
+#      两者都是"命令成功、完全无效、极难排查"的失败 —— 全部交给
+#      `cc-computer-use-setup`（它自己第一件事就是拒绝 root）。
+#   3. **绝不无条件跑。** 下面几道闸确保只在"确实有一个真实桌面用户"时才动手。
+#
+# 为什么还用 $SUDO_USER 而不是干脆只靠 autostart
+# ------------------------------------------------------------------
+#   因为最常见的路径是 `sudo apt install ./x.deb`，用户装完就想用，不想注销重登。
+#   autostart 要等下一次登录，而这一步能把"当场可用"补上（无障碍开关对**新启动**的
+#   应用即时生效，不需要重登）。
+#   但它只是**尽力而为**：GDebi / gnome-software 走 polkit 不走 sudo，那条路上
+#   SUDO_USER 根本不存在 —— 那时静默退到 autostart，不算失败。
+# ============================================================
+
+# 刻意不用 set -e（见上）
+
+case "$1" in
+  configure)
+    # 闸 1：往 rootfs 镜像里装（dpkg --root=/target 会设 DPKG_ROOT）。
+    # 那种场合根本没有"当前用户"这回事，任何用户级动作都是错的。
+    if [ -n "${DPKG_ROOT:-}" ]; then
+      exit 0
+    fi
+
+    # 闸 2：SUDO_USER 必须存在、不是 root、且 SUDO_UID 与它自己认到的 uid 对得上。
+    # 校验 SUDO_UID 是为了挡住被伪造/泄漏的环境变量 —— 只信 SUDO_USER 字符串，
+    # 一个写错的值就会让下面的 runuser 去操作一个不存在的用户。
+    u="${SUDO_USER:-}"
+    if [ -n "$u" ] && [ "$u" != "root" ] && \
+       id "$u" >/dev/null 2>&1 && \
+       [ "$(id -u "$u")" -ge 1000 ] && \
+       [ "${SUDO_UID:-0}" = "$(id -u "$u")" ]; then
+      # 闸 3：runuser -l 给出该用户正确的 HOME 与 login PATH
+      #       （claude 常常装在 ~/.local/bin 或 npm 全局前缀下，只有 login 环境才在 PATH 里）。
+      # 闸 4：整段 `|| true` —— 用户级配置失败不能影响安装结果。
+      runuser -l -u "$u" -c '/usr/bin/cc-computer-use-setup --quiet' >/dev/null 2>&1 || true
+      echo "cc-computer-use: 已为该用户完成配置（无障碍开关 + Claude Code 注册，若适用）。"
+    else
+      # 闸 1 之外最常见的落点：apt 从 GUI / 自动化工具装，没有 SUDO_USER。
+      echo "cc-computer-use: 请以**普通用户**身份运行一次  cc-computer-use-setup"
+      echo "                 来打开无障碍开关并注册到 Claude Code（不需要 sudo）。"
+    fi
+
+    echo "cc-computer-use: 检查环境是否就绪：  cc-computer-use-doctor"
+    ;;
+
+  abort-upgrade|abort-remove|abort-deconfigure)
+    # dpkg 的回滚路径，什么都不用做
+    ;;
+
+  *)
+    ;;
+esac
+
+exit 0

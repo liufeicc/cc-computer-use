@@ -1,0 +1,127 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: cc-computer-use
+Upstream-Contact: liufei <liufeicc@users.noreply.github.com>
+Source: https://github.com/liufeicc/cc-computer-use
+
+Files: *
+Copyright: 2026 liufei <liufeicc@users.noreply.github.com>
+License: MIT
+ Permission is hereby granted, free of charge, to any person obtaining a copy of
+ this software and associated documentation files (the "Software"), to deal in
+ the Software without restriction, including without limitation the rights to
+ use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ the Software, and to permit persons to whom the Software is furnished to do so,
+ subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+
+# ============================================================================
+# 随包分发的第三方组件。
+#
+# 完整清单（含每个组件的版本、上游地址与完整说明）见同一目录下的
+# THIRD-PARTY-LICENSES.txt —— 分发本包时**必须一并带上它**，原因见那个文件的抬头。
+# 下面按许可证归类，只列组件名。
+# ============================================================================
+
+Files: opt/cc-computer-use/server/computer-use-mcp-bin/_internal/*
+Copyright: 2019-2026 The mcp / pydantic / anyio / cryptography / Pillow / mss /
+  python-xlib developers; 2001-2026 the Python Software Foundation;
+  1995-2026 the GLib, GObject, Gio and AT-SPI developers
+License: MIT and Apache-2.0 and PSF-2.0 and LGPL-2.1+
+  PyInstaller 产物内各组件各自保留自己的许可证，全文随 pip 包分发
+  （_internal/*.dist-info/ 下）。Atspi typelib 与 libatspi 来自 at-spi2-core
+  （LGPL-2.1+），见 THIRD-PARTY-LICENSES.txt 第二节。
+
+Files: opt/cc-computer-use/vendor/bin/xdotool opt/cc-computer-use/vendor/bin/i3
+Copyright: 2007-2024 Jordan Sissel; 2009-2024 Michael Stapelberg and contributors
+License: BSD-3-Clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are met:
+ .
+ 1. Redistributions of source code must retain the above copyright notice, this
+    list of conditions and the following disclaimer.
+ .
+ 2. Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+ .
+ 3. Neither the name of the copyright holder nor the names of its contributors
+    may be used to endorse or promote products derived from this software
+    without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Files: opt/cc-computer-use/vendor/bin/xclip opt/cc-computer-use/vendor/bin/wmctrl
+Copyright: 2001-2024 Kim Woelders, Peter Astrand and contributors
+License: GPL-2+
+ 本项目随包再分发这两个程序（GPL 允许），许可证全文在
+ /usr/share/common-licenses/GPL-2；对应源码可从 THIRD-PARTY-LICENSES.txt 给出的
+ 上游地址取得。**分发本包时不要删除 THIRD-PARTY-LICENSES.txt。**
+
+Files: opt/cc-computer-use/vendor/bin/Xephyr opt/cc-computer-use/vendor/bin/xrandr
+Copyright: 1987-2024 The X.Org Foundation and contributors
+License: MIT-X11
+ Permission is hereby granted, free of charge, to any person obtaining a copy of
+ this software and associated documentation files (the "Software"), to deal in
+ the Software without restriction, including without limitation the rights to
+ use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+ of the Software, and to permit persons to whom the Software is furnished to do
+ so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+
+Files: opt/cc-computer-use/vendor/bin/dbus-daemon
+Copyright: 2002-2024 Red Hat, Inc. and contributors
+License: GPL-2+ or AFL-2.1
+ dbus 采用双许可（AFL-2.1 或 GPL-2+）。本包按 GPL-2+ 处理：
+ /usr/share/common-licenses/GPL-2 有全文，源码见 THIRD-PARTY-LICENSES.txt 的上游地址。
+
+Files: opt/cc-computer-use/vendor/bin/at-spi2-registryd
+ opt/cc-computer-use/vendor/at-spi2/accessibility.conf
+Copyright: 2003-2024 The AT-SPI and GNOME Accessibility developers
+License: LGPL-2.1+
+ 许可证全文在 /usr/share/common-licenses/LGPL-2.1。
+ accessibility.conf 派生自 at-spi2-core 的同名文件，仅删去 <servicedir> 与
+ <listen> 两节，其余逐字保留。
+
+Files: opt/cc-computer-use/vendor/bin/tesseract
+ opt/cc-computer-use/vendor/tessdata/*
+Copyright: 2006-2024 Google Inc., 2006-2024 the Tesseract OCR contributors
+License: Apache-2.0
+ 许可证全文在 /usr/share/common-licenses/Apache-2.0。
+
+Files: opt/cc-computer-use/vendor/lib/*
+Copyright: 1995-2026 the glib / GTK / cairo / harfbuzz / pango / freetype /
+ fontconfig / libpng / libjpeg / libtiff / libwebp / libxml2 / OpenSSL /
+ nettle / libarchive / libcurl … developers
+License: LGPL-2.1+ and MIT and BSD-3-Clause and Apache-2.0
+ 这是上列可执行程序的动态依赖闭包中「不属基线」的那部分（约 50 个）。
+ 完整清单：  ls /opt/cc-computer-use/vendor/lib
+ 逐个溯源：  THIRD-PARTY-LICENSES.txt 第二节末尾给出了查法。

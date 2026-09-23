@@ -1,0 +1,47 @@
+#!/bin/sh
+# ============================================================
+# postrm —— 卸载后的收尾
+#
+# ⚠️ 这里同样**只提示、不代劳**：本包在卸载时以 root 运行，而它留下的两样东西都在
+# **用户**名下（`~/.claude.json` 里的一条 MCP 注册、以及 dconf 里的无障碍开关）。
+# root 够不到它们 —— 更何况机器上可能有多个用户，root 也无从知道该动哪一个。
+#
+# 所以策略是：把「怎么清干净」印给用户，而不是猜。
+#
+# 另外两条刻意的选择：
+#   · **不动 gsettings。** 无障碍开关是用户的桌面设置，别的工具（屏幕阅读器等）也可能
+#     依赖它。我们没有资格在卸载时替用户改回去。
+#   · **不删 /tmp 下的沙箱残留。** 那些是 `cc-cu-at-spi-d<屏号>-*` 目录，可能正被
+#     **另一个会话**（另一个 Claude Code）在用。按前缀无差别清扫会误杀别人 ——
+#     程序自己在启动时会按屏号精确回收，不需要这里插手。
+# ============================================================
+
+case "$1" in
+  remove|purge)
+    # 只在最后一份被移除时提示（purge 之前会先过一次 remove）
+    if [ "$1" = "purge" ] || [ ! -e /opt/cc-computer-use ]; then
+      cat <<'EOF'
+
+cc-computer-use 已卸载。还有两处**用户级**的痕迹需要你自己决定要不要清（root 无权代劳）：
+
+  1) Claude Code 里的 MCP 注册（每个用过的用户各有一条）：
+       claude mcp remove cc-computer-use -s user
+
+  2) GNOME 无障碍开关（本包打开过；若其它辅助工具也在用，建议保留）：
+       gsettings set org.gnome.desktop.interface toolkit-accessibility false
+
+  （登录自启项 /etc/xdg/autostart/cc-computer-use-setup.desktop 已随包删除，
+    无需处理。）
+
+EOF
+    fi
+    ;;
+
+  upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+
+  *)
+    ;;
+esac
+
+exit 0

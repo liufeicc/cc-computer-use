@@ -254,7 +254,45 @@ GTK 对话框 `get_extents(SCREEN)` 常返回相对窗口原点的漂移坐标�
 - 入口是根目录的 `entry.py` 而非 `server.py`：后者用相对导入（`from . import _bootstrap`）不能当脚本跑；`entry.py` 只做一件事——绝对导入并调 `server.main()`。
 - `build.sh` 开头 `rm -rf build dist computer-use-mcp.spec computer-use-mcp-bin.spec` 会**清掉整个 dist/**（wrapper 也在内，每次重建），别把它当"增量构建"用。**spec 名必须与 `--name` 一致**：PyInstaller 生成的 spec 是 `name + '.spec'`，故本仓库真正要清的是 **`computer-use-mcp-bin.spec`**——历史上那行只写了 `computer-use-mcp.spec`（**该文件从来不存在**，等于清理动作没做，实测残留的 spec 一直是 `-bin.spec`）；现已两个都删，兼容换过 `--name` 的旧工作区。（M-45）
 - 环境名/路径可用 `ENV_NAME` / `CONDA_BASE` 覆盖，默认 `cc-computer-use` + `$HOME/anaconda3`（换机器打包时用得上）。
-- **冻结产物仍依赖系统提供 `libatspi` / Atspi typelib / xdotool / Xephyr / tesseract** —— 这是已接受的 OS 级依赖，别试图全打进二进制。
+- **冻结产物仍依赖系统提供 `xdotool` / `Xephyr` / `i3` / `dbus-daemon` / `at-spi2-registryd` / `tesseract`** —— 那 9 个**外部命令**没有内嵌，是已接受的 OS 级依赖（`.deb` 里由 `vendor/bin` 提供）。
+  ⚠️ **但 `libatspi.so.0` 与 `Atspi-2.0.typelib` 现在随产物嵌进 `_internal/` 了**（2026-09-23，见下条），别再按老说法把它们算作"系统必须提供"。
+
+## 分发形态与 `.deb` 打包（`packaging/`，2026-09-23 新增）
+
+三种产物：**本机 `build.sh`**（开发用）、**`.deb`**（Ubuntu 用户）、**`.mcpb`**（Claude Desktop）。后两者共用 `packaging/build-in-container.sh` 一次产出，**必须在 ubuntu:22.04 容器里跑**（24.04 上取到的系统二进制要求 GLIBC 2.38，会恰好排除掉 22.04 这个最低档）。
+
+```bash
+docker run --rm -v "$PWD":/src -v /tmp/out:/out \
+  -v /tmp/Miniforge3-Linux-x86_64.sh:/miniforge.sh:ro \
+  -e CC_CU_MINIFORGE_SH=/miniforge.sh \
+  ubuntu:22.04 bash -c 'bash /src/packaging/build-in-container.sh'
+# → /tmp/out/cc-computer-use_0.1.0-1_amd64.deb（实测 68MB，96 个随包库 64.7MB）+ cc-computer-use-0.1.0.mcpb（98MB）
+
+bash packaging/deb/verify-install.sh /tmp/out/*.deb ubuntu:22.04   # 干净容器验收（10 步）
+bash packaging/deb/verify-install.sh /tmp/out/*.deb ubuntu:24.04   # 高版本再验一遍
+```
+
+**验收状态（2026-09-23）：22.04 与 24.04 两个干净容器各跑一遍，10 步全过。** 另实测产物中所有 ELF 的最高 `GLIBC_*` 需求 = **2.35**（正好是 22.04 的基线；`Xephyr` 与 `libXfont2.so.2` 是最高那两个）—— 这是「在 22.04 里构建」这个约束要保住的东西，换构建基座前先重新量。
+
+⚠️ **验收用例不许依赖宿主 locale**（同一批实测踩到）：`mcp_smoke.py` 原先按 zenity 的**中文默认标签「是」**找按钮，开发机上一直绿（宿主认中文 locale），一到干净容器就红 —— 那里没配 locale，GTK 渲染成 `Yes`/`No`。这不是产品缺陷，是用例偷偷依赖了宿主语言环境，属于「在开发机上永远重现不了」的假红，最耗排查时间。现在用 `--ok-label` 把标签写死成 ASCII，判据与语言无关；`tests/test_packaging.py::test_smoke_pins_zenity_button_labels` 钉住（断言 `re.search` 那几行里不许有中文字面量 —— 报错文案里的中文不算）。
+
+几条**改之前必须知道**的：
+
+- **`libatspi.so.0` / `Atspi-2.0.typelib` 必须落在 PyInstaller 产物的 `_internal/` 下**（`packaging/embed-atspi.sh`，两条构建路径都调它）。目标机可能既没装 `libatspi2.0-0` 也没装 `gir1.2-atspi-2.0`，缺了它们 `import Atspi` 直接失败 → 无障碍能力整体消失（只剩最贵的 OCR 那条路）。落点各有硬理由，**别挪**：
+  - `libatspi.so.0` → `_internal/`：引导器把 `_MEIPASS` 设进 `LD_LIBRARY_PATH` 故能找到；**且它在 `_MEIPASS` 之下，会被 `_strip_frozen_lib_path` 自动从子进程 env 里剥掉** —— 安全不变量由构造保证。实测 `LD_DEBUG=libs` 只有一条 `trying file=<...>/_internal/libatspi.so.0`，系统那份一次都没开。
+  - `Atspi-2.0.typelib` → `_internal/gi_typelibs/`：PyInstaller 的 `pyi_rth_gi` 运行时钩子**无条件赋值**（不是追加）`GI_TYPELIB_PATH = <_MEIPASS>/gi_typelibs`。放别处、或指望 wrapper 设那个变量，都会被直接覆盖成死配置。实测 `strace -e openat` 只打开这一处。
+  - **⚠️ 光拷 `Atspi-2.0.typelib` 一个文件不够，必须连它的依赖闭包一起拷**（2026-09-23 在干净容器里抓到的）：typelib 头部声明了自己的依赖，`Atspi-2.0` 是 `GObject-2.0|GLib-2.0|DBus-1.0`，而 **`DBus-1.0` 来自 `gir1.2-freedesktop`**（不是 at-spi2-core 的包）。只拷一个的表现是自检报 `ImportError: Typelib file for namespace 'DBus', version '1.0' not found` → 无障碍能力整体消失。**这个坑在开发机/构建机上永远重现不了**：`_bootstrap` 会把系统 typelib 目录追加进来兜底，只有目标机没装 `gir1.2-*` 时才现形。故 `embed-atspi.sh` 用 BFS 遍历闭包（从 typelib 自身解析，不硬编码清单；构建机缺包时**当场报错**，不静默跳过）。
+    - **解析那行依赖有三条硬规则，别退回宽松版**（同一处连挨两次）：① **只在前 4KB 找** —— deps 是头部的一项（偏移 ~0xa7），全文件扫描会把后面 MB 级元数据段的随机字节当依赖，实测 `GLib-2.0.typelib` 在**第 6906 行**匹配到 `i|E`，于是队列里多出一个叫 `i` 的「依赖」，构建当场失败；② **每个元素必须带 `-版本号`**（GIR 命名空间永远是「名字-版本」），这条拦住裸词 `i`，顺带拦住共享库名（`libgio-2.0.so.0` 版本号后面跟的是 `.so.0` 而非 `.数字`）；③ **两种存储格式都要认** —— 老格式是一个 `|` 分隔的串，新格式（gi 1.76+，conda 那份 pygobject 就是）是一串**独立的 NUL 结尾串**，所以必须取头部**所有**匹配行再拆；旧实现用 `grep -m1` 只取第一条，在新格式下**只能拿到一个依赖**且完全静默（同一类「构建机上能用、目标机缺件」的坑）。已用 24.04 上 **83 个系统 typelib** 全量扫过验证零假阳性；`tests/test_packaging.py` 里有两个**真跑这个函数**的用例（构造老/新格式与噪声样例喂给它），不是断言源码文本。
+- **⚠️ 绝不能把 `vendor/lib` 设进 `LD_LIBRARY_PATH`**：`_strip_frozen_lib_path` 只剥 `_MEIPASS` 之下的路径，`vendor/lib` 不在其下 → 会被**沙箱应用**继承，而那里有约 50 个构建基座的库（libxml2/libcrypto/libicu*…），正是 2026-09-15/16 两次混装事故的同一类路径。`vendor/bin` 那 9 个二进制靠 patchelf 写死的 RPATH `$ORIGIN/../lib` 自定位，**本来就不经过环境变量**。`packaging/assemble.sh` 的 manifest 里那两行（`LD_LIBRARY_PATH`/`GI_TYPELIB_PATH`）已删，`tests/test_packaging.py` 钉住不许加回来。
+- **`.deb` 的 `Depends:` 只有 `libc6 (>= 2.34)`**：目标机**取不到 apt 源**，任何一条依赖落空都会让安装直接失败且无法补救。也**刻意不写 Recommends**（无源时 apt 解析它可能报 `not installable`）。缺什么由 `cc-computer-use-doctor` 运行期探测。
+- **9 个随包二进制只进 `/opt`，绝不落 `/usr/bin`**：目标机只要装过其中一个就会 `dpkg: error ... trying to overwrite` → **安装直接失败**。`/usr/bin` 下只放三个软链。
+- **压缩必须显式 `-Zxz`**：宿主默认 zstd。（实测 22.04 的 dpkg 1.21.1 **能**读 zstd，但 xz 更保守、体积更小。）
+- **用户级配置只能由用户跑**（`packaging/deb/cc-computer-use-setup`，**第一件事就是拒绝 root**）：`postinst` 以 root 运行，`gsettings` 写的是走会话总线的 dconf、`~/.claude.json` 是用户的文件 —— root 写进去只落在 `/root`，是「命令成功、完全无效」那类失败。触发点有三：`postinst` 用 `$SUDO_USER` 当场跑一次、`/etc/xdg/autostart/` 每次登录兜底、用户手动。autostart 那份**刻意不写进 `conffiles`**（conffile 在 remove 时被保留 → 卸载后还在跑脚本）。
+- **`accessibility.conf` 自带一份**（`vendor/at-spi2/`，由 wrapper 经 **`CC_CU_AT_SPI_CONF`** 指过去）：系统那份 `/usr/share/defaults/at-spi2/accessibility.conf` **属 at-spi2-core**，写它就是文件冲突。`_resolve_at_spi_deps()` 里该变量优先级最高、系统候选降为兜底（变量指向不存在处会**告警回退**，不静默）。
+- **`vendor_libs.py` 的基线白名单只留 glibc 工具链 + 压缩库**（2026-09-23 大幅收窄，**别再按「桌面必然有」往里加**）：实测在一个干净的 `ubuntu:22.04` 容器里跑验收，9 个随包二进制有 **44 个库解析不到** —— 整条 X11 + GLib + cairo/pango 栈都不在。即便放宽到「Ubuntu 桌面」，`libev.so.4` / `libstartup-notification` / `libxcb-icccm` / `libxcb-xrm` / `libXfont2`（i3 与 Xephyr 的私有依赖）也不是桌面默认就有的 —— 缺了沙箱就起不来。既然分发前提是「目标机不装任何东西」，白名单不能建立在「桌面必然有 X11」这个假设上。**多带库没有混装风险**：随包二进制靠 RPATH 定位、不经过 `LD_LIBRARY_PATH`，`vendor/lib` 永远进不了沙箱应用的环境。
+- **容器构建的坑**：`binutils`（PyInstaller 靠 `objdump`）、`zip`（打 `.mcpb`）、`python3`（`assemble.sh` 跑 `vendor_libs.py`）、`patchelf` 四样都必须在第 1 步装上 —— 它们都在**后半程**才被用到，缺了会在前几步跑完之后才失败，重跑代价很大（`vendor_libs.py` 现在有 `_require_tools()` 前置检查）。容器到 github 会**间歇性**失败（实测卡到 `Failed to connect ... after 133027 ms`），故支持 `CC_CU_MINIFORGE_SH`（挂预置安装包，不碰网络）与 `CC_CU_MINIFORGE_URL`（换镜像；实测国内快 16 倍：github ~0.1MB/s vs 清华 ~1.6MB/s）。
+- **⚠️ `ubuntu:*` 官方 Docker 镜像自带文档瘦身规则**（`/etc/dpkg/dpkg.cfg.d/excludes`：`path-exclude=/usr/share/doc/*`，只 `path-include` 回 `copyright` 与 `changelog.*`）。**真实 Ubuntu 安装没有这条**（本机查过）。在容器里验收时会表现为「`README.Debian` / `THIRD-PARTY-LICENSES.txt` 没装上」—— 与我们的包无关，`verify-in-container.sh` 里已先把它挪走。
+- **合规**：deb 会重分发 **GPL-2+ 的 xclip / wmctrl**（还有 dbus-daemon 的双许可之一）等第三方二进制，必须随附 `THIRD-PARTY-LICENSES.txt`（`build-deb.sh` 已放进 `/usr/share/doc`）。
 
 ## mcp SDK 版本兼容
 

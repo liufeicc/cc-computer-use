@@ -226,6 +226,7 @@ def test_at_spi_deps_have_multi_path_candidates():
 
 def test_at_spi_deps_fall_back_to_path(monkeypatch):
     """硬编码路径都不存在时，registryd 要能从 PATH 里找到（Fedora/SUSE 的情形）。"""
+    monkeypatch.delenv(dm.ENV_AT_SPI_CONF, raising=False)
     monkeypatch.setattr(dm.os.path, "exists", lambda p: False)
     monkeypatch.setattr(dm.shutil, "which", lambda n: "/opt/bin/at-spi2-registryd"
                         if n == "at-spi2-registryd" else None)
@@ -237,6 +238,8 @@ def test_at_spi_deps_fall_back_to_path(monkeypatch):
 
 
 def test_at_spi_deps_prefers_existing_candidate(monkeypatch):
+    monkeypatch.delenv(dm.ENV_AT_SPI_CONF, raising=False)
+
     def fake_exists(p):
         return p == "/etc/xdg/at-spi2/accessibility.conf"
 
@@ -245,6 +248,45 @@ def test_at_spi_deps_prefers_existing_candidate(monkeypatch):
 
     conf, _reg = dm._resolve_at_spi_deps()
     assert conf == "/etc/xdg/at-spi2/accessibility.conf"
+
+
+# ============ 随包自带的 accessibility.conf（.deb / .mcpb）============
+
+def test_at_spi_conf_env_var_wins_over_system_candidates(monkeypatch):
+    """
+    `CC_CU_AT_SPI_CONF` 必须**压过**系统候选表。
+
+    判据不能只看「有 conf 返回」——系统候选在开发机上本来就存在，那样写这个用例
+    在「环境变量被忽略」时照样全绿。必须让系统候选**也可用**，再看返回的是哪一个。
+    """
+    bundled = "/opt/cc-computer-use/vendor/at-spi2/accessibility.conf"
+    system = "/usr/share/defaults/at-spi2/accessibility.conf"
+    monkeypatch.setenv(dm.ENV_AT_SPI_CONF, bundled)
+    monkeypatch.setattr(dm.os.path, "exists", lambda p: p in (bundled, system))
+
+    conf, _reg = dm._resolve_at_spi_deps()
+
+    assert conf == bundled, f"自带的那份应优先（而不是系统候选 {system}）"
+
+
+def test_at_spi_conf_env_var_missing_falls_back_with_warning(monkeypatch):
+    """
+    变量指向不存在的路径时**告警并回退**，不静默降级也不直接报错。
+
+    为什么这条重要：.deb 装上后若 vendor/ 被误删，这条回退是「沙箱内还有没有 a11y」
+    的分水岭——静默 None 会表现成「读不到元素树」，排查时完全看不出是 conf 丢了。
+    """
+    system = "/usr/share/defaults/at-spi2/accessibility.conf"
+    monkeypatch.setenv(dm.ENV_AT_SPI_CONF, "/nonexistent/accessibility.conf")
+    monkeypatch.setattr(dm.os.path, "exists", lambda p: p == system)
+    warned: list[str] = []
+    monkeypatch.setattr(dm.log, "warning", lambda *a, **k: warned.append(str(a)))
+
+    conf, _reg = dm._resolve_at_spi_deps()
+
+    assert conf == system
+    assert warned, "回退必须留下告警（否则这就是一次静默降级）"
+    assert dm.ENV_AT_SPI_CONF in warned[0]
 
 
 # ==================== M-10②：拒绝伪造的总线目录 ====================

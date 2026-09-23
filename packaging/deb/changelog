@@ -1,0 +1,11 @@
+cc-computer-use (0.1.0-1) unstable; urgency=medium
+
+  * 首个 .deb 打包。
+  * 完全自包含：随包分发 xdotool / Xephyr / xclip / wmctrl / xrandr / i3 /
+    dbus-daemon / at-spi2-registryd / tesseract 及其依赖闭包、Atspi typelib
+    与 OCR 语言包（eng + chi_sim），目标机无需访问 apt 源。
+  * 随包自带 AT-SPI 总线配置，不再依赖 at-spi2-core 的文件。
+  * 安装后由 cc-computer-use-setup 打开 GNOME 无障碍开关，并在检测到 Claude Code
+    时自动注册 MCP（user scope，不覆盖已有配置）。
+
+ -- liufei <liufeicc@users.noreply.github.com>  Wed, 23 Sep 2026 03:00:00 +0800

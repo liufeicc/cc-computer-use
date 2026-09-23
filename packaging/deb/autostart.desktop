@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Computer Use MCP setup (per user)
+Comment=Enable the GNOME accessibility switch and register the Computer Use MCP server in Claude Code for this user
+Exec=/usr/bin/cc-computer-use-setup --quiet
+Icon=utilities-terminal
+Terminal=false
+NoDisplay=true
+StartupNotify=false
+# gnome-session 认这个键（也是「启动应用程序」里那个开关）；其它桌面环境忽略它，无害。
+X-GNOME-Autostart-enabled=true
+# 给会话总线 / dconf 服务留出起来的时间。脚本自己会探测，但有这个更稳。
+X-GNOME-Autostart-Delay=2

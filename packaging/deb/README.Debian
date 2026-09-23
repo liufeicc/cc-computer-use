@@ -1,0 +1,106 @@
+cc-computer-use for Debian/Ubuntu
+=================================
+
+这是一个让 AI agent 操作 Linux 桌面的 MCP server。默认它在自己的虚拟屏（Xephyr）
+里操作，不会抢占你的鼠标键盘；要让它操作真实桌面，见下面「操作真实桌面」。
+
+
+装了之后要做什么
+----------------
+
+装完通常会**自动**完成下面两件事；如果没有（比如你用的是图形界面的软件中心装的），
+以**普通用户**身份跑一次即可（**不要加 sudo**）：
+
+    cc-computer-use-setup
+
+  1. 打开 GNOME 的无障碍开关
+     （`org.gnome.desktop.interface toolkit-accessibility`）。
+     **不开这个开关，GTK 应用根本不上报无障碍树**，MCP 读到的界面会是空的，
+     而报错信息不会告诉你原因 —— 这是最常见的"装好了却不能用"。
+
+  2. 如果本机装了 Claude Code，把本 MCP 以 **user scope** 注册进去。
+     已经存在同名配置时**不会覆盖**，只打印现状；确实要替换就加 `--force`。
+
+然后重启 Claude Code 会话（或执行 `/mcp`），就会看到 `cc-computer-use`。
+
+检查是否就绪：
+
+    cc-computer-use-doctor
+
+它逐项检查随包文件、动态库依赖、无障碍开关、服务自检、OCR 语言包、Claude Code 注册，
+并把结论翻成人话 —— 这台机器取不到 apt 源，所以出问题时它给出的提示就是唯一的线索。
+
+
+它装在哪
+--------
+
+    /opt/cc-computer-use/           整棵载荷（server/ + vendor/ + bin/）
+    /usr/bin/cc-computer-use-mcp        启动器（软链到上面）
+    /usr/bin/cc-computer-use-setup      用户级配置
+    /usr/bin/cc-computer-use-doctor     体检
+
+`vendor/` 里带着 xdotool / Xephyr / xclip / wmctrl / xrandr / i3 / dbus-daemon /
+at-spi2-registryd / tesseract 以及它们的依赖 —— **刻意不放进 /usr/bin**：放过去的话，
+只要目标机装过其中任何一个（`dpkg: error ... trying to overwrite`），安装就会**直接失败**，
+而本包面向的机器没有 apt 源可以补救。启动器把它们前置进 PATH，效果一样。
+
+同理，本包自带一份 AT-SPI 总线配置（`vendor/at-spi2/accessibility.conf`），不去写
+at-spi2-core 拥有的 `/usr/share/defaults/at-spi2/accessibility.conf`。
+
+
+操作真实桌面
+------------
+
+默认（isolated）模式下 agent 在虚拟屏里工作，你的桌面不受影响。要让它驱动**真实桌面**，
+给 MCP 加一个环境变量：
+
+    claude mcp remove cc-computer-use -s user
+    claude mcp add --scope user cc-computer-use -e CC_CU_DISPLAY_MODE=real -- /usr/bin/cc-computer-use-mcp
+
+⚠️ 该模式下 agent 会用你的真实鼠标键盘、你的剪贴板，并且**你无法同时使用电脑**
+（X11 每块屏只有一套指针与焦点）。用完建议改回去。
+
+临时试一次（不影响注册）：
+
+    CC_CU_DISPLAY_MODE=real /usr/bin/cc-computer-use-mcp --selftest
+
+
+关掉「每次登录自动配置」
+------------------------
+
+本包会装一个登录自启项，作用是覆盖 postinst 管不到的情形（机器上有多个桌面用户、
+或者你先装了本包、之后才装 Claude Code）。它很轻（只在需要注册时才启动 claude CLI），
+但如果你不想让它跑：
+
+    cp /etc/xdg/autostart/cc-computer-use-setup.desktop ~/.config/autostart/
+    sed -i 's/^X-GNOME-Autostart-enabled=.*/X-GNOME-Autostart-enabled=false/' \
+        ~/.config/autostart/cc-computer-use-setup.desktop
+
+（XDG 规则：`~/.config/autostart/` 下的同名文件完整覆盖 `/etc/xdg/autostart/` 下的那份。）
+
+
+卸载
+----
+
+    sudo apt remove cc-computer-use
+
+有两处**用户级**痕迹需要你自己决定要不要清 —— 卸载脚本以 root 运行，够不到它们，
+而且机器上可能有多个用户（它无从知道该动哪一个），所以只提示、不代劳：
+
+    claude mcp remove cc-computer-use -s user            # 各用过的用户各一条
+    gsettings set org.gnome.desktop.interface toolkit-accessibility false
+                                                         # 若其它辅助工具也在用，建议保留
+
+
+已知限制
+--------
+
+  · 只提供 **amd64**、面向 **Ubuntu 22.04 及更新版本**（产物实测需要 glibc 2.34，
+    22.04 是 2.35）。Debian 12 理论上可用但未做验证。
+  · 目标必须是 **X11 会话**。Wayland 下沙箱（isolated 模式）仍可用 —— Xephyr 本身
+    就是个 X server；但 `CC_CU_DISPLAY_MODE=real` 在 Wayland 上不工作。
+  · 沙箱内**隔离不了会话 D-Bus**，所以 gedit 这类按会话总线做单实例判定的程序，
+    在多用户 / 多 Claude 会话并发时可能把窗口开到别人的屏上。
+    沙箱内请用 `gedit --standalone`。
+  · 灰区应用（没有无障碍树的：WPS / Apifox / Remmina / 多数 Electron 与 Qt 程序）
+    只能走 OCR + 坐标点击，明显比元素级操作慢。

@@ -81,6 +81,7 @@ import time  # noqa: F401
 from .constants import (  # noqa: F401
     DEFAULT_SANDBOX_SCREEN,
     DEFAULT_WAIT_USER,
+    ENV_AT_SPI_CONF,
     ENV_MODE,
     ENV_SANDBOX_AT_SPI_BUS,
     ENV_SANDBOX_DISPLAY,

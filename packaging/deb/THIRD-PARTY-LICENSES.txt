@@ -1,0 +1,114 @@
+cc-computer-use —— 随包分发的第三方组件与许可证
+================================================
+
+本包（cc-computer-use 自身，MIT）为了做到「目标机不需要 apt 就能用」，随包分发了
+一批第三方程序与库。这个文件列出它们、各自的许可证与上游地址。
+
+**为什么必须带上这个文件**：其中 xclip 与 wmctrl 是 **GPL-2+**、dbus-daemon 是
+**GPL-2+ / AFL-2.1 双许可**。GPL 允许再分发二进制，但要求随附许可证全文，并让接收者
+能够取得对应源码。分发本包时**不要删掉这个文件**。
+
+各许可证全文在本机的 /usr/share/common-licenses/ 下（GPL-2、GPL-3、LGPL-2.1、
+Apache-2.0）；MIT / BSD-3-Clause 的全文附在本文件末尾。
+
+
+一、随包的**可执行程序**（/opt/cc-computer-use/vendor/bin/）
+------------------------------------------------------------
+
+  xdotool               BSD-3-Clause    https://github.com/jordansissel/xdotool/
+  Xephyr                MIT (X.Org)     https://www.x.org/
+  xclip                 GPL-2.0+        https://github.com/astrand/xclip
+  wmctrl                GPL-2+          http://tripie.sweb.cz/utils/wmctrl/
+  xrandr                MIT (X.Org)     https://www.x.org/
+  i3                    BSD-3-Clause    https://i3wm.org/
+  dbus-daemon           GPL-2+ 或 AFL-2.1（双许可，按 GPL-2+ 处理）
+                                        https://dbus.freedesktop.org/
+  at-spi2-registryd     LGPL-2.1+       https://wiki.gnome.org/Accessibility
+  tesseract             Apache-2.0      https://github.com/tesseract-ocr/
+
+
+二、随包的**数据与库**
+----------------------
+
+  vendor/tessdata/eng.traineddata       Apache-2.0
+  vendor/tessdata/chi_sim.traineddata   Apache-2.0
+      ↑ tesseract 官方训练数据，取自 https://github.com/tesseract-ocr/tessdata
+
+  server/computer-use-mcp-bin/_internal/libatspi.so.0            LGPL-2.1+
+  server/computer-use-mcp-bin/_internal/gi_typelibs/Atspi-2.0.typelib   LGPL-2.1+
+      ↑ 来自 at-spi2-core，https://wiki.gnome.org/Accessibility
+         （嵌在 PyInstaller 产物里，因为目标机可能没装 libatspi2.0-0 / gir1.2-atspi-2.0）
+
+  vendor/at-spi2/accessibility.conf     LGPL-2.1+ / GPL-2（派生自 at-spi2-core 的同名文件）
+      ↑ 仅删去 <servicedir> 与 <listen> 两节，其余逐字保留
+
+  vendor/lib/*.so*                      各自上游（见下）
+      ↑ 上列可执行程序的**动态依赖闭包**，按「任何桌面 Ubuntu 必然已有」的白名单筛选后
+        剩下约 50 个库。它们是 glib / GTK / cairo / harfbuzz / pango / freetype /
+        fontconfig / libpng / libjpeg / libtiff / libwebp / libxml2 / openssl /
+        gnupg / nettle / libarchive / libcurl … 这类基础库的「非白名单」部分。
+        这些库绝大多数是 LGPL-2.1+ / MIT / BSD-3-Clause / Apache-2.0。
+        精确清单：  ls /opt/cc-computer-use/vendor/lib
+        逐个查证：  files=$(ls /opt/cc-computer-use/vendor/lib) ; dpkg -S /usr/lib/x86_64-linux-gnu/$f
+
+  PyInstaller 产物内的 Python 侧依赖（_internal/ 下）
+      Python 3.12（PSF-2.0）、mcp / pydantic / anyio / cryptography（MIT / Apache-2.0）、
+      Pillow（MIT-CMU）、mss（MIT）、python-xlib（LGPL-2.1+）、
+      GLib / GObject / Gio typelib（LGPL-2.1+）
+      各自的许可证全文随 pip 包一同分发（_internal/*.dist-info/ 下）。
+
+
+三、本项目自身
+--------------
+
+  cc-computer-use                        MIT
+  Copyright (c) 2026 liufei
+  https://github.com/liufeicc/cc-computer-use
+
+
+四、附：MIT 与 BSD-3-Clause 全文
+--------------------------------
+
+MIT License
+-----------
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+BSD-3-Clause
+------------
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

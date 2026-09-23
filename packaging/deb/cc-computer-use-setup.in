@@ -1,0 +1,174 @@
+#!/bin/bash
+# ============================================================
+# cc-computer-use —— **用户级**配置（每个用户在自己的会话里跑一次）
+#
+# 它做两件事，都属于「机器级安装包做不了」的那一类：
+#   ① 打开 GNOME 的无障碍开关（不打开，GTK 应用根本不上报无障碍树，
+#      get_ui_tree 会返回空 —— 而报错信息不会告诉你原因）；
+#   ② 若有 Claude Code，就把本 MCP 注册进去（`claude mcp add --scope user`）。
+#
+# 为什么这两件事必须由**用户自己**执行，而不是让 .deb 的 postinst 直接做
+# ------------------------------------------------------------------------
+#   · postinst 以 root 运行。`gsettings set` 写的是 **dconf**，而 dconf 走**会话总线**
+#     —— root 在那个上下文里写进去的只会落在 /root 的 dconf，对真实用户**完全无效**，
+#     是一类「命令成功、毫无作用、还很难查」的失败。
+#   · `~/.claude.json` 是**用户**的文件。postinst 里写它 = 写进 /root/.claude.json。
+#
+# 所以本脚本**第一件事就是拒绝以 root 运行**：即便有人从 postinst 里没套 runuser
+# 直接调它，也只会报错退出，绝不可能污染 root 的配置。这是刻意的不对称 ——
+# 宁可什么都不做，也不做错事。
+#
+# 触发它的地方（三处，都幂等，重复跑无害）：
+#   · .deb 的 postinst：`sudo apt install` 那条路径上，用 $SUDO_USER 当场跑一次；
+#   · /etc/xdg/autostart/cc-computer-use-setup.desktop：每个用户每次登录跑一次，
+#     覆盖「多用户机器」「先装包后装 Claude Code」这些 postinst 管不到的情形；
+#   · 用户手动跑（纯 SSH、没有桌面会话时唯一的路）。
+#
+# 用法: cc-computer-use-setup [--quiet] [--force]
+#   --quiet  只在有实际改动/需要用户注意时才输出（autostart 与 postinst 用）
+#   --force  已存在同名 MCP 配置时**替换**它（默认不动，只打印现状）
+# ============================================================
+
+set -uo pipefail
+# ⚠️ 刻意**不用** `set -e`：本脚本要「每步独立可失败」。某一步（比如 gsettings）
+# 失败不该带走另一步 —— 用户级配置里这两件事互不依赖，一起失败只会让排障更难。
+
+readonly PREFIX="@PREFIX@"
+readonly MCP_NAME="cc-computer-use"
+readonly MCP_CMD="@MCP_BIN@"
+
+QUIET=0
+FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --quiet|-q) QUIET=1 ;;
+    --force|-f) FORCE=1 ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "未知参数: $arg（可用: --quiet --force --help）" >&2; exit 2 ;;
+  esac
+done
+
+# ── 输出助手：quiet 模式下 info 静默，warn/changed 仍然可见 ────────────────
+info()    { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+warn()    { printf '⚠️  %s\n' "$*" >&2; }
+changed() { printf '✅ %s\n' "$*"; }
+
+# ══════════════════════════════════════════════════════════════════════
+# 闸门：拒绝 root（理由见文件头）
+# ══════════════════════════════════════════════════════════════════════
+if [ "$(id -u)" -eq 0 ]; then
+  cat >&2 <<'EOF'
+❌ 请不要用 root / sudo 运行 cc-computer-use-setup。
+
+   它配置的是**当前用户**的 Claude Code 与桌面设置，用 root 跑只会写进 /root，
+   对你自己完全无效（而且很难发现）。
+
+   请以普通用户身份运行：   cc-computer-use-setup
+EOF
+  exit 1
+fi
+
+# ══════════════════════════════════════════════════════════════════════
+# ① 无障碍开关
+# ══════════════════════════════════════════════════════════════════════
+enable_a11y() {
+  local uid cur
+  uid="$(id -u)"
+
+  # 补齐会话上下文：从 postinst（经 runuser）或 SSH 进来时，这两个变量可能没设，
+  # 而 gsettings/dconf 需要它们才能找到**用户会话**的总线。不补的话，dconf 会自己
+  # 起一个空的、临时的库，命令照样返回 0 —— 又是一个「成功但无效」。
+  [ -n "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "/run/user/$uid" ] || export XDG_RUNTIME_DIR="/run/user/$uid"
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$uid/bus" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus"
+  fi
+
+  if ! command -v gsettings >/dev/null 2>&1; then
+    info "跳过无障碍开关：没有 gsettings（apt install libglib2.0-bin）"
+    return
+  fi
+
+  # `gsettings writable` 是**精确探测**，不是猜：schema 不存在、或后端不可写（没有
+  # dconf）都会给出非 true。所以 XFCE / KDE / 纯 SSH 会自然落到下面的跳过分支，
+  # 不需要靠「是不是 GNOME」这种一猜就错的方式判断。
+  if [ "$(gsettings writable org.gnome.desktop.interface toolkit-accessibility 2>/dev/null)" != "true" ]; then
+    info "跳过无障碍开关：本会话没有可写的 GSettings 后端，或没有该 schema"
+    info "  （XFCE / KDE / 无桌面会话都会这样，属正常，不影响 MCP 注册）"
+    return
+  fi
+
+  cur="$(gsettings get org.gnome.desktop.interface toolkit-accessibility 2>/dev/null)"
+  if [ "$cur" = "true" ]; then
+    info "无障碍开关已是 true，无需改动"
+  elif gsettings set org.gnome.desktop.interface toolkit-accessibility true 2>/dev/null; then
+    # 打印原值而不是静默改掉：这是个用户看得见、且可能在未来某天需要还原的设置。
+    changed "已打开无障碍开关（原值 ${cur:-未知}）—— 对**新启动**的 GTK 应用即时生效"
+    info "  （关闭：gsettings set org.gnome.desktop.interface toolkit-accessibility false）"
+  else
+    warn "无障碍开关写入失败。可手动执行："
+    warn "  gsettings set org.gnome.desktop.interface toolkit-accessibility true"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# ② 注册 MCP 到 Claude Code
+# ══════════════════════════════════════════════════════════════════════
+
+# 找 claude 可执行文件。为什么要找这么多地方：autostart 拿到的 PATH 是**会话** PATH，
+# 而 `~/.local/bin`、npm 全局前缀这些通常只写在 `~/.bashrc` 里（显示管理器不读它），
+# 于是「用户 shell 里 claude 明明能用」而这里找不到。`bash -lc` 读 login profile，
+# 是最接近用户真实环境的一次兜底探测。
+find_claude() {
+  local c
+  c="$(command -v claude 2>/dev/null)" && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  for c in "$HOME/.local/bin/claude" "$HOME/.npm-global/bin/claude" \
+           "$HOME/.claude/local/claude" "/usr/local/bin/claude"; do
+    [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  c="$(bash -lc 'command -v claude' 2>/dev/null)"
+  [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  return 1
+}
+
+register_mcp() {
+  local claude
+  if ! claude="$(find_claude)"; then
+    info "未找到 claude 命令 —— 若之后才装 Claude Code，重跑一次本脚本即可"
+    info "  （登录时也会自动重试：/etc/xdg/autostart/cc-computer-use-setup.desktop）"
+    return
+  fi
+
+  # `timeout` 是必要的：这里的 claude 可能正卡在某个交互提示上（首次运行、版本升级），
+  # 而本脚本由 autostart 调用 —— 挂住会连带拖住整个登录会话。
+  # `mcp get` 是权威判据（能看穿 local/user/project 各 scope），比 grep ~/.claude.json 可靠。
+  if timeout 20 "$claude" mcp get "$MCP_NAME" >/dev/null 2>&1; then
+    if [ "$FORCE" != 1 ]; then
+      info "MCP「$MCP_NAME」已存在，保持不动："
+      [ "$QUIET" = 1 ] || timeout 20 "$claude" mcp get "$MCP_NAME" 2>&1 | sed 's/^/    /'
+      info "  如需改为本包的入口：claude mcp remove $MCP_NAME -s user && $0 --force"
+      return
+    fi
+    timeout 20 "$claude" mcp remove "$MCP_NAME" -s user >/dev/null 2>&1
+    info "已移除旧的「$MCP_NAME」配置（--force）"
+  fi
+
+  if timeout 30 "$claude" mcp add --scope user "$MCP_NAME" -- "$MCP_CMD" >/dev/null 2>&1; then
+    changed "已注册到 Claude Code（user scope）：$MCP_NAME → $MCP_CMD"
+    info "  重启 Claude Code 会话（或执行 /mcp）即可看到它"
+  else
+    warn "自动注册失败。请手动执行："
+    warn "  claude mcp add --scope user $MCP_NAME -- $MCP_CMD"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# 主流程
+# ══════════════════════════════════════════════════════════════════════
+enable_a11y
+register_mcp
+
+if [ "$QUIET" != 1 ]; then
+  echo
+  echo "检查是否可用：  cc-computer-use-doctor"
+fi
+exit 0
