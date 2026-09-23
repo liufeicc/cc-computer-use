@@ -21,7 +21,28 @@ MAMBA_VER="26.7.2-0"
 # pygobject 3.50 需要 Python >=3.12（与本项目 requires-python 一致）
 PY_VER="3.12"
 
-echo "=== [1/8] 基础工具 + 项目自身需要的系统库 ==="
+# ── 每步计时 ─────────────────────────────────────────────────────────────
+# 为什么要有这个：整条流水线约 19 分钟，而**其中绝大部分不是我们的代码** ——
+# 实测 apt（两步共 238 个包 / 115 MB）就占掉一半以上，且每次构建都从零开始下。
+# 没有计时的话，「为什么这么慢」只能靠翻文件 mtime 反推（真这么干过一次），
+# 而耗时是会随网络抖动的（实测同一份脚本两次运行差好几分钟）。
+# 输出形如 `=== [1/8] ... (用时 2m24s)`，机器可读，便于事后比对。
+_STEP_T0=0
+_step() {                       # _step <序号> <说明>
+  local now; now=$(date +%s)
+  if [ "$_STEP_T0" -gt 0 ]; then
+    local d=$(( now - _STEP_T0 ))
+    printf '\n\033[1m── 上一步用时 %dm%02ds ──\033[0m\n' $(( d / 60 )) $(( d % 60 ))
+  fi
+  _STEP_T0=$now
+  echo "=== [$1] $2 ==="
+}
+_finish() {
+  local d=$(( $(date +%s) - _STEP_T0 ))
+  printf '\n\033[1m── 最后一步用时 %dm%02ds ──\033[0m\n' $(( d / 60 )) $(( d % 60 ))
+}
+
+_step "1/8" "基础工具 + 项目自身需要的系统库"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 # binutils 是 PyInstaller 在 Linux 上的**硬依赖**（它用 objdump 读每个二进制的
@@ -39,14 +60,14 @@ apt-get install -y -qq --no-install-recommends \
 # 它提供 **DBus-1.0.typelib**，而 Atspi-2.0.typelib 的头部声明了 `...|DBus-1.0` 这个依赖。
 # embed-atspi.sh 现在会把整个 typelib 闭包一起嵌进产物，少了它会在那一步直接失败。
 
-echo "=== [2/8] 要随包分发的 9 个系统二进制（及其运行时依赖包） ==="
+_step "2/8" "要随包分发的 9 个系统二进制（及其运行时依赖包）"
 apt-get install -y -qq --no-install-recommends \
     xdotool xserver-xephyr xclip wmctrl x11-xserver-utils \
     i3-wm dbus at-spi2-core \
     tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng \
     >/dev/null
 
-echo "=== [3/8] 安装 miniforge（conda） ==="
+_step "3/8" "安装 miniforge（conda）"
 # 为什么要有「预置安装包」这条路径（2026-09-23 实测踩到）：
 #   容器到 github.com 的连通性会**间歇性**失败，实测一次直接卡到
 #   `curl: (28) Failed to connect to github.com port 443 after 133027 ms: Connection timed out`，
@@ -77,18 +98,18 @@ export PATH="/opt/conda/bin:$PATH"
 conda config --set remote_max_retries 5 >/dev/null 2>&1 || true
 conda config --set remote_connect_timeout_secs 30 >/dev/null 2>&1 || true
 
-echo "=== [4/8] 建 conda 环境并装 pygobject ==="
+_step "4/8" "建 conda 环境并装 pygobject"
 conda create -y -q -p /opt/env python="${PY_VER}" >/dev/null
 conda install -y -q -p /opt/env -c conda-forge pygobject >/dev/null
 PY="/opt/env/bin/python"
 
-echo "=== [5/8] Python 依赖 + 本项目 ==="
+_step "5/8" "Python 依赖 + 本项目"
 export PYTHONNOUSERSITE=1
 "$PY" -m pip install -q -U pip >/dev/null
 "$PY" -m pip install -q mcp cryptography pyinstaller pytest python-xlib mss pillow >/dev/null
 "$PY" -m pip install -q -e /src >/dev/null
 
-echo "=== [6/8] PyInstaller 打包 ==="
+_step "6/8" "PyInstaller 打包"
 export GI_TYPELIB_PATH="/usr/lib/x86_64-linux-gnu/girepository-1.0"
 export LD_LIBRARY_PATH="/opt/env/lib"
 cd /src
@@ -136,10 +157,10 @@ cd /src
 # _MEIPASS 之下的路径，所以它会被自动从子进程 env 里剥掉。详见脚本注释。
 bash /src/packaging/embed-atspi.sh /out/dist/computer-use-mcp-bin
 
-echo "=== [7/8] 组装可分发目录（.mcpb / 通用目录）==="
+_step "7/8" "组装可分发目录（.mcpb / 通用目录）"
 bash /src/packaging/assemble.sh /out/dist
 
-echo "=== [8/8] 打 .deb（Ubuntu 用户的主要分发形态）==="
+_step "8/8" "打 .deb（Ubuntu 用户的主要分发形态）"
 # 在容器里打而不是在宿主打：这边的 dpkg 就是 22.04 的那一份，打出来的包天然与
 # 最低目标平台一致，不需要额外假设宿主的 dpkg-deb 行为。
 # 版本号可由 CC_CU_VERSION 覆盖（与 assemble.sh 同源）。
@@ -158,6 +179,7 @@ if [ -n "${CC_CU_CHOWN:-}" ]; then
   chown -R "$CC_CU_CHOWN" /out
 fi
 
+_finish
 echo
 echo "=== 构建完成，产物在 /out/dist ==="
 ls -lh /out/dist/*.deb /out/dist/*.mcpb 2>/dev/null

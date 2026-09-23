@@ -190,6 +190,36 @@ def test_container_build_returns_output_ownership():
         assert "CC_CU_CHOWN" in _read(doc), f"{doc} 的构建命令没带 CC_CU_CHOWN"
 
 
+def test_build_deb_pins_umask():
+    """
+    `build-deb.sh` 必须在**建任何文件之前**把 umask 定死。
+
+    实测（2026-09-23）：脚本里的 `cp` / `mkdir -p` / `gzip >` 全部受调用方 umask 影响，
+    而末尾那段「权限归一」只覆盖 `$PREFIX` 与 `/usr`、`/etc` 的**目录**，没有逐个 chmod
+    `/usr/share/doc/` 下的文件。于是同一份源码在两台机器上打出**权限位不同**的包：
+    宿主 umask 0002 → `/usr/share/doc/.../README.Debian` 是 0664；容器里（022）是 0644。
+
+    这不只是「不一致」——/usr/share/doc 下的文件按 Debian 政策就该是 0644，0664 是错的，
+    而且它让「同一份源码产出同一个包」这个前提悄悄失效。
+
+    判据取**非注释行**上的 `umask`：注释里写一句「本该 umask 022」是挡不住问题的
+    （同款教训见上面那条 chown 守卫）。
+    """
+    src = _read("packaging", "deb", "build-deb.sh")
+    live = [ln.split("#", 1)[0] for ln in src.splitlines()]
+    live = [ln for ln in live if ln.strip()]
+    assert any(re.match(r"\s*umask\s+022\s*$", ln) for ln in live), \
+        "build-deb.sh 没有在任何真实命令行上定死 umask（产物权限位会随构建机漂移）"
+
+    # 而且必须在建文件之前：第一处 mkdir / cp 的**行号**要晚于 umask 那行
+    i_umask = next(i for i, ln in enumerate(live) if re.match(r"\s*umask\s+022\s*$", ln))
+    first_create = next((i for i, ln in enumerate(live)
+                         if re.search(r"\b(mkdir|cp|gzip|ln)\b", ln)), None)
+    assert first_create is not None, "没找到建文件的命令（脚本被大改？）"
+    assert i_umask < first_create, \
+        "umask 定得太晚 —— 在它之前已经有文件被创建出来了"
+
+
 # ==================== ② 分发清单不许泄漏库路径 ====================
 
 def test_mcpb_manifest_does_not_leak_library_paths():

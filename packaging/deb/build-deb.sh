@@ -31,6 +31,15 @@
 # ============================================================
 set -euo pipefail
 
+# ⚠️ umask 必须在**建任何文件之前**定死（2026-09-23 实测踩到）。
+# 下面所有的 `cp` / `mkdir -p` / `gzip >` 都受调用方 umask 影响，而脚本末尾那段
+# 「权限归一」只覆盖 `$PREFIX` 与 `/usr`、`/etc` 的**目录**，没有逐个 chmod
+# `/usr/share/doc/` 下的文件。于是同一份源码在两台机器上会打出**权限位不同**的包：
+# 实测本机 umask 0002 → `/usr/share/doc/.../README.Debian` 是 0664，容器里（022）是 0644。
+# 这不只是「不一致」：/usr/share/doc 里的文件按 Debian 政策就该是 0644，0664 是错的，
+# 而且它让「同一份源码产出同一个包」这个前提悄悄失效。
+umask 022
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$REPO/packaging/deb"
 
