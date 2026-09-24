@@ -291,6 +291,11 @@ docker run --rm -v "$PWD":/src -v "$PWD/dist":/out/dist \
 bash packaging/deb/verify-install.sh dist/*.deb ubuntu:22.04   # 干净容器验收（10 步）
 bash packaging/deb/verify-install.sh dist/*.deb ubuntu:24.04   # 高版本再验一遍
 
+# 专项探针：确认包里的**冻结产物**带着「沙箱里操作 shell」两条修复（verify 查不到这段）。
+# 那 10 步验的是安装/依赖/注册/a11y 全链路，**不会**调 launch_app("gnome-terminal")、
+# 也不会往终端里输入长文本，所以「build 时用的是不是最新源码」它证明不了。
+bash packaging/deb/probe-deb-fix.sh dist/*.deb ubuntu:22.04
+
 # 只改了打包脚本/control 文件时**别重跑上面那 19 分钟**——组装目录已经有了，
 # 直接重打 deb 只要约 1 分钟（实测 1m07s）：
 docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/d -v /tmp/o:/o ubuntu:22.04 \

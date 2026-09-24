@@ -230,6 +230,10 @@ docker run --rm -v "$PWD":/src -v "$PWD/dist":/out/dist \
 
 # 在干净容器里验收（装、跑、点、卸全链路；22.04 与 24.04 各跑一遍）
 bash packaging/deb/verify-install.sh dist/*.deb ubuntu:22.04
+
+# 专项探针：确认包里的**冻结产物**带着「沙箱里操作 shell」两条修复
+# （上面那 10 步不会调 launch_app("gnome-terminal")，所以证明不了 build 用的是最新源码）
+bash packaging/deb/probe-deb-fix.sh dist/*.deb ubuntu:22.04
 ```
 
 只产 `.deb`，**不打 `.mcpb`**（Claude Desktop 那个包要额外 zip 两分钟，本次分发用不到；

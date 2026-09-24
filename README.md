@@ -317,6 +317,10 @@ docker run --rm -v "$PWD":/src -v "$PWD/dist":/out/dist \
 
 # Accept it in a clean container (install → run → click → uninstall; run it on both 22.04 and 24.04)
 bash packaging/deb/verify-install.sh dist/*.deb ubuntu:22.04
+
+# Probe the packaged artifacts for the sandbox-shell fixes (the 10-step acceptance above
+# never calls launch_app("gnome-terminal"), so it can't tell which source tree was built)
+bash packaging/deb/probe-deb-fix.sh dist/*.deb ubuntu:22.04
 ```
 
 Only the `.deb` is produced — the `.mcpb` (Claude Desktop bundle) is opt-in via `CC_CU_MCPB=1`,

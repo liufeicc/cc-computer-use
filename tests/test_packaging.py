@@ -547,6 +547,7 @@ def test_shipped_shell_scripts_avoid_grep_q_in_pipelines():
         ("packaging", "deb", "verify-in-container.sh"),
         ("packaging", "deb", "cc-computer-use-doctor.in"),
         ("packaging", "deb", "cc-computer-use-setup.in"),
+        ("packaging", "deb", "probe-in-container.sh"),
     ]
     offenders = []
     for parts in targets:
@@ -559,3 +560,61 @@ def test_shipped_shell_scripts_avoid_grep_q_in_pipelines():
         "pipefail 下管线判为失败）—— 改成先收变量 + case 模式匹配：\n  "
         + "\n  ".join(offenders)
     )
+
+
+# ==================== ⑨ .deb 专项探针（probe-deb-fix.sh）====================
+
+def test_probe_mounts_every_script_the_container_part_calls():
+    """
+    探针分两层（宿主脚本起容器 / 容器内脚本干活），靠 `-v` 把文件挂进去。
+
+    **漏挂一个的表现是「容器里报 No such file」而不是「探针漏测」**，但那仍然要跑一次
+    几分钟的 docker 才暴露。更坏的一种是挂了却忘了写进 targets、于是那条判据静默消失。
+    这里直接对着「容器内脚本引用的 /tmp/*.py」清单去核对「宿主脚本挂了哪些」。
+    """
+    host = _read("packaging", "deb", "probe-deb-fix.sh")
+    inner = _read("packaging", "deb", "probe-in-container.sh")
+
+    referenced = set(re.findall(r"/tmp/(probe_[A-Za-z0-9_]+\.py)", inner))
+    assert referenced, "容器内脚本里一个 probe_*.py 都没引用，正则或脚本结构变了"
+
+    # 挂载写法是 `-v "$HERE/xxx.py":/tmp/xxx.py:ro` —— 名字在**引号之前**，
+    # 所以正则要让 `[^"]*` 吃掉引号内的目录部分，再在闭合引号前取文件名。
+    mounted = set(re.findall(r'-v\s+"[^"]*/([A-Za-z0-9_.]+)":/tmp/', host))
+    missing = referenced - mounted
+    assert not missing, (
+        f"probe-deb-fix.sh 没有把这些脚本挂进容器：{sorted(missing)}"
+        "（漏挂会在容器里报 No such file）"
+    )
+
+
+def test_probe_judges_are_not_tautologies():
+    """
+    探针的判据不能是「工具报了 ok」这类恒真条件 —— 两个 bug 的**共同特征**恰恰是
+    "工具报成功、实际没生效"：`type_text` 恒报成功、`launch_app` 恒报 ok=True。
+    所以判据必须是外部可观测量：子进程真收到的 argv、xev 真记录的按键。
+
+    这条守卫钉住那两样东西在源码里确实存在（判据本身在容器里跑，单测跑不了 docker）。
+    """
+    launch = _read("packaging", "deb", "probe_launch.py")
+    paste = _read("packaging", "deb", "probe_paste.py")
+    inner = _read("packaging", "deb", "probe-in-container.sh")
+
+    # 判据只看**会执行的行**：这几个文件的注释里大段写着「修复前是裸 ctrl+v」
+    # 「Shift_L 会出现」之类的说明，拿原文断言等于在测注释 —— 实测把条件里的
+    # `"Shift_L" not in keys` 整个删掉，注释里的 Shift_L 照样让守卫全绿。
+    paste_live = "\n".join(_live_lines(paste))
+    inner_live = "\n".join(_live_lines(inner))
+
+    # ① launch 探针：假 gnome-terminal 把**子进程实际收到的参数**写进这个文件，
+    #    判据必须落在它上面（只看返回的 JSON 是恒真的）。
+    assert "gt-args.txt" in inner_live, "容器内脚本没有去读子进程实际收到的参数"
+    assert "grep -qx" in inner_live, "容器内脚本没有对实际参数做精确断言"
+    assert "launch_app" in launch, "launch 探针没有真的调 launch_app"
+
+    # ② paste 探针：必须断言 xev 记录的按键里带 Shift，否则裸 ctrl+v 也会判通过
+    assert '"Shift_L"' in paste_live, "paste 探针没有检查 Shift（那样裸 ctrl+v 也会判通过）"
+    assert "xev" in paste_live, "paste 探针没有用 xev 观测真实按键"
+
+    # ③ 两个 bug 都在真机上才暴露，所以容器内脚本必须起 Xvfb 当父显示
+    assert "Xvfb" in inner_live, "容器内脚本没起 Xvfb（沙箱嵌在已有 X server 上，没它起不来）"
