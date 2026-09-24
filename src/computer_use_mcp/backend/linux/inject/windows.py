@@ -43,6 +43,60 @@ class WindowMixin:
         except (ValueError, AttributeError):
             return None
 
+    def active_window_class(self) -> str | None:
+        """
+        活动窗口的 WM_CLASS，归一成小写应用名（如 'gnome-terminal'、'xterm'）；读不到返回 None。
+
+        用途：剪贴板粘贴要据此决定发 `ctrl+v` 还是 `ctrl+shift+v` —— 终端仿真器里
+        `Ctrl+V` 不是粘贴（见 keyboard.py 的 `_paste_combo`）。标题与 pid 都替代不了它：
+        标题是任意字节串且随内容变（终端标题里带着当前目录），pid 还要再解析 WM_CLASS。
+
+        ⚠️ **不能走 xdotool**（2026-09-24 实测）：本机 xdotool 3.20160805.1 的命令表里
+        **没有 `getwindowclassname`**（`xdotool help` 列出的只有 getactivewindow /
+        getwindowfocus / getwindowname / getwindowpid / getwindowgeometry），调它只会得到
+        `Unknown command` + 空 stdout。所以改用 **wmctrl**（本项目已随包分发、apps.py 也
+        在用它读 WM_CLASS）：先 `xdotool getactivewindow` 拿活动窗口 id，再到
+        `wmctrl -lpx` 的行里按 id 找它的 `instance.Class`。
+        **id 要用 int() 比而不是字符串比**：xdotool 给十进制（12582918）、wmctrl 给
+        零填充十六进制（0x00c00006），直接比字符串永远不相等（且不报错）。
+
+        本方法自身**不抛**：读不到就返回 None，调用方据此退回默认行为。这条很重要——
+        它只是"帮个忙"的优化，绝不允许把原本能用的输入弄坏。
+        """
+        wid = self.active_window_id()
+        if not wid:
+            return None
+        try:
+            want = int(wid.strip(), 0)
+        except ValueError:
+            return None
+        wmctrl = shutil.which("wmctrl")
+        if not wmctrl:
+            return None
+        try:
+            p = subprocess.run([wmctrl, "-lpx"], capture_output=True, text=True,
+                               timeout=5, errors="replace", env=display.env_for())
+        except Exception as exc:  # noqa: BLE001
+            log.debug("wmctrl -lpx 执行失败: %s", exc)
+            return None
+        if p.returncode != 0:
+            return None
+        # 行格式：<窗口id> <桌面> <pid> <instance.Class> <主机名> <标题……>
+        # → split(maxsplit=5) 恰好 6 段（标题含空格，不限次会把标题切碎）。
+        for line in p.stdout.splitlines():
+            parts = line.split(maxsplit=5)
+            if len(parts) < 5:
+                continue
+            try:
+                if int(parts[0], 16) != want:
+                    continue
+            except ValueError:
+                continue
+            # 复用 AppMixin 的解析（instance 与 Class 同名时 wmctrl 会拼成 X.X，
+            # 直接 split('.', 1)[1] 会切错——详见 _wm_class_to_name 的 docstring）。
+            return self._wm_class_to_name(parts[3]) or None
+        return None
+
     def window_geometry(self, wid: str) -> Rect | None:
         """读窗口屏幕几何（左上角 + 尺寸）。复用 demo getwindowgeometry --shell 解析。"""
         p = self._run(["getwindowgeometry", "--shell", wid])

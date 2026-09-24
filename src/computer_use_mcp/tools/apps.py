@@ -17,8 +17,13 @@ def register(mcp: Any, coord: Coordinator) -> None:
         description=(
             "在目标 display 启动应用：isolated 模式即放进 Xephyr 沙箱（把应用放上虚拟屏的"
             "**唯一正路**，宿主桌面不受影响）；real 模式即普通启动。command 用 shlex 解析"
-            "（如 'zenity --entry --title=T'、'gedit'），返回 {pid,command,display} 的 JSON。"
+            "（如 'zenity --entry --title=T'、'gedit'），返回 {pid,command,display,argv} 的"
+            "JSON（argv 是**实际执行**的命令行）。"
             "启动后配合 wait_window 等窗口出现，再 get_ui_tree/click 操作。"
+            "已知的单实例应用（gnome-terminal、gedit 等）会自动补上它们各自的『去单实例』"
+            "参数（如 --disable-factory / --standalone），否则它们的窗口会开到宿主桌面上"
+            "那个已存在的实例旁——这类应用只改 DISPLAY 是搬不动的，返回的 argv 里能看到"
+            "补了什么。"
         ),
     )
     def launch_app(command: str, settle: float = 2.0) -> str:

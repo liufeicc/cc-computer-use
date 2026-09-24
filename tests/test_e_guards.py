@@ -150,6 +150,89 @@ def test_text_clipboard_is_restored_without_warning(monkeypatch):
     assert warns == [], f"正常路径不该告警：{warns}"
 
 
+# ==================== 终端里的粘贴键：ctrl+v 不是粘贴 ====================
+#
+# 2026-09-24 实测：终端仿真器（VTE）里 `Ctrl+V` **不是粘贴**，它的粘贴键是
+# `Ctrl+Shift+V`；`Ctrl+V` 会被原样写进 pty（0x16），bash/readline 当作 lnext
+# （引用下一个字符）。后果是**静默失败**——type_text 报成功、屏幕上一个字都没进来，
+# 且紧随其后的那个字符被吃掉。实测：37 字符的命令走剪贴板路径后终端里只剩一个 `^V`；
+# 同一串 ctrl+v 打在 GTK 输入框（zenity）里则完整粘贴成功。
+
+
+def _run_paste_with_class(monkeypatch, cls, *, raise_in_probe=False):
+    """跑一次剪贴板输入，返回实际按下的组合键列表（WM_CLASS 由参数给定）。"""
+    monkeypatch.setattr(inject_mod.shutil, "which", lambda n: "/usr/bin/xclip")
+    monkeypatch.setattr(inject_mod.subprocess, "run",
+                        lambda cmd, **kw: _Proc(stdout=b"old-text") if "-o" in cmd else _Proc())
+    inj = _inj()
+    keys: list[str] = []
+    inj.press_key = lambda c: (keys.append(c), True)[1]
+    if raise_in_probe:
+        def _boom():
+            raise RuntimeError("xdotool 不可用")
+        inj.active_window_class = _boom
+    else:
+        inj.active_window_class = lambda: cls
+    inj._type_via_clipboard("中文")
+    return keys
+
+
+def test_paste_uses_ctrl_shift_v_in_terminal(monkeypatch):
+    """判据是**实际按下的组合键**，不是"有没有报成功"——旧实现恒发 ctrl+v，同样报成功。"""
+    assert _run_paste_with_class(monkeypatch, "Gnome-terminal") == ["ctrl+shift+v"]
+    assert _run_paste_with_class(monkeypatch, "XTerm") == ["ctrl+shift+v"]
+    assert _run_paste_with_class(monkeypatch, "Alacritty") == ["ctrl+shift+v"]
+
+
+def test_paste_stays_ctrl_v_in_normal_widgets(monkeypatch):
+    """反向：普通窗口必须**继续**用 ctrl+v —— 改错了会让所有 GUI 应用的输入全废。"""
+    assert _run_paste_with_class(monkeypatch, "Zenity") == ["ctrl+v"]
+    assert _run_paste_with_class(monkeypatch, None) == ["ctrl+v"]
+    # 空串（xdotool 读不到 class 时的归一结果）也不能被当成终端
+    assert _run_paste_with_class(monkeypatch, "") == ["ctrl+v"]
+
+
+def test_paste_probe_failure_falls_back_instead_of_breaking_input(monkeypatch):
+    """
+    探测本身**绝不允许**把输入弄坏：活动窗口读不到（没有 WM、无活动窗、测试替身
+    没有 `_bin`）时必须安静退回 ctrl+v。这是个"帮个忙"的优化，不是新依赖。
+    """
+    assert _run_paste_with_class(monkeypatch, None, raise_in_probe=True) == ["ctrl+v"]
+
+
+def test_paste_key_env_override_wins(monkeypatch):
+    """逃生口：表里没有的终端 / 判错了，可以用 CC_CU_PASTE_KEY 直接指定。"""
+    monkeypatch.setenv("CC_CU_PASTE_KEY", "ctrl+v")
+    assert _run_paste_with_class(monkeypatch, "Gnome-terminal") == ["ctrl+v"]
+    monkeypatch.setenv("CC_CU_PASTE_KEY", "ctrl+shift+v")
+    assert _run_paste_with_class(monkeypatch, "Zenity") == ["ctrl+shift+v"]
+
+
+def test_active_window_class_matches_wmctrl_by_numeric_id(monkeypatch):
+    """
+    判据要同时挡住两个静默失效：
+      ① 走 xdotool（本机 3.20160805.1 **没有** getwindowclassname，恒返回空）；
+      ② 拿十进制 id 去和 wmctrl 的 `0x…` 字符串比（永远不相等，也不报错）。
+    """
+    inj = _inj()
+    inj.active_window_id = lambda: "12582918"          # xdotool 给的是十进制
+    monkeypatch.setattr(inject_mod.shutil, "which", lambda n: "/usr/bin/wmctrl")
+    monkeypatch.setattr(inject_mod.subprocess, "run", lambda cmd, **kw: _Proc(
+        stdout="0x00c00006  0  1234  gnome-terminal-server.Gnome-terminal  host  liufei@host: ~\n"
+               "0x00c00007  0  5678  other.Other  host  别的窗口\n"))
+
+    assert inj.active_window_class() == "gnome-terminal"
+
+    # 活动窗口不在清单里 / 没有活动窗口 / wmctrl 缺失 → None（调用方退回 ctrl+v）
+    inj.active_window_id = lambda: "999999"
+    assert inj.active_window_class() is None
+    inj.active_window_id = lambda: None
+    assert inj.active_window_class() is None
+    monkeypatch.setattr(inject_mod.shutil, "which", lambda n: None)
+    inj.active_window_id = lambda: "12582918"
+    assert inj.active_window_class() is None
+
+
 # ==================== M-32：标题当正则用 ====================
 
 def test_window_search_escapes_title_regex(monkeypatch):

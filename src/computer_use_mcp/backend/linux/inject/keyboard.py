@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
@@ -19,6 +20,20 @@ from .base import log
 # 长文本（含纯 ASCII）也走剪贴板粘贴的字符阈值：逐字符 xdotool type 太慢
 # （60 字符约 1s），剪贴板 + ctrl+v 是一次原子操作，长串快一个量级。
 _CLIPBOARD_MIN_LEN = 24
+
+# 终端仿真器的 WM_CLASS（**class** 名，小写比对）——在它们里面粘贴必须用 ctrl+shift+v。
+# 为什么是一张表而不是一条通用判据：X11 里没有任何字段能直接回答"这个窗口是不是终端"
+# （role/type 都只是普通窗口），class 名是唯一稳定且零成本的信号。它会过时、会漏新终端，
+# 但漏了的后果只是"退回 ctrl+v、粘贴不生效"——与今天的行为完全一致，不会更坏；
+# 而 CC_CU_PASTE_KEY 可以在不改代码的情况下兜住新终端。
+_TERMINAL_CLASSES = frozenset({
+    "gnome-terminal", "gnome-terminal-server",
+    "xterm", "uxterm", "koi8rxterm", "urxvt", "rxvt",
+    "konsole", "xfce4-terminal", "mate-terminal", "lxterminal", "lilyterm",
+    "terminator", "tilix", "alacritty", "kitty", "wezterm", "foot", "footclient",
+    "st", "stterm", "sakura", "tilda", "guake", "yakuake", "deepin-terminal",
+    "qterminal", "terminology", "cool-retro-term",
+})
 
 # 键名别名归一表：把 agent 常用但 xdotool 不认的写法翻译成合法 keysym，
 # 避免「发错键名却静默无操作」白耗一轮。键统一小写匹配。
@@ -54,6 +69,8 @@ class KeyboardMixin:
             （XChangeKeyboardMapping 把字符绑到空闲 keycode 再模拟敲击），输入期间
             物理键盘整体失灵（鼠标不受影响），且与 fcitx 等输入法争抢 XKB 状态；
             剪贴板 + ctrl+v 是一次性原子操作，不改键位映射、不冻键盘、快一个量级。
+            注意粘贴键**不是恒为 ctrl+v**：目标是终端仿真器时要用 ctrl+shift+v，
+            否则文本会静默丢失（见 _paste_combo 的 docstring 与 _TERMINAL_CLASSES）。
         """
         if text.isascii() and len(text) < _CLIPBOARD_MIN_LEN:
             # `--` 终止选项解析（M-33）：文本以 `-` 开头时（如 "-1"、"--flag"、" - item"），
@@ -83,6 +100,35 @@ class KeyboardMixin:
             return p.stdout.decode("utf-8", "replace").split() if p.returncode == 0 else []
         except Exception:  # noqa: BLE001
             return []
+
+    def _paste_combo(self) -> str:
+        """
+        本次剪贴板粘贴该发哪个组合键：默认 `ctrl+v`；活动窗口是终端仿真器时 `ctrl+shift+v`。
+
+        为什么必须区分（2026-09-24 实测）：**终端里 Ctrl+V 不是粘贴**。VTE 的粘贴键是
+        Ctrl+Shift+V，而 Ctrl+V 会被原样写进 pty（字节 0x16），bash/readline 把它当作
+        lnext（"引用下一个字符"）。后果是**静默失败**：`type_text` 报成功、屏幕上却一个
+        字都没进来，而且紧随其后的那个字符还会被吃掉（实测：37 字符的命令经剪贴板路径
+        输入后，终端提示符上只剩一个 `^V`，命令内容全无）。同一串 `ctrl+v` 打在 GTK
+        输入框（zenity）里则完整粘贴成功——所以这不是剪贴板或 xclip 的问题。
+
+        判定只用活动窗口的 WM_CLASS（X11 一次调用，**不依赖 a11y**，沙箱私有总线失效
+        时照样能判）。**探测失败一律退回 `ctrl+v`**：这是个"帮个忙"的优化，绝不允许它
+        把原本能用的输入弄坏——测试替身（`XdotoolInjector.__new__` 构造、没有 `_bin`）
+        会让 `active_window_class()` 抛异常，故这里必须吞掉。
+
+        `CC_CU_PASTE_KEY` 可强制指定组合键（表里没有的终端，或判错了）：设成 `ctrl+v`
+        即整体退回旧行为。
+        """
+        forced = os.environ.get("CC_CU_PASTE_KEY")
+        if forced:
+            return forced
+        try:
+            cls = (self.active_window_class() or "").lower()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("读活动窗口 WM_CLASS 失败（退回 ctrl+v）: %s", exc)
+            return "ctrl+v"
+        return "ctrl+shift+v" if cls in _TERMINAL_CLASSES else "ctrl+v"
 
     def _type_via_clipboard(self, text: str) -> bool:
         """
@@ -139,8 +185,9 @@ class KeyboardMixin:
             raise InjectionError(f"xclip 写入剪贴板失败(rc={w.returncode})")
         try:
             # 3. 粘贴（缩短等待：剪贴板所有权就绪通常 <50ms）
+            # 组合键由 _paste_combo 决定：终端里是 ctrl+shift+v，其余 ctrl+v。
             time.sleep(0.05)
-            self.press_key("ctrl+v")
+            self.press_key(self._paste_combo())
         finally:
             # 4. 还原原剪贴板 —— **必须在 finally 里**（M-30②）：粘贴一旦抛异常，历史实现
             #    会直接向上抛，剪贴板就**停在 agent 文本上**，而这同样会被剪贴板管理器

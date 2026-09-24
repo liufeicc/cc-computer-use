@@ -351,6 +351,68 @@ def test_launch_app_bad_quoting_gives_actionable_error():
     assert "命令行解析失败" in str(ei.value)
 
 
+# ---------- 单实例应用必须补「去单实例」参数 ----------
+#
+# 2026-09-24 实测：`launch_app("gnome-terminal")` 报 ok、display=":0"，窗口却出现在
+# **宿主 :1**。原因是这类 GTK/GApplication 应用在会话总线上的单实例语义——只改 DISPLAY
+# 搬不动它，第二次启动只是请**已有实例**开个窗口。修法是补上应用自带的去单实例开关。
+
+
+def test_desingleton_args_injected_for_singleton_apps():
+    """判据是**实际执行的 argv**，不是返回值里的 command（那串永远是用户原话）。"""
+    from computer_use_mcp.core.coordinator.windows import _desingleton_argv
+
+    assert _desingleton_argv(["gnome-terminal"]) == ["gnome-terminal", "--disable-factory"]
+    # 只认 basename：绝对路径、带 .real 后缀的变体都要命中
+    assert _desingleton_argv(["/usr/bin/gnome-terminal"]) == [
+        "/usr/bin/gnome-terminal", "--disable-factory"]
+    assert _desingleton_argv(["gedit"]) == ["gedit", "--standalone"]
+    # 参数补在**选项区最前面**：`--` 之后的位置参数不能被顶掉
+    assert _desingleton_argv(["gnome-terminal", "--", "bash"]) == [
+        "gnome-terminal", "--disable-factory", "--", "bash"]
+
+
+def test_desingleton_args_leave_everything_else_untouched():
+    """
+    反向（比正向更要紧）：**不认识的应用一个字都不许改**。
+    模糊匹配或"猜一个参数塞进去"会把本来好的启动弄坏，而且只有那一类应用会出问题。
+    """
+    from computer_use_mcp.core.coordinator.windows import _desingleton_argv
+
+    assert _desingleton_argv(["zenity", "--entry"]) == ["zenity", "--entry"]
+    # 只是名字里含 gnome-terminal 的别的程序，不得命中
+    assert _desingleton_argv(["my-gnome-terminal-wrapper"]) == ["my-gnome-terminal-wrapper"]
+    assert _desingleton_argv(["gnome-terminal-helper"]) == ["gnome-terminal-helper"]
+    # 调用方自己已经加过 → 不重复加（两份会被应用当成语法错）
+    assert _desingleton_argv(["gnome-terminal", "--disable-factory"]) == [
+        "gnome-terminal", "--disable-factory"]
+
+
+def test_launch_app_popen_receives_desingleton_argv(monkeypatch):
+    """端到端一点的那条：确认 launch_app 真的把补过参数的 argv 交给了 Popen。"""
+    from computer_use_mcp.core.coordinator import windows as coord_windows
+
+    seen: dict = {}
+
+    class _P:
+        pid = 4242
+
+        def wait(self):
+            return 0
+
+    def fake_popen(argv, **kw):
+        seen["argv"] = argv
+        return _P()
+
+    monkeypatch.setattr(coord_windows.subprocess, "Popen", fake_popen)
+    coord = Coordinator(backend=_StubBackend())
+    out = coord.launch_app("gnome-terminal", settle=0)
+
+    assert seen["argv"] == ["gnome-terminal", "--disable-factory"]
+    assert out["argv"] == ["gnome-terminal", "--disable-factory"], "返回值也要如实回报"
+    assert out["command"] == "gnome-terminal", "原命令串保持原样，便于对照"
+
+
 
 
 
