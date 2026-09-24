@@ -46,9 +46,75 @@ PROCESS_DPI_AWARENESS_UNAWARE = 0
 PROCESS_DPI_AWARENESS_SYSTEM_AWARE = 1
 PROCESS_DPI_AWARENESS_PER_MONITOR_AWARE = 2
 
+# 屏幕度量（GetSystemMetrics）
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+SM_CMONITORS = 80
+
+# 枚举当前显示设置（EnumDisplaySettingsW）
+ENUM_CURRENT_SETTINGS = 0xFFFFFFFF
+
+# SendInput
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+
+# ═══ 定宽别名：为什么不能直接用 `wintypes.DWORD` ═══
+#
+# `ctypes.wintypes` 在**非 Windows** 上把所有名字都建在 `c_long`/`c_ulong` 之上
+# （`DWORD = c_ulong`、`LONG = c_long`）。而 Linux 是 **LP64**（这两个 8 字节）、
+# Windows 是 **LLP64**（4 字节）—— 于是同一份结构体定义在两个平台上会布局成不同大小。
+#
+# 后果不只是"Linux 上算错"（我们本来也不在 Linux 上调这些 API），而是：
+# **唯一能在 CI 里自动验证结构布局的地方恰恰是 Linux**。布局一旦随平台漂移，
+# `sizeof` 断言就只能在真机上跑 —— 而真机验证正是我们要避免的那件事。
+#
+# 所以凡是「希望布局跨平台一致、从而能被 Linux 上的守卫守住」的结构体，
+# 一律用下面这几个写死宽度的别名，**不要**用 `wintypes` 里那些。
+# （既有那些只用标量入参、不构成结构体布局的地方不受影响，无需改动。）
+_WORD = ctypes.c_uint16
+_DWORD = ctypes.c_uint32
+_LONG = ctypes.c_int32
+
+# ⚠️ `WCHAR` 同样要钉死：Windows 的 `wchar_t` 是 **2** 字节，而 Linux 的 `ctypes.c_wchar`
+# 是 **4** 字节。`DEVMODEW` 里有两个 32 元素的字符数组（`dmDeviceName` / `dmFormName`），
+# 用 `c_wchar` 会让整个结构体大出 128 字节 —— 而 `dmPelsWidth` 正是本探针用来判定
+# 「坐标有没有被虚拟化」的**绝对参照物**，读错它的后果是整份结论反向。
+# 用定宽 `c_uint16` 数组 + `_wchars_to_str` 解码，布局就与 Windows 逐字节一致了。
+_WCHAR = ctypes.c_uint16
+
+
+def _wchars_to_str(arr) -> str:  # noqa: ANN001 —— ctypes 数组，类型没法标
+    """把定宽 UTF-16 数组读成 str（到 NUL 为止）。只用于设备名这类 BMP 文本。"""
+    return "".join(chr(c) for c in arr if c != 0)
+
+# ⚠️ `ctypes.wintypes` 在非 Windows 上还少一个 `ULONG_PTR`（那个名字只在
+# `sys.platform == 'win32'` 分支里定义）。语义：指针宽度整数。
+ULONG_PTR = getattr(wintypes, "ULONG_PTR", None) or (
+    ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+)
+
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class POINTL(ctypes.Structure):
+    """
+    `POINTL`。
+
+    ⚠️ 这里刻意用 `c_int32` 而**不是** `c_long`：Windows 是 LLP64（`long` = 4 字节），
+    Linux 是 LP64（`long` = 8 字节）。用 `c_long` 的话，同一份定义在 Linux 上会布局成
+    另一个大小 —— 而本模块的硬纪律是「在 Linux 上 import 也必须成功」，CI 也跑在 Linux，
+    于是**唯一能自动验证结构布局的地方恰恰是 Linux**。写死 `c_int32` 后布局在两个平台上
+    一致，`sizeof` 断言才能真的在 CI 里跑（见 `test_windows_driver_guards.py`）。
+    """
+    _fields_ = [("x", ctypes.c_int32), ("y", ctypes.c_int32)]
 
 
 class RECT(ctypes.Structure):
@@ -200,6 +266,352 @@ def dpi_for_window(hwnd: int) -> int | None:
         return int(u.GetDpiForWindow(wintypes.HWND(hwnd)))
     except Exception:  # noqa: BLE001
         return None
+
+
+# ── ★ 坐标空间：DPI 虚拟化的判定 ──────────────────────────────────────────
+#
+# ═══ 这一节要回答的唯一问题 ═══
+#
+# **「UIA 给的坐标」与「我们注入的坐标」是不是同一个空间？**
+#
+# 若不是，表现是「在 100% 缩放的开发机上一切正常，在 4K 笔记本上点偏几十像素」——
+# 一个在开发机上**永远重现不了**、且没有任何报错的故障。
+#
+# ═══ 为什么不能靠"自己跟自己比"来判定 ═══
+#
+# 非 DPI 感知的进程会被 Windows **虚拟化**：它眼里的一切坐标都被按缩放比除过了。
+# 而 `GetSystemMetrics` / `GetCursorPos` / `SetCursorPos` / `SendInput` / `UIA 矩形`
+# **全都经过同一层虚拟化** —— 于是"绕过一圈回来对得上"这个判据**恒真**，
+# 哪怕实际上全偏了 1.5 倍。这类判据是坏尺子：它测不出任何东西，却永远绿。
+#
+# 所以本节的判据**必须锚在一个绝对参照物上**：
+#   · `EnumDisplaySettingsW` 读的是**显示驱动**里的模式表，**从不虚拟化**
+#     （`dmPelsWidth/Height` 永远是物理像素）
+#   · `GetSystemMetrics(SM_CXSCREEN)` 对非感知进程**会**被虚拟化
+# 两者一比即知：相等 ⇒ 没被虚拟化；差一个缩放比 ⇒ 被虚拟化了。
+#
+# 另一条独立的、同样非循环的判据是**感知度上下文本身**
+# （`AreDpiAwarenessContextsEqual`）——它比 shcore 的 `GetProcessDpiAwareness` 强，
+# 因为后者只能报出 "PER_MONITOR"(2)，**分不出 V1 与 V2**。
+
+
+class _DEVMODE_PRINT(ctypes.Structure):
+    _fields_ = [("dmOrientation", ctypes.c_short), ("dmPaperSize", ctypes.c_short),
+                ("dmPaperLength", ctypes.c_short), ("dmPaperWidth", ctypes.c_short),
+                ("dmScale", ctypes.c_short), ("dmCopies", ctypes.c_short),
+                ("dmDefaultSource", ctypes.c_short), ("dmPrintQuality", ctypes.c_short)]
+
+
+class _DEVMODE_DISPLAY(ctypes.Structure):
+    _fields_ = [("dmPosition", POINTL),
+                ("dmDisplayOrientation", _DWORD),
+                ("dmDisplayFixedOutput", _DWORD)]
+
+
+class _DEVMODE_U1(ctypes.Union):
+    """头文件里那个匿名并集：打印口径与显示口径共用同一段空间（两者都是 16 字节）。"""
+
+    _fields_ = [("print", _DEVMODE_PRINT), ("display", _DEVMODE_DISPLAY)]
+
+
+class _DEVMODE_U2(ctypes.Union):
+    _fields_ = [("dmDisplayFlags", _DWORD), ("dmNup", _DWORD)]
+
+
+class DEVMODEW(ctypes.Structure):
+    """
+    `DEVMODEW`（EnumDisplaySettings 的输出结构）。
+
+    ⚠️ 字段顺序与并集布局必须与 Windows 头文件逐字对应——这是**二进制布局契约**，
+    错一位后面读到的 `dmPelsWidth` 就是垃圾值，而且不会有任何报错。
+    故本探针把 `dmSize` 一并记进报告（Windows 要求调用方填对 `dmSize`，
+    填错时 `EnumDisplaySettingsW` 直接返回 0 —— 那是我们能拿到的最早的失败信号）。
+
+    ⚠️ `_DEVMODE_*` 四个类型**必须定义在本类之前**：ctypes 在 `_fields_` 里引用的是
+    已存在的类型对象，没有 Python 那种前向引用。写成字符串名会静默产生一个
+    **错误布局**，而不是报错。
+    """
+
+    _fields_ = [
+        ("dmDeviceName", _WCHAR * 32),
+        ("dmSpecVersion", _WORD),
+        ("dmDriverVersion", _WORD),
+        ("dmSize", _WORD),
+        ("dmDriverExtra", _WORD),
+        ("dmFields", _DWORD),
+        ("u1", _DEVMODE_U1),
+        ("dmColor", ctypes.c_short),
+        ("dmDuplex", ctypes.c_short),
+        ("dmYResolution", ctypes.c_short),
+        ("dmTTOption", ctypes.c_short),
+        ("dmCollate", ctypes.c_short),
+        ("dmFormName", _WCHAR * 32),
+        ("dmLogPixels", _WORD),           # ← 这一项就是 DPI（老 API 里就这么存）
+        ("dmBitsPerPel", _DWORD),
+        ("dmPelsWidth", _DWORD),          # ← ★ 物理宽度，不随调用方感知度变化
+        ("dmPelsHeight", _DWORD),         # ← ★ 物理高度
+        ("u2", _DEVMODE_U2),
+        ("dmDisplayFrequency", _DWORD),
+        ("dmICMMethod", _DWORD),
+        ("dmICMIntent", _DWORD),
+        ("dmMediaType", _DWORD),
+        ("dmDitherType", _DWORD),
+        ("dmReserved1", _DWORD),
+        ("dmReserved2", _DWORD),
+        ("dmPanningWidth", _DWORD),
+        ("dmPanningHeight", _DWORD),
+    ]
+
+
+def system_metrics() -> dict:
+    """
+    一组 `GetSystemMetrics` 取值。**其中屏幕宽高对非 DPI 感知进程是被虚拟化的**
+    —— 这正是它作为判据的价值（见本节开头的说明）。
+    """
+    u = user32()
+    u.GetSystemMetrics.argtypes = [ctypes.c_int]
+    u.GetSystemMetrics.restype = ctypes.c_int
+    names = {
+        "SM_CXSCREEN": SM_CXSCREEN, "SM_CYSCREEN": SM_CYSCREEN,
+        "SM_XVIRTUALSCREEN": SM_XVIRTUALSCREEN, "SM_YVIRTUALSCREEN": SM_YVIRTUALSCREEN,
+        "SM_CXVIRTUALSCREEN": SM_CXVIRTUALSCREEN, "SM_CYVIRTUALSCREEN": SM_CYVIRTUALSCREEN,
+        "SM_CMONITORS": SM_CMONITORS,
+    }
+    out: dict = {}
+    for name, idx in names.items():
+        try:
+            out[name] = int(u.GetSystemMetrics(idx))
+        except Exception as exc:  # noqa: BLE001
+            out[name] = {"error": str(exc)}
+    return out
+
+
+def current_display_mode(device: str | None = None) -> dict:
+    """
+    当前显示模式（`EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, …)`）。
+
+    ★ 这是本节里**唯一不随调用方 DPI 感知度变化的**屏幕尺寸来源，
+    故它是判定「坐标有没有被虚拟化」的绝对参照物。
+    """
+    u = user32()
+    u.EnumDisplaySettingsW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                       ctypes.POINTER(DEVMODEW)]
+    u.EnumDisplaySettingsW.restype = wintypes.BOOL
+    dm = DEVMODEW()
+    dm.dmSize = ctypes.sizeof(DEVMODEW)
+    ok = u.EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, ctypes.byref(dm))
+    if not ok:
+        return {"ok": False, "dmSize_used": dm.dmSize,
+                "err": ctypes.get_last_error(),
+                "note": "返回 0 —— 多半是 dmSize 填错或没有该显示设备"}
+    return {
+        "ok": True,
+        "dmSize_used": dm.dmSize,
+        "device": _wchars_to_str(dm.dmDeviceName),
+        "dmPelsWidth": int(dm.dmPelsWidth),
+        "dmPelsHeight": int(dm.dmPelsHeight),
+        "dmLogPixels": int(dm.dmLogPixels),
+        "dmBitsPerPel": int(dm.dmBitsPerPel),
+        "dmDisplayFrequency": int(dm.dmDisplayFrequency),
+        "dmPosition": [int(dm.u1.display.dmPosition.x), int(dm.u1.display.dmPosition.y)],
+    }
+
+
+def thread_dpi_awareness_context() -> int:
+    """当前线程的 DPI 感知上下文（伪句柄，只用于比较，不要当普通指针解引用）。"""
+    u = user32()
+    u.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    return int(u.GetThreadDpiAwarenessContext() or 0)
+
+
+def window_dpi_awareness_context(hwnd: int) -> int | None:
+    """某个窗口（= 它的进程）的 DPI 感知上下文。用于判断**目标应用**的感知档位。"""
+    try:
+        u = user32()
+        u.GetWindowDpiAwarenessContext.argtypes = [wintypes.HWND]
+        u.GetWindowDpiAwarenessContext.restype = ctypes.c_void_p
+        return int(u.GetWindowDpiAwarenessContext(wintypes.HWND(hwnd)) or 0)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _context_value(offset: int) -> ctypes.c_void_p:
+    """
+    DPI 感知上下文常量 → `c_void_p`。
+
+    ⚠️ 这些是**负数**（UNAWARE=-1 … PER_MONITOR_AWARE_V2=-4），在 64 位上是
+    符号扩展的伪句柄。直接 `c_void_p(-1)` 会得到 `0xFFFFFFFFFFFFFFFF`，
+    这与 Windows 内部表示一致；**不要**改成 `c_void_p(0xFFFFFFFF)`。
+    """
+    return ctypes.c_void_p(offset)
+
+
+def describe_awareness_context(ctx: int | None) -> dict:
+    """
+    把一个 DPI 感知上下文翻译成可读名字 —— **能分出 V1 与 V2**。
+
+    ⚠️ 为什么不用 `shcore!GetProcessDpiAwareness`（`dpi_awareness_now` 里那个）：
+    它只返回值 2 = `PER_MONITOR_AWARE`，**V1 与 V2 都报 2**。而 V1 与 V2 在
+    "非客户区是否随 DPI 缩放"等行为上并不相同 —— 我们要的恰恰是 V2。
+    只有 `AreDpiAwarenessContextsEqual` 能区分它们。
+    """
+    if not ctx:
+        return {"known": False, "reason": "拿不到上下文句柄"}
+    try:
+        u = user32()
+        u.AreDpiAwarenessContextsEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        u.AreDpiAwarenessContextsEqual.restype = wintypes.BOOL
+        u.GetAwarenessFromDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        u.GetAwarenessFromDpiAwarenessContext.restype = ctypes.c_int
+    except Exception as exc:  # noqa: BLE001
+        return {"known": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    candidates = {
+        "unaware": DPI_AWARENESS_CONTEXT_UNAWARE,
+        "system_aware": DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+        "per_monitor_aware_v1": DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+        "per_monitor_aware_v2": DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        "unaware_gdiscaled": -5,
+    }
+    matched: list[str] = []
+    for name, val in candidates.items():
+        try:
+            if u.AreDpiAwarenessContextsEqual(ctypes.c_void_p(ctx), _context_value(val)):
+                matched.append(name)
+        except Exception:  # noqa: BLE001 —— 老系统上没有 -5 这个常量
+            pass
+    try:
+        value = int(u.GetAwarenessFromDpiAwarenessContext(ctypes.c_void_p(ctx)))
+    except Exception as exc:  # noqa: BLE001
+        value = {"error": str(exc)}
+    return {"known": True, "matched": matched, "awareness_value": value}
+
+
+# ── 注入通道的坐标回环 ───────────────────────────────────────────────────
+#
+# ⚠️ 下面两个都是**会被虚拟化**的 API（与 UIA 矩形同一层）。所以它们**不能**用来
+# 判定"坐标空间对不对"——见本节开头的说明。它们的用途是**回环自检**：
+# 走一遍真实注入路径（挪指针 → 读回 → 问那个点下面是哪个窗口），
+# 能抓到"感知度没问题但注入路径本身写错了"这类 bug（归一化取整、虚拟桌面偏移等）。
+
+def get_cursor_pos() -> tuple[int, int] | None:
+    u = user32()
+    p = POINT()
+    if not u.GetCursorPos(ctypes.byref(p)):
+        return None
+    return (int(p.x), int(p.y))
+
+
+def set_cursor_pos(x: int, y: int) -> bool:
+    """把鼠标指针挪到 (x, y)。坐标按**调用进程的 DPI 感知度**解释。"""
+    u = user32()
+    u.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    u.SetCursorPos.restype = wintypes.BOOL
+    return bool(u.SetCursorPos(int(x), int(y)))
+
+
+class MOUSEINPUT(ctypes.Structure):
+    # dx/dy 用定宽别名而不是 wintypes.LONG，理由见文件上方的「定宽别名」说明。
+    _fields_ = [("dx", _LONG), ("dy", _LONG),
+                ("mouseData", _DWORD), ("dwFlags", _DWORD),
+                ("time", _DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+
+class _INPUT_U(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_U)]
+
+
+def send_input_move_absolute(x: int, y: int) -> dict:
+    """
+    用 **`SendInput` + `MOUSEEVENTF_ABSOLUTE`** 把指针挪到屏幕坐标 (x, y)。
+
+    这是生产路径上真正会用的那条（`uiautomation` 的点击底层就是 `SendInput`），
+    所以要验的不是 `SetCursorPos` 而是它。两者的坐标解释规则相同，但这条多一层
+    **归一化**：绝对坐标要先映射到 0~65535，多显示器还要 `MOUSEEVENTF_VIRTUALDESK`。
+    那一层取整/漏 flag 正是"看着成功、偏几十像素"的另一处来源，故一并量出来。
+    """
+    metrics = system_metrics()
+    vw = metrics.get("SM_CXVIRTUALSCREEN")
+    vh = metrics.get("SM_CYVIRTUALSCREEN")
+    vx = metrics.get("SM_XVIRTUALSCREEN")
+    vy = metrics.get("SM_YVIRTUALSCREEN")
+    if not all(isinstance(v, int) and v > 0 for v in (vw, vh)):
+        return {"ok": False, "reason": "虚拟桌面度量为空（服务会话的典型症状）"}
+
+    # Windows 的归一化分母是 (边长 - 1)，不是边长 —— 差这一格会在屏幕最右/最下
+    # 产生一像素的系统性偏差，且只在边界处可见。
+    norm_x = int(round((x - vx) * 65535 / max(vw - 1, 1)))
+    norm_y = int(round((y - vy) * 65535 / max(vh - 1, 1)))
+
+    flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+    inp = INPUT(type=INPUT_MOUSE)
+    inp.u.mi = MOUSEINPUT(dx=norm_x, dy=norm_y, mouseData=0, dwFlags=flags, time=0, dwExtraInfo=0)
+
+    u = user32()
+    u.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    u.SendInput.restype = wintypes.UINT
+    sent = int(u.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)))
+    return {
+        "ok": sent == 1,
+        "sent_count": sent,
+        "input_struct_size": ctypes.sizeof(INPUT),
+        "normalized": [norm_x, norm_y],
+        "virtual_desktop": [vx, vy, vw, vh],
+    }
+
+
+# ── 顶层窗口枚举 ─────────────────────────────────────────────────────────
+
+def enum_top_level_windows(visible_only: bool = True) -> list[int]:
+    """
+    枚举顶层窗口（`EnumWindows`）。
+
+    ⚠️ 与 Linux 侧的 `wmctrl -lpx` 不是一回事：`wmctrl` 那种"只列受 WM 管理的窗口"
+    的概念在 Windows 上不存在，这里拿到的是**所有顶层 HWND**（含工具窗、托盘窗）。
+    调用方必须自己按"有标题 + 有面积 + WS_VISIBLE 位"过滤 —— 本函数的定位是
+    **提供原始集合**，过滤策略留在一处（`describe`/`is_usable_window` 那边）。
+    """
+    u = user32()
+    found: list[int] = []
+    proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def _cb(hwnd, _lparam):  # noqa: ANN001
+        try:
+            if not visible_only or u.IsWindowVisible(hwnd):
+                found.append(int(hwnd))
+        except Exception:  # noqa: BLE001 —— 枚举期间窗口消失是常态，跳过即可
+            pass
+        return True
+
+    u.EnumWindows.argtypes = [proc_type, wintypes.LPARAM]
+    u.EnumWindows.restype = wintypes.BOOL
+    u.EnumWindows(proc_type(_cb), 0)
+    return found
+
+
+def is_usable_window(hwnd: int, min_side: int = 40) -> bool:
+    """
+    过滤掉托盘/工具/消息窗，留下"用户能看见的那个框"。
+
+    三条一起用（任一条单独都不够）：
+      · 有非空标题 —— 工具窗与消息窗通常没有；
+      · 面积够大 —— 图标级窗口（16x16）不是应用主窗；
+      · `WS_VISIBLE` **风格位**而不是 `IsWindowVisible` —— 后者沿父链上溯，
+        桌面窗口不可见时会把所有子窗一律报 False（服务会话里正是这样）。
+    """
+    rect = window_rect(hwnd)
+    if not rect:
+        return False
+    left, top, right, bottom = rect
+    if right - left < min_side or bottom - top < min_side:
+        return False
+    if not window_text(hwnd):
+        return False
+    return has_ws_visible(hwnd)
 
 
 # ── 窗口查询 ─────────────────────────────────────────────────────────────

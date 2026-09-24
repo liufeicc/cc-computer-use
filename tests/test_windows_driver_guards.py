@@ -122,6 +122,7 @@ def test_driver_modules_import_on_this_platform():
         "'computer_use_mcp.backend.windows.driver.session_info',"
         "'computer_use_mcp.backend.windows.driver.tree',"
         "'computer_use_mcp.backend.windows.driver._uia',"
+        "'computer_use_mcp.backend.windows.driver.dpi_probe',"
         "'computer_use_mcp.backend.windows.driver.probe'];"
         "[importlib.import_module(m) for m in mods];"
         "print('IMPORT_OK')"
@@ -196,3 +197,127 @@ def test_probe_exit_codes_are_stable(verdict, expected_code):
     mapping = {"ok": 0, "session_untrusted": 3, "dpi_not_set": 4}
     assert mapping[verdict] == expected_code
     assert probe  # 模块可 import（上面那条子进程断言之外，再确认本进程也能用）
+
+
+# ==================== ⑥ 结构体布局（唯一能在 CI 里跑的真机契约）====================
+
+def test_ctypes_structs_match_the_windows_x64_layout():
+    """
+    ctypes 结构体的**字节布局**必须与 Windows x64 逐字节一致。
+
+    ═══ 为什么这条值得单独守 ═══
+
+    `DEVMODEW` 是 `EnumDisplaySettingsW` 的**输出缓冲**，`dmPelsWidth` 在本项目里是
+    判定「坐标有没有被 DPI 虚拟化」的**唯一绝对参照物**（见 `dpi_probe` 的 docstring）。
+    布局错一位 ⇒ 读到一个垃圾数 ⇒ **整份 DPI 结论反向**，而且不会有任何报错：
+    `EnumDisplaySettingsW` 只看 `dmSize` 填得对不对，只要那个数对了它就照写。
+
+    更隐蔽的是：`ctypes.wintypes` 在非 Windows 上把所有名字都建在 `c_long`/`c_ulong`
+    之上，而 Linux 是 LP64（8 字节）、Windows 是 LLP64（4 字节）—— 照抄头文件写
+    `wintypes.DWORD` 会得到一个**在 Linux 上大小不同**的结构体。那是"只在真机上才
+    发现得了"的那类问题，与本文件其他条目同一个病根。
+
+    所以驱动层里凡是构成结构体布局的地方一律用**定宽别名**（`_WORD`/`_DWORD`/
+    `_LONG`/`_WCHAR`），使得布局跨平台一致 —— 于是**能在 CI（Linux）里断言**，
+    不必依赖真机。本用例就是那条断言。
+
+    期望值取自 Windows 头文件的手工推导（`sizeof` 是 ABI 契约的一部分，不是实现细节）：
+      · `DEVMODEW` 220（x64；两个 32 元素的 2 字节字符数组 + 一个 16 字节匿名并集）
+      · `INPUT` 40（x64；DWORD type + 4 字节对齐填充 + 32 字节 MOUSEINPUT）
+      · `POINTL` 8
+    """
+    import ctypes
+
+    from computer_use_mcp.backend.windows.driver import win32
+
+    assert ctypes.sizeof(win32.POINTL) == 8, "POINTL 布局漂了（c_long 在 Linux 上是 8 字节）"
+    assert ctypes.sizeof(win32.MOUSEINPUT) == 32, "MOUSEINPUT 布局漂了（同上）"
+    assert ctypes.sizeof(win32.DEVMODEW) == 220, (
+        "DEVMODEW 布局与 Windows x64 不一致 —— dmPelsWidth 会读到垃圾值，"
+        "而它是 DPI 判定的绝对参照物。检查是否有人把定宽别名换回了 wintypes.DWORD/WCHAR。"
+    )
+    assert ctypes.sizeof(win32.INPUT) == 40, (
+        "INPUT 布局不对 —— SendInput 的 cbSize 传错时**返回 0 且不报错**，"
+        "表现成「注入静默无效」。"
+    )
+
+    # 关键字段的偏移也要钉住：大小对而字段错位是最坏的一种（两种错互相抵消掉 size 断言）。
+    off = {name: getattr(win32.DEVMODEW, name).offset for name, _t in win32.DEVMODEW._fields_}
+    assert off["dmPelsWidth"] == 172, f"dmPelsWidth 偏移漂了：{off['dmPelsWidth']}"
+    assert off["dmPelsHeight"] == 176, f"dmPelsHeight 偏移漂了：{off['dmPelsHeight']}"
+    assert off["dmSize"] == 68, f"dmSize 偏移漂了：{off['dmSize']}"
+
+
+def test_dpi_probe_verdict_distinguishes_virtualized_from_not():
+    """
+    `_virtualization_verdict` 必须真的能分出"被虚拟化"与"没有"。
+
+    ⚠️ 这是一条**正控**：只断言"给一份数据它返回 ok"是坏尺子 —— 一个恒定返回
+    `virtualized=False` 的实现照样过。故两侧都给数据，要求它给出**两个不同的答案**。
+
+    判据本身用的是一个绝对参照物（`EnumDisplaySettingsW` 的物理像素 vs
+    `GetSystemMetrics` 的虚拟化值），这个函数就是那次比较。
+    """
+    from computer_use_mcp.backend.windows.driver import dpi_probe
+
+    def verdict(sm, pels):
+        return dpi_probe._virtualization_verdict(
+            {"SM_CXSCREEN": sm[0], "SM_CYSCREEN": sm[1]},
+            {"dmPelsWidth": pels[0], "dmPelsHeight": pels[1]},
+        )
+
+    # 150% 缩放下，非感知进程看到的系统度量是被除小的那份
+    scaled = verdict((1280, 720), (1920, 1080))
+    assert scaled["virtualized"] is True
+    assert scaled["implied_scaling_percent"] == 150
+
+    # 100% 缩放：两者相等
+    plain = verdict((1920, 1080), (1920, 1080))
+    assert plain["virtualized"] is False
+    assert plain["implied_scaling_percent"] == 100
+
+    # 拿不到度量时必须报 ok=False，而不是"默认没虚拟化"——
+    # 后者会把一次读数失败伪装成一条正面结论，正是本项目最忌讳的那种静默。
+    missing = dpi_probe._virtualization_verdict({}, {})
+    assert missing["ok"] is False
+
+
+def test_dpi_probe_exit_code_for_virtualized_coordinates_is_distinct():
+    """
+    「坐标被虚拟化」必须有**自己**的退出码，不能混进 5。
+
+    这是本探针存在的唯一理由那条结论。若它和"跑通了但自检项没过"共用一个码，
+    调用方（真机脚本）就没法用退出码区分「结果是坏消息」与「结果是坏消息但环境可疑」，
+    只能去读 JSON —— 而退出码存在的意义正是不用读 JSON。
+    """
+    from computer_use_mcp.backend.windows.driver import dpi_probe
+
+    assert dpi_probe._EXIT_CODES["coordinates_virtualized"] == 6
+    # 其余几个沿用 probe 已公布的约定，不许漂移
+    assert dpi_probe._EXIT_CODES["ok"] == 0
+    assert dpi_probe._EXIT_CODES["session_untrusted"] == 3
+    assert dpi_probe._EXIT_CODES["dpi_not_set"] == 4
+
+
+def test_dpi_probe_report_keeps_the_two_verdicts_separate():
+    """
+    报告必须**同时**含「绝对判据」与「回环」两块，且 docstring 里写明回环判不了坐标空间。
+
+    ⚠️ 这条守的是一类**认知**错误，不是代码错误：把"挪指针 → 读回 → 问窗口"这套
+    自洽的回环当成坐标空间的判据。它天然自洽（整条链共用同一层 DPI 虚拟化），
+    所以它**永远绿**，也就永远发现不了问题 —— 而它看起来又特别像在验证这件事。
+
+    故用两条断言钉住：① 报告里两个键都在；② 模块 docstring 里保留了那句说明。
+    删掉那段说明不会让任何代码变红，只会让后来者重新踩一遍。
+    """
+    from computer_use_mcp.backend.windows.driver import dpi_probe
+
+    src = (_WINPKG / "driver" / "dpi_probe.py").read_text(encoding="utf-8")
+    for key in ('report["virtualization"]', 'report["awareness"]',
+                'report["windows"]', 'report["session"]', 'report["dpi_setup"]'):
+        assert key in src, f"dpi_probe 报告少了约定的键 {key}"
+    assert "恒真" in dpi_probe.__doc__, (
+        "dpi_probe 的 docstring 丢了「回环判据恒真、不能用来判定坐标空间」那段说明 —— "
+        "这正是最容易犯的错，必须留在文件里。"
+    )
+
