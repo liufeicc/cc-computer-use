@@ -42,11 +42,24 @@ case "$1" in
        id "$u" >/dev/null 2>&1 && \
        [ "$(id -u "$u")" -ge 1000 ] && \
        [ "${SUDO_UID:-0}" = "$(id -u "$u")" ]; then
-      # 闸 3：runuser -l 给出该用户正确的 HOME 与 login PATH
-      #       （claude 常常装在 ~/.local/bin 或 npm 全局前缀下，只有 login 环境才在 PATH 里）。
-      # 闸 4：整段 `|| true` —— 用户级配置失败不能影响安装结果。
-      runuser -l -u "$u" -c '/usr/bin/cc-computer-use-setup --quiet' >/dev/null 2>&1 || true
-      echo "cc-computer-use: 已为该用户完成配置（无障碍开关 + Claude Code 注册，若适用）。"
+      # ⚠️ runuser 的写法**只能是 `runuser -l <用户> -c <命令>`**。
+      #    曾经写成 `runuser -l -u "$u" -c ...`（2026-09-23 实测踩到）——
+      #    `-l/--login` 与 `-u/--user` 在 util-linux 里是**互斥**的，那条命令会直接报
+      #        runuser: options --{shell,fast,command,session-command,login} and --user are mutually exclusive
+      #    然后**什么都不做**。而下面那句"已为该用户完成配置"当时是无条件打印的，
+      #    于是整个用户级配置静默失效、还把成功消息摆在用户面前 —— 正是本文件开头
+      #    第 2 条铁律要防的那种「命令成功、完全无效、极难排查」的失败。
+      #    现在两处都修了：写法改对，且**按退出码**决定报什么（见下）。
+      # `-l`（login）是必需的：它给出该用户正确的 HOME 与 login PATH
+      # （claude 常装在 ~/.local/bin 或 npm 全局前缀下，只有 login 环境才在 PATH 里）。
+      if runuser -l "$u" -c '/usr/bin/cc-computer-use-setup --quiet' >/dev/null 2>&1; then
+        echo "cc-computer-use: 已为该用户完成配置（无障碍开关 + Claude Code 注册，若适用）。"
+      else
+        # 绝不静默：这一步失败意味着用户级配置整个没做（无障碍开关没开、Claude Code
+        # 没注册），而**界面上一切正常**。必须让用户看到并知道怎么补。
+        echo "cc-computer-use: 自动配置未能完成。请以**普通用户**身份手动跑一次："
+        echo "                     cc-computer-use-setup"
+      fi
     else
       # 闸 1 之外最常见的落点：apt 从 GUI / 自动化工具装，没有 SUDO_USER。
       echo "cc-computer-use: 请以**普通用户**身份运行一次  cc-computer-use-setup"

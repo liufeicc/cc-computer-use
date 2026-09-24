@@ -409,3 +409,153 @@ def test_smoke_pins_zenity_button_labels():
     for line in exprs:
         assert not re.search(r"[一-鿿]", line), \
             f"匹配表达式里出现了中文字面量（会随 locale 翻转）: {line.strip()}"
+
+
+# ==================== ⑤ postinst 的 runuser 路径 ====================
+#
+# 这一组守的是 2026-09-23 的一次真实故障：装完 .deb **不注册到 Claude Code**。
+#
+# 根因不在 setup 脚本，而在 postinst 里那句
+#     runuser -l -u "$u" -c '/usr/bin/cc-computer-use-setup --quiet' >/dev/null 2>&1 || true
+# `-l/--login` 与 `-u/--user` 在 util-linux 里是**互斥**的，这条命令当场报
+#     runuser: options --{shell,fast,command,session-command,login} and --user are mutually exclusive
+# 然后什么都不做。而紧接着那句"已为该用户完成配置"是**无条件打印**的 ——
+# 于是用户级配置整体静默失效，还把成功消息摆在用户面前。
+#
+# 更要命的是**验收全绿**：verify-in-container.sh 当时只测了
+# 「直接 su - tester 跑 setup」这条手动路径，从没走过 apt → postinst → runuser。
+
+_LOGIN_FLAGS = {"-l", "--login"}
+_USER_FLAGS = {"-u", "--user"}
+
+
+def test_postinst_runuser_flags_are_not_mutually_exclusive():
+    """
+    postinst 里的 runuser 调用**只能**是 `runuser -l <用户> -c <命令>`。
+
+    `-l/--login` 与 `-u/--user` 互斥（util-linux），同时给会**直接报错退出、
+    什么都不做**。判据是「同一行的 runuser 后面不许同时出现这两类开关」——
+    这条规则直接来自 util-linux 的语义，不是对某种写法的偏好。
+    """
+    live = [ln for ln in _live_lines(_read("packaging", "deb", "postinst"))
+            if "runuser" in ln]
+    assert live, "postinst 里没有 runuser —— 用户级配置不会在安装时被触发"
+
+    for ln in live:
+        toks = ln.split()
+        i = toks.index("runuser")
+        flags = {t for t in toks[i + 1:] if t.startswith("-")}
+        assert not (flags & _LOGIN_FLAGS and flags & _USER_FLAGS), (
+            f"runuser 同时给了 --login 与 --user（util-linux 判为互斥，命令会直接失败、"
+            f"什么都不做）: {ln.strip()}"
+        )
+
+
+def test_postinst_reports_failure_instead_of_claiming_success():
+    """
+    跑完 runuser 之后必须**按退出码**说话，不能无条件打印"已为该用户完成配置"。
+
+    历史实现是 `runuser ... || true` 紧跟一句无条件的成功提示 —— 这正是本仓库
+    CLAUDE.md 里反复警告的那类失败：「命令成功、完全无效、极难排查」。
+    用户看到的是一句确定的好消息，而实际上无障碍开关没开、Claude Code 没注册。
+    """
+    live = _live_lines(_read("packaging", "deb", "postinst"))
+    r_idx = next(i for i, ln in enumerate(live) if "runuser" in ln)
+
+    assert re.match(r"\s*if\s+runuser\b", live[r_idx]), \
+        "runuser 没有被 if 包住 —— 退出码根本没被检查"
+
+    # 这段 if 的 else 分支：必须给出让用户能自救的下一步
+    else_idx = next((i for i in range(r_idx + 1, len(live))
+                     if re.match(r"\s*else\s*$", live[i])), None)
+    fi_idx = next((i for i in range(r_idx + 1, len(live))
+                   if re.match(r"\s*fi\s*$", live[i])), None)
+    assert else_idx is not None and fi_idx is not None and else_idx < fi_idx, \
+        "runuser 的 if 没有 else 分支（失败时什么都不说？）"
+
+    else_body = " ".join(live[else_idx + 1:fi_idx])
+    assert "cc-computer-use-setup" in else_body, \
+        "失败分支没告诉用户怎么补救（应当提示手动跑 cc-computer-use-setup）"
+
+
+def test_verify_simulates_the_real_install_path():
+    """
+    验收脚本必须真的走一遍 **apt → postinst → runuser → setup**。
+
+    这是上面那个故障能潜伏下来的原因：验收只测了「直接以 tester 身份跑 setup」
+    这条手动路径（它是通的，所以全绿），而**真正的安装路径**从没被执行过。
+    只测组件、不测装配，等于没测。
+
+    判据是「验收脚本里给 apt 装了 SUDO_USER」—— 那是 postinst 认出"有一个真实
+    用户要配置"的唯一依据；不设它，postinst 会走到另一个分支（提示用户手动跑）。
+    """
+    src = _read("packaging", "deb", "verify-in-container.sh")
+    live = _live_lines(src)
+
+    assert any(re.search(r"\bSUDO_USER=", ln) for ln in live), \
+        "验收没有模拟 `sudo apt install`（缺 SUDO_USER，postinst 不会去注册）"
+    # 而且这次安装必须发生在假 claude 就位**之后**，否则注册无从谈起
+    i_claude = next((i for i, ln in enumerate(live) if ".local/bin/claude" in ln), None)
+    i_sudo = next((i for i, ln in enumerate(live) if re.search(r"\bSUDO_USER=", ln)), None)
+    assert i_claude is not None, "验收里没装假 claude CLI"
+    assert i_sudo is not None and i_claude < i_sudo, \
+        "先装了包、后放 claude —— 那样测不到 postinst 的注册动作"
+
+
+def test_doctor_searches_the_same_claude_locations_as_setup():
+    """
+    doctor 的 claude 探测必须与 setup 的 `find_claude()` 同源同序。
+
+    历史实现里那个兜底是**死代码**：
+        claude_bin="$(command -v claude)"
+        if [ -z "$claude_bin" ]; then  soft ...          # ← 空的话在这一支
+        else  [ -n "$claude_bin" ] || claude_bin="$(bash -lc ...)"   # ← 必然非空，永不执行
+    于是「PATH 里没有、但装在 ~/.local/bin」会被误报成"未找到 claude"。
+    doctor 的假阴性比不报更糟：用户会照着它去重装 Claude Code，而问题不在那儿。
+    """
+    src = _read("packaging", "deb", "cc-computer-use-doctor.in")
+    assert ".npm-global/bin/claude" in src and ".local/bin/claude" in src, \
+        "doctor 没有按固定安装位置兜底探测 claude"
+
+    setup = _read("packaging", "deb", "cc-computer-use-setup.in")
+    for cand in (".local/bin/claude", ".npm-global/bin/claude",
+                 ".claude/local/claude", "/usr/local/bin/claude"):
+        assert cand in setup, f"setup 的候选路径少了 {cand}（doctor 却按它找，两边会不一致）"
+        assert cand in src, f"doctor 的候选路径少了 {cand}（与 setup 不同源）"
+
+
+def test_shipped_shell_scripts_avoid_grep_q_in_pipelines():
+    """
+    随包脚本里**不许**出现 `… | grep -q …` 这类管线判据。
+
+    为什么（2026-09-23 实测，被这条坑了两处）：
+      `grep -q` 一命中就**立刻退出并关掉读端**，而上游进程往往还没写完 —— 上游于是
+      吃到 EPIPE 而失败。在 `set -o pipefail` 下，整条管线的退出码就变成「上游失败」，
+      **即使 grep 明明命中了**。实测：34 行、1362 字节的输出稳定触发；
+      同一份输出换成 `grep -c`（要读完全文才退出）就正常 —— 所以与缓冲区大小无关，
+      是 `-q` 提前退出本身。
+
+    两个方向的危害不对称，但都真实：
+      · 判「通过」时被误判成失败 → 医生对着健康的安装报 ❌（用户白折腾）；
+      · 判「有问题」时被误判成没问题 → **真的缺库被静默放过**（健康检查失去意义）。
+    第二种更坏，所以这条守的是整类写法，不是某一处。
+
+    替代写法：先 `x="$(cmd)"`，再用 `case "$x" in *PAT*)` 或 `${x##*PAT}`——
+    完全不经管线，没有退出码可污染。
+    """
+    targets = [
+        ("packaging", "deb", "verify-in-container.sh"),
+        ("packaging", "deb", "cc-computer-use-doctor.in"),
+        ("packaging", "deb", "cc-computer-use-setup.in"),
+    ]
+    offenders = []
+    for parts in targets:
+        for ln in _live_lines(_read(*parts)):
+            # 只抓「有管道的 grep -q」；`grep -q 文件` 上游是 grep 自己，无此问题
+            if re.search(r"\|\s*grep\s+-q", ln):
+                offenders.append(f"{'/'.join(parts)}: {ln.strip()}")
+    assert not offenders, (
+        "这些地方用了 `| grep -q`（grep 提前退出会让上游吃 EPIPE、"
+        "pipefail 下管线判为失败）—— 改成先收变量 + case 模式匹配：\n  "
+        + "\n  ".join(offenders)
+    )

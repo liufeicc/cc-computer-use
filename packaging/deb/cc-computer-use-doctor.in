@@ -61,9 +61,15 @@ head_ "[2/6] 动态库依赖"
 if command -v ldd >/dev/null 2>&1; then
     broken=""
     for exe in "$VENDOR"/bin/*; do
-      if ldd "$exe" 2>/dev/null | grep -q "not found"; then
-        broken="$broken $(basename "$exe")"
-      fi
+      # ⚠️ 先收到变量里再判，**别写成 `ldd "$exe" | grep -q "not found"`**：
+      #    `grep -q` 命中即退出、关掉读端，ldd 还在写就会吃到 EPIPE 而失败；
+      #    `set -o pipefail` 下整条管线的退出码变成「ldd 失败」→ if 判为假 →
+      #    **一个真的缺库被静默放过**。这是假阴性，方向最坏（健康检查失去意义）。
+      #    同款坑见本文件 [4/6] 那条 `✅ OK` 判据上的注释。
+      _ldd_out="$(ldd "$exe" 2>/dev/null)"
+      case "$_ldd_out" in
+        *"not found"*) broken="$broken $(basename "$exe")" ;;
+      esac
     done
     if [ -z "$broken" ]; then
       ok "随包二进制的依赖全部可解析"
@@ -107,7 +113,13 @@ else
   if [ $rc -ne 0 ]; then
     bad "--selftest 退出码 $rc"
     printf '%s\n' "$out" | tail -20 | sed 's/^/      /'
-  elif printf '%s' "$out" | grep -q "✅ OK"; then
+  elif [ "${out##*✅ OK}" != "$out" ]; then
+    # ⚠️ 判据写成 shell 模式匹配（`${var##*PAT}`），**别改回 `printf | grep -q`**：
+    #    `grep -q` 找到就立刻退出、关掉读端，而上游还在写 —— 上游于是吃到 EPIPE 而失败。
+    #    在 `set -o pipefail` 下这条管线的退出码就变成「上游失败」，**即使 grep 明明命中了**。
+    #    实测（2026-09-23）：34 行、1362 字节的输出就会稳定触发，
+    #    同一份输出的 `grep -c`（读完全文才退出）却正常 —— 所以这不是缓冲区大小的问题，
+    #    是 `-q` 提前退出本身。本判据若被误判成失败，医生就会对着健康的安装报 ❌。
     # 自检会在 isolated 模式下**惰性拉起一个 Xephyr 沙箱**，退出时 atexit 回收 ——
     # 这一步过了，等于「沙箱 + 私有 a11y 总线 + i3」整条链路都验证过了。
     ok "--selftest 通过（含沙箱启动）"
@@ -132,12 +144,28 @@ fi
 
 # ── 6. Claude Code 注册 ───────────────────────────────────────────────
 head_ "[6/6] Claude Code 注册"
-claude_bin="$(command -v claude 2>/dev/null)"
+# 与 cc-computer-use-setup 的 find_claude() 同源同序：PATH → 几个固定安装位置 →
+# login shell。**逐级兜底，不是二选一** —— 原先写的是
+#     claude_bin="$(command -v claude)"; if [ -z ... ]; then soft ...; else
+#         [ -n "$claude_bin" ] || claude_bin="$(bash -lc ...)"   # ← 死代码
+# 进了 else 分支说明 claude_bin 必然非空，那个 `||` 永远不执行。于是「PATH 里没有、
+# 但装在 ~/.local/bin」这类情况会被误报成"未找到 claude"。doctor 出现假阴性比
+# 不报还糟：用户会照它去"重装 Claude Code"，而问题根本不在那儿。
+find_claude_bin() {
+  local c
+  c="$(command -v claude 2>/dev/null)" && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  for c in "$HOME/.local/bin/claude" "$HOME/.npm-global/bin/claude" \
+           "$HOME/.claude/local/claude" "/usr/local/bin/claude"; do
+    [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  c="$(bash -lc 'command -v claude' 2>/dev/null)"
+  [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  return 1
+}
+claude_bin="$(find_claude_bin)"
 if [ -z "$claude_bin" ]; then
   soft "未找到 claude 命令 —— 装上 Claude Code 后跑一次: cc-computer-use-setup"
 else
-  # 与 setup 脚本同源：登录 shell 里才有的 PATH 也要兜住
-  [ -n "$claude_bin" ] || claude_bin="$(bash -lc 'command -v claude' 2>/dev/null)"
   if timeout 20 "$claude_bin" mcp get cc-computer-use >/dev/null 2>&1; then
     ok "已在 Claude Code 中注册"
     timeout 20 "$claude_bin" mcp get cc-computer-use 2>&1 | sed 's/^/      /'
