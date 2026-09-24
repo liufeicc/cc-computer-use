@@ -613,6 +613,19 @@ class LinuxBackend(Backend):
         """
         self.reader.sync_bus()
 
+    def liveness(self) -> bool:
+        """
+        目标会话是否活着 —— 走 **X11 通道**（xdotool 读活动窗口），不碰 a11y（M-43）。
+
+        为什么不能直接用 `is_available()`：它会触碰 AT-SPI，而 isolated 模式下沙箱未就绪
+        时，AT-SPI 会落到**宿主总线**上——那正是能把宿主 GNOME Shell 打崩的那条路
+        （2026-09-14/15 两次实测事故）。自检在「沙箱没起来」这条分支上必须换一条
+        不碰 a11y 的通道。
+
+        判据（rc 与 "Can't open display"）见 `inject.windows.WindowMixin.probe_liveness`。
+        """
+        return self.injector.probe_liveness()
+
     # ---------- 落点证据（省掉「再截一张图确认」的整个来回）----------
     def active_window_title(self) -> str | None:
         """当前活动窗口标题（纯 X11 一次调用，约 10ms）。"""

@@ -38,7 +38,12 @@
 
 from __future__ import annotations
 
-from .. import display, screen_lock  # noqa: F401  （兼容既有 `coordinator.xxx` 用法）
+# 这里原先还有一行 `from .. import display, screen_lock`，注释说是「兼容既有
+# `coordinator.xxx` 用法」。2026-09-24 加 Windows 支持时查证：
+# **全仓（src/ tests/ bench/）零处**使用 `coordinator.display` 或
+# `coordinator.screen_lock` —— 那个兼容承诺没有兑现对象，而代价是
+# `import core.coordinator` 会连带 import `core.display`（X11 专属）。
+# 移除它，「core/ 只有 session.py 认识 display」这条边界才成立（有守卫盯着）。
 from .actions import ActionMixin
 from .awareness import AwarenessMixin
 from .base import CoordinatorBase

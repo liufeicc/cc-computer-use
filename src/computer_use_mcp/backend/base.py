@@ -174,10 +174,60 @@ class QueryResult:
 BUTTON_NUMBERS = {"left": 1, "middle": 2, "right": 3}
 
 
+# ── 跨平台角色词表（2026-09-24 从 backend/linux/atspi.py 迁来）────────────────────
+#
+# **已定：沿用 AT-SPI 的角色名作为跨平台通用词表**。各平台 backend 负责把自己的方言
+# 翻译进来（UIA 的 `Button` → `push button`、macOS 的 `AXButton` → `push button`）。
+# 好处是工具描述、`find_element(role=...)` 的语义、既有 role 断言测试全部零改动。
+#
+# ⚠️ 为什么必须搬到本模块（而不是留在 atspi.py）：`core/serializer.py` 是**平台无关**的
+# 序列化层，却硬 import 了 `backend.linux.atspi` 的角色词表——那是全仓唯一一处
+# 「平台无关层直接依赖某个平台实现」的跨层泄漏。搬到 ABC 所在处，它才能既表达词表
+# 是契约的一部分、又不把 Linux 拖进 core。
+#
+# ⚠️ 翻译进来的角色如果**不在**任何集合里，**原样保留**、不得丢弃：
+# ControlType / AXRole 都会随系统版本增加，丢弃等于让新控件静默消失。
+
+# 可交互角色（有操作意义的），过滤纯装饰 panel/label —— 原样搬自 demo/probe_element.py
+INTERACTIVE_ROLES = {
+    "push button", "toggle button", "menu item", "menu", "check box",
+    "radio button", "text", "entry", "combo box", "list item", "list",
+    "table cell", "slider", "scroll bar", "spin button", "hyperlink",
+    "tab", "tree item", "page tab", "tool button", "split pane",
+    "table", "tree", "tree table", "filler", "label", "panel",
+}
+
+# 真正「可操作」的角色子集（用于判断节点是否值得分配 ref / interactive_only 过滤）
+ACTIONABLE_ROLES = {
+    "push button", "toggle button", "menu item", "check box", "radio button",
+    "entry", "combo box", "list item", "slider", "scroll bar", "spin button",
+    "hyperlink", "tab", "page tab", "tool button", "tree item", "table cell",
+}
+
+# 纯噪声角色（无名字时直接丢弃，省 token）
+NOISE_ROLES = {"filler", "panel", "unknown", "section", "scroll pane"}
+
+
 class Backend(ABC):
     """平台后端抽象契约。"""
 
     name: str = "abstract"
+
+    # ── 「清空再输入」用的两个键（clear_first 路径）──────────────────────────────
+    #
+    # 为什么上提到类属性：这两个键**是平台差异**，而原先它们硬编码在
+    # `core/coordinator/actions.py` 里——那是平台无关层。
+    #   · Linux / Windows：全选 `ctrl+a`，删除 `Delete`
+    #   · macOS：全选 `cmd+a`
+    # 留在 coordinator 里等于把「Windows 恰好和 Linux 一样」这件**巧合**写成了事实，
+    # 将来加 macOS 就会在那一行上分叉。
+    #
+    # ⚠️ 调用方必须写成 `self.backend.SELECT_ALL_COMBO`，
+    # **不要**写成 `getattr(self.backend, "SELECT_ALL_COMBO", "ctrl+a")`——
+    # 那种带默认值的写法会让「新平台忘了覆盖」静默退化成 Linux 行为，
+    # 正是 I-10 明文否定的 `hasattr` 哨兵同族。
+    SELECT_ALL_COMBO: str = "ctrl+a"
+    DELETE_KEY: str = "Delete"
 
     @abstractmethod
     def is_available(self) -> bool:
@@ -459,6 +509,23 @@ class Backend(ABC):
         D-Bus，共用宿主 registryd，遍历会打崩宿主 GNOME Shell；见 core/display.py）。
         Windows backend 没有这个概念，继承本默认实现即可。
         """
+
+    def liveness(self) -> bool:
+        """
+        目标会话是否活着 —— **不碰 a11y** 的判活通道（`--selftest` 用）。
+
+        为什么是「带默认实现」而不是 `@abstractmethod`：`_StubBackend`
+        （tests/_helpers.py、test_d_guards.py）等测试替身继承本 ABC，新增一个抽象方法
+        会让它们**当场无法实例化**，几十个用例一起红。这正是 `click_preview` 的
+        docstring 已经记录过的那条教训——ABC 该是「契约」，不是「清单」。
+
+        ⚠️ 默认值是 **False（说不清就不声称可用）**，不是 True：
+        本方法只被自检消费，语义是「我能不能确认目标会话可用」。返回 True 会让一个
+        什么都没实现的占位 backend 在自检里**凭空显示健康**，而那正是自检要防的事。
+        「Linux 的实现被误删成默认值」这一风险由
+        `test_tools_and_backend.py::test_linux_backend_actually_implements_liveness` 兜住。
+        """
+        return False
 
 
 def get_backend() -> Backend:

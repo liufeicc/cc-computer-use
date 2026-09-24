@@ -408,8 +408,10 @@ class ActionMixin:
         warn = self._sandbox_guard()  # 键盘注入会发真实按键事件，注入前礼让
         try:
             if clear_first:
-                self.backend.press_key("ctrl+a")
-                self.backend.press_key("Delete")
+                # 键名走 backend 类属性：这两个键是**平台差异**（macOS 是 cmd+a），
+                # 硬编码在平台无关层等于把「Windows 恰好与 Linux 相同」写成事实。
+                self.backend.press_key(self.backend.SELECT_ALL_COMBO)
+                self.backend.press_key(self.backend.DELETE_KEY)
             ok = self.backend.type_text(text)
             # 注：backend 内部按文本分流——纯 ASCII 走 xdotool type，
             # 含中文等非 ASCII 走剪贴板粘贴（避免全局键位重映射冻结物理键盘）

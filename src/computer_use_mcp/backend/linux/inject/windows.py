@@ -26,6 +26,27 @@ from .base import log
 class WindowMixin:
     """窗口枚举、几何查询与等待。"""
 
+    # ---------- 目标屏判活 ----------
+    def probe_liveness(self) -> bool:
+        """
+        目标屏（DISPLAY）是否活着 —— **完全不碰 a11y 的判活通道**。
+
+        为什么单独有这一条（M-43）：`is_available()` 会触碰 AT-SPI，而 isolated 模式下
+        沙箱未就绪时，AT-SPI 会落到**宿主总线**上（正是那条能把 GNOME Shell 打崩的路）。
+        所以自检在「沙箱没起来」这条分支上必须换一条不碰 a11y 的通道，X11 就是它。
+
+        判据：rc=0，**或** stderr 里不含 "Can't open display"。
+        后面的或条件是刻意的——`xdotool getactivewindow` 在**没有活动窗口**时会以非 0
+        退出，那属于「连上了 X 但没有窗口」，不是「连不上」。只有 X 连接失败才算死。
+
+        （逐字搬自原 `server.py::_x11_liveness`，行为与判据一字未改。）
+        """
+        try:
+            proc = self._run(["getactivewindow"], timeout=5.0)
+        except Exception:  # noqa: BLE001 —— 缺 xdotool / 超时 / 任何异常一律判死
+            return False
+        return proc.returncode == 0 or "Can't open display" not in (proc.stderr or "")
+
     # ---------- 活动窗口 ----------
     def active_window_id(self) -> str | None:
         p = self._run(["getactivewindow"])

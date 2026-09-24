@@ -35,6 +35,7 @@ import os
 import tempfile
 
 from .logging import get_logger
+from .procfs import pid_alive
 
 # 与拆分后的 display/inject 包同理：共用同一个 logger 对象（固定名），
 # 测试里 `monkeypatch.setattr(temps.log, ...)` 才打得中。
@@ -82,8 +83,12 @@ def owner_pid(path: str, family: str) -> int | None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """进程是否存在（Linux 专用：本项目只有 X11/Linux backend，不需要跨平台兜底）。"""
-    return os.path.isdir(f"/proc/{pid}")
+    """进程是否存在。判定已抽到 `utils/procfs.py`（那里是**唯一**认 `/proc` 的地方）。
+
+    这里保留同名的薄包装只为不打断既有调用点与测试对 `temps._pid_alive` 的引用；
+    新代码请直接 `from .procfs import pid_alive`。
+    """
+    return pid_alive(pid)
 
 
 def prune_temp_images(family: str, keep: int = DEFAULT_KEEP, protect: str | None = None) -> int:

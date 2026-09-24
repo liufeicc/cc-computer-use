@@ -478,3 +478,44 @@ def test_server_instructions_urge_act_sequence():
     assert "不依赖上一步结果" in src or "分支判断" in src, \
         "引导必须带判据，否则退化成「无脑串长序列」"
     assert "ui_tree" in src, "instructions 该提到「把观察折进同一次调用」的写法"
+
+
+# ==================== clear_first 的键名必须走 backend 类属性 ====================
+
+def test_type_text_clear_first_uses_backend_key_attributes(monkeypatch):
+    """
+    `clear_first` 要发的两个键必须取自 **backend 实例/类的属性**，而不是写死在 coordinator 里。
+
+    为什么值得钉住：这两个键**是平台差异**（macOS 是 `cmd+a`）。原先它们硬编码在
+    `core/coordinator/actions.py`，能跑只是因为「Windows 恰好和 Linux 同键」这个**巧合**——
+    加 macOS 时会在同一行上分叉，而且不会有任何测试变红。
+
+    ⚠️ **判据必须把桩的类属性改成哨兵值**，不能直接拿 `backend.SELECT_ALL_COMBO` 去比：
+    桩没覆盖那两个属性时会继承 `Backend` 的 `"ctrl+a"`，于是「读类属性」与「写死 ctrl+a」
+    两种实现产出**完全相同**的结果 —— 断言两边都过，判据等于空转。
+    （这条是本项目反复吃亏的失效形态：判据松的测试等于没有测试。）
+    """
+    monkeypatch.setattr(display_mod.MANAGER, "is_sandbox_up", lambda: True)
+    monkeypatch.setattr(_StubBackend, "SELECT_ALL_COMBO", "sentinel-select-all")
+    monkeypatch.setattr(_StubBackend, "DELETE_KEY", "sentinel-delete")
+
+    backend = _StubBackend()
+    coord = Coordinator(backend=backend)
+    coord.type_text("新内容", clear_first=True)
+
+    keys = [c[1] for c in backend.calls if c[0] == "key"]
+    assert keys == ["sentinel-select-all", "sentinel-delete"], (
+        f"clear_first 没走 backend 的属性：实际发出 {keys}。"
+        f"（若看到 ['ctrl+a','Delete']，说明 coordinator 又把键名写死了）"
+    )
+
+
+def test_clear_first_false_does_not_send_keys():
+    """反向：默认不清空时**不该**发那两个键（防「无条件清空」把用户已有输入抹掉）。"""
+    backend = _StubBackend()
+    coord = Coordinator(backend=backend)
+
+    coord.type_text("追加内容")
+
+    assert [c for c in backend.calls if c[0] == "key"] == []
+    assert ("type", "追加内容") in backend.calls

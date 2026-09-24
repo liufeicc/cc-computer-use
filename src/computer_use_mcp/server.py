@@ -30,7 +30,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from .backend.base import Backend, get_backend  # noqa: E402
-from .core import display  # noqa: E402
+from .core import session  # noqa: E402
 from .core.coordinator import Coordinator  # noqa: E402
 from .tools import (  # noqa: E402
     action, apps, find, layout, mouse, screen_text, screenshot, ui_tree, windows,
@@ -207,30 +207,6 @@ def create_server() -> FastMCP:
 mcp = create_server()
 
 
-def _x11_liveness() -> bool:
-    """
-    用 **X11 通道**（xdotool 读活动窗口）判断目标屏是否活着，完全不碰 AT-SPI（M-43）。
-
-    为什么单独写一个：`backend.is_available()` 会触碰 AT-SPI，而 isolated 模式下沙箱没
-    起来时那次触碰会落到**宿主总线**上（见 `_selftest` 的说明）。selftest 需要一条
-    「既不做 a11y 遍历、又能说明目标屏是否可用」的判据，X11 这条路正好合适，
-    与 `list_apps` 走 `wmctrl -lpx`、`_read_titles` 走 `xdotool` 是同一个理由。
-    """
-    import subprocess
-
-    try:
-        from .core import display as _d
-
-        proc = subprocess.run(["xdotool", "getactivewindow"], capture_output=True,
-                              text=True, timeout=5, errors="replace",
-                              env=_d.env_for())
-    except Exception:  # noqa: BLE001
-        return False
-    # rc=0 表示目标屏有 X server 在响应；"no windows" 之类的报错也算连接成功，
-    # 故判据只看是否发生了 X 连接错误。
-    return proc.returncode == 0 or "Can't open display" not in (proc.stderr or "")
-
-
 def _selftest() -> int:
     """
     自检模式（--selftest）：不跑 stdio 循环，直接打印 backend/工具/屏幕布局状态。
@@ -241,8 +217,14 @@ def _selftest() -> int:
     import asyncio
     import json
 
-    info = display.start()
-    print(f"[selftest] display = {json.dumps(info, ensure_ascii=False)}")
+    info = session.MANAGER.ensure_ready()
+    print(f"[selftest] session = {json.dumps(info, ensure_ascii=False)}")
+    caps = session.MANAGER.capabilities()
+    print(f"[selftest] capabilities = {json.dumps({'target': caps.target,
+          'input_isolated': caps.input_isolated, 'screen_isolated': caps.screen_isolated,
+          'a11y_isolated': caps.a11y_isolated, 'strong_mode': caps.strong_mode,
+          'unimplemented': list(caps.unimplemented), 'notes': list(caps.notes)},
+          ensure_ascii=False)}")
 
     backend = _make_backend()
     # M-43：`is_available()` 会一路走到 AT-SPI 的 `get_desktop(0) + get_child_count()`。
@@ -251,15 +233,13 @@ def _selftest() -> int:
     # 启动失败」恰恰是文档明说用户会遇到的场景，也正是本自检最该给出有用结论的时候。
     # 故只在「isolated 且沙箱就绪」时才走 AT-SPI 判活；否则改用 X11 通道判活，
     # 与「selftest 不碰 AT-SPI」的约定保持一致。
-    sandbox_ok = (
-        display.MANAGER.mode != display.MODE_ISOLATED or display.MANAGER.is_sandbox_up()
-    )
+    sandbox_ok = session.MANAGER.is_ready()
     if not sandbox_ok:
         print("[selftest] ⚠️ isolated 模式但沙箱未就绪：跳过 AT-SPI 判活"
-              "（避免触碰宿主总线），改用 X11 通道判断")
-        x11_ok = _x11_liveness()
-        print(f"[selftest] X11 通道可用 = {x11_ok}")
-        if not x11_ok:
+              "（避免触碰宿主总线），改用不碰 a11y 的判活通道")
+        alive = backend.liveness()
+        print(f"[selftest] 目标会话判活（不碰 a11y） = {alive}")
+        if not alive:
             print("[selftest] ❌ 沙箱不可用且宿主 X11 也读不到："
                   "检查 xserver-xephyr / DISPLAY 设置")
             return 2
@@ -285,9 +265,14 @@ def _selftest() -> int:
     print(f"[selftest] 桌面应用数 = {len(apps)}，前5 = {apps[:5]}")
     # 光圈状态：最常见的「怎么没看到红圈」就是它被 env 关了（CC_CU_CLICK_RING=0）或被
     # 按屏熔断（连续失败 2 次）。这里只读内存、不画圈（画圈要真点在屏上，那是 e2e 的事）。
-    from .backend.linux import ring as _ring
+    # 点击光圈是 Linux 专属能力（python-xlib + X11 SHAPE）。非 Linux 上要**显式申报缺失**
+    # 而不是让这行 import 直接炸掉整个自检——「能力没有」是已知状态，不是故障。
+    if session.IS_LINUX:
+        from .backend.linux import ring as _ring
 
-    print(f"[selftest] 点击光圈 = {json.dumps(_ring.status(), ensure_ascii=False)}")
+        print(f"[selftest] 点击光圈 = {json.dumps(_ring.status(), ensure_ascii=False)}")
+    else:
+        print(f"[selftest] 点击光圈 = 未实现（本平台不支持；unimplemented={list(caps.unimplemented)}）")
     print("[selftest] ✅ OK")
     return 0
 

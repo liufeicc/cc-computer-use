@@ -195,11 +195,19 @@ def test_selftest_skips_at_spi_when_sandbox_down(monkeypatch, capsys):
         def screen_layout(self):
             return {}
 
+        def liveness(self):
+            # 判活已下沉为 backend 的能力（原先打桩 `srv._x11_liveness`）。
+            return True
+
     monkeypatch.setattr(srv, "_make_backend", lambda: _Be())
-    monkeypatch.setattr(srv.display.MANAGER, "_mode", display_mod.MODE_ISOLATED)
-    monkeypatch.setattr(srv.display.MANAGER, "is_sandbox_up", lambda: False)
-    monkeypatch.setattr(srv, "_x11_liveness", lambda: True)
-    monkeypatch.setattr(srv.display, "start", lambda: {"stub": True})  # 别真起 Xephyr
+    # 2026-09-24（加 Windows 支持）：会话状态改由 `core.session.MANAGER` 统一入口取，
+    # 而 Linux 上它就是 `display.MANAGER` **同一个对象**（见 core/display/provider.py），
+    # 故这些补丁的落点与语义都没变，只是名字从 `srv.display` 换成了 `srv.session`。
+    monkeypatch.setattr(srv.session.MANAGER, "_mode", display_mod.MODE_ISOLATED)
+    monkeypatch.setattr(srv.session.MANAGER, "is_sandbox_up", lambda: False)
+    # 判活下沉成了 backend 的能力（原先打桩 `srv._x11_liveness`），故改为给 backend 加桩。
+    monkeypatch.setattr(_Be, "liveness", lambda self: True)
+    monkeypatch.setattr(srv.session.MANAGER, "ensure_started", lambda: {"stub": True})  # 别真起 Xephyr
 
     rc = srv._selftest()
 
@@ -225,9 +233,9 @@ def test_selftest_uses_at_spi_when_sandbox_is_up(monkeypatch):
             return []
 
     monkeypatch.setattr(srv, "_make_backend", lambda: _Be())
-    monkeypatch.setattr(srv.display.MANAGER, "_mode", display_mod.MODE_ISOLATED)
-    monkeypatch.setattr(srv.display.MANAGER, "is_sandbox_up", lambda: True)
-    monkeypatch.setattr(srv.display, "start", lambda: {"stub": True})  # 别真起 Xephyr
+    monkeypatch.setattr(srv.session.MANAGER, "_mode", display_mod.MODE_ISOLATED)
+    monkeypatch.setattr(srv.session.MANAGER, "is_sandbox_up", lambda: True)
+    monkeypatch.setattr(srv.session.MANAGER, "ensure_started", lambda: {"stub": True})  # 别真起 Xephyr
 
     assert srv._selftest() == 2
     assert touched == ["at-spi"], f"沙箱就绪时应走 AT-SPI 判活、且只探一次：{touched}"

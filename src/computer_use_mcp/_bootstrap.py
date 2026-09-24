@@ -64,13 +64,27 @@ def _conda_prefix() -> str | None:
 
 def setup_gi_environment() -> None:
     """
-    幂等配置 GI_TYPELIB_PATH / LD_LIBRARY_PATH。
+    幂等配置 GI_TYPELIB_PATH / LD_LIBRARY_PATH。**非 Linux 上整体 no-op。**
 
     实现逻辑：
       - typelib：候选系统目录中，凡包含 Atspi-2.0.typelib 的都加入；同时加入 conda 前缀下的
         lib/girepository-1.0（提供 GLib/GObject 等基础 typelib）。
       - lib：候选系统目录中，凡包含 libatspi.so* 的都加入 LD_LIBRARY_PATH。
+
+    ⚠️ 为什么要显式判平台（而不是靠"候选路径都不存在、于是自然什么都不做"）：
+    gi / Atspi / LD_LIBRARY_PATH **全都是 Linux 专属**，在 Windows/macOS 上这段逻辑
+    从语义上就不成立。原先它只是**碰巧**没副作用（`_merge_env` 对不存在的目录不写入），
+    而"碰巧对"正是本项目反复吃亏的那类东西——一旦将来有人给候选列表加上一个
+    跨平台路径（比如 conda 前缀下的某个通用目录），这段就会在 Windows 上悄悄跑起来。
+
+    平台判定消费 `core.session.IS_LINUX`，本模块**自己不写 `platform.system()`** ——
+    「平台分支在哪」必须只有一个答案，否则又要靠 grep 去找。
     """
+    from .core.session import IS_LINUX  # 函数内导入：本模块被 backend 层早期依赖，保持轻量
+
+    if not IS_LINUX:
+        return
+
     # 1. typelib 路径
     typelib_dirs: list[str] = []
     # conda/venv 自带的 girepository（GLib/GObject 基础 typelib）

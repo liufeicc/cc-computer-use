@@ -19,6 +19,8 @@ import os
 import time
 import sys
 
+import pathlib
+
 import pytest
 from PIL import Image
 
@@ -33,7 +35,10 @@ from computer_use_mcp.utils import blocks as blocks_mod  # noqa: E402
 from computer_use_mcp.utils import temps  # noqa: E402
 from computer_use_mcp.utils.errors import ActionResult  # noqa: E402
 
+_SRC_ROOT = pathlib.Path(__file__).resolve().parent.parent / "src" / "computer_use_mcp"
+
 from _helpers import _StubBackend  # noqa: E402
+from _importscan import scan  # noqa: E402
 
 
 class _FakeMCP:
@@ -744,21 +749,33 @@ def test_screenshot_clears_ring_first(monkeypatch):
 
 def test_coordinator_never_imports_platform_ring():
     """
-    结构性守卫：平台代码（Xlib / ring）**不得下渗**到 platform-agnostic 的 coordinator。
+    结构性守卫：平台代码（Xlib / ring）**不得下渗**到 platform-agnostic 的 core/。
 
     这条同时守住「光圈挂在 backend.click_at 这个唯一漏斗上」的设计——一旦有人把挂载点
-    搬回 coordinator，他必然要在那里 import 平台模块，本测试立刻变红。
-    """
-    import pathlib
+    搬回 core，他必然要在那里 import 平台模块，本测试立刻变红。
 
-    root = pathlib.Path(__file__).resolve().parent.parent / "src" / "computer_use_mcp"
-    offenders = []
-    for path in (root / "core").rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        if "Xlib" in text or "from ..backend.linux import ring" in text \
-                or "from ...backend.linux import ring" in text:
-            offenders.append(str(path.relative_to(root)))
+    ⚠️ 判据 2026-09-24 从「全文子串匹配」改为 **AST 查 import**，两个方向都修：
+      · **假绿**（漏报）：原先只匹配 `from ..backend.linux import ring` 这两个**相对**
+        写法。换成 `from computer_use_mcp.backend.linux import ring` 或
+        `import Xlib.display` 就一条都匹配不到 —— 守卫静默失效。
+      · **假红**（误报）：正文里提一句 "Xlib" 也算命中。这在加 Windows 支持时立刻咬人：
+        `core/session.py` 的 docstring 本来就要举例说明「平台库（Xlib / ctypes.windll）
+        不得下渗」，一写就红 —— 逼着人把说明删掉，等于让文档给守卫让路。
+      同一把尺子见 `tests/test_platform_module_boundary.py`。
+
+    正控：改完后必须**仍然量得到东西**——末尾拿 `backend/linux/ring.py` 试一次。
+    量不到就说明尺子坏了（而不是"代码很干净"），那样这条守卫等于没有。
+    """
+    root = _SRC_ROOT
+    hits = scan(root / "core", banned_modules=("Xlib",), banned_prefixes=("backend.linux.ring",))
+    offenders = sorted(f"{rel}:{line}" for rel, line in hits)
     assert not offenders, f"平台代码出现在 core/ 下：{offenders}"
+
+    # 正控：同一把尺子在平台代码上必须命中（ring.py 在函数内 `from Xlib import ...`，
+    # 所以扫描器必须 ast.walk 整个模块、不能只看模块级 import）。
+    ctrl = scan(root / "backend" / "linux", banned_modules=("Xlib",),
+                banned_prefixes=("backend.linux.ring",))
+    assert ctrl, "banned 列表在本仓库量不到任何东西 —— 判据已失效（正控没命中）"
 
 
 def test_all_coordinate_clicks_go_through_backend_click_at():
@@ -767,18 +784,50 @@ def test_all_coordinate_clicks_go_through_backend_click_at():
 
     光圈、预览图、变化对比全都依赖「所有坐标点击都经过它」——一旦有人新增一条绕过它的
     坐标路径，那些证据会**静默缺失**（工具照常返回成功，只是没有落点反馈）。
+
+    ⚠️ 白名单 2026-09-24 从「两条硬编码路径」改为「按平台目录推导」：
+    原先写死 `{"core/coordinator/actions.py", "backend/linux/backend.py"}` +
+    `startswith("backend/linux/inject")`，于是 Windows/macOS backend 一落地，
+    它们的 `click_at` 会**因为平台名不同而被判成违规**——红是红了，但红的原因在误导人
+    （看起来像"新代码绕过了漏斗"，其实是白名单没泛化）。改成平台通配后，
+    这条守卫在加平台时**不需要再动**，仍然只拦真正的绕过。
     """
-    import pathlib
     import re
 
-    root = pathlib.Path(__file__).resolve().parent.parent / "src" / "computer_use_mcp"
-    allowed = {"core/coordinator/actions.py", "backend/linux/backend.py"}
-    offenders = []
+    root = _SRC_ROOT
+    # 白名单三类：上层发起处（唯一）、各平台 backend 的实现、各平台注入通道内部
+    allowed_exact = {"core/coordinator/actions.py"}
+    allowed_re = [
+        re.compile(r"^backend/(linux|windows|mac)/backend\.py$"),
+        re.compile(r"^backend/(linux|windows|mac)/(inject|driver)/"),
+    ]
+    offenders: list[str] = []
+    matched_platform: list[str] = []
     for path in root.rglob("*.py"):
         rel = str(path.relative_to(root))
-        if rel in allowed or rel.startswith("backend/linux/inject"):
+        if rel in allowed_exact:
+            continue
+        if any(r.match(rel) for r in allowed_re):
+            matched_platform.append(rel)
             continue
         for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if re.search(r"\.click_at\(", line) and "def click_at" not in line:
                 offenders.append(f"{rel}:{i}: {line.strip()}")
     assert not offenders, f"绕过了唯一漏斗的坐标点击：{offenders}"
+
+    # ① 白名单不许过期：被豁免的那个文件必须真的还在
+    assert (root / "core/coordinator/actions.py").is_file(), (
+        "白名单里的 core/coordinator/actions.py 不存在了 —— 它被改名/删除后，"
+        "本守卫会静默放宽（那条路径下的绕过再也拦不住）"
+    )
+    # ② 平台规则不许成为死登记：至少要有一条真的匹配到文件
+    assert matched_platform, (
+        "没有任何文件匹配平台白名单 —— 规则写错了（比如目录改名），"
+        "本守卫正在静默失守"
+    )
+    # ③ 尺子自检：**测的是生产用的那条正则**（不是另写一条更严的来比）。
+    #    正控：调用点必须命中；反控：定义行不得命中（否则每个 backend 的实现行
+    #    都会被当成"绕过漏斗"，红一片且指向错误的原因）。
+    _PAT = r"\.click_at\("
+    assert re.search(_PAT, "        self.backend.click_at(1, 2)\n"), "正控没命中，尺子坏了"
+    assert not re.search(_PAT, "    def click_at(self, x, y):\n"), "反控命中，尺子过宽"

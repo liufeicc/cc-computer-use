@@ -17,7 +17,7 @@ from typing import Any
 
 from ...utils.errors import SandboxUnavailableError, ScreenBusyError
 from ...utils.logging import get_logger
-from .. import display, screen_lock
+from .. import screen_lock, session
 
 # ⚠️ 用**固定名字**取 logger（而不是 `__name__`）：本包拆分自单文件
 # `core/coordinator.py`，固定名字让所有子模块**共用同一个 logger 对象**（日志名与
@@ -69,7 +69,7 @@ def _needs_display(fn):
     """
     @functools.wraps(fn)
     def wrapper(self: "Any", *args: Any, **kwargs: Any) -> Any:
-        display.MANAGER.ensure_started()
+        session.MANAGER.ensure_ready()
         # 沙箱起来后把 a11y 连接对齐到沙箱私有 AT-SPI 总线（顺序不能反：总线随沙箱建，
         # 且 libatspi 的 init 是一次性的，必须赶在第一次真正用 a11y 之前）。
         # 廉价：两次字符串比较；非 Linux backend 是 no-op。

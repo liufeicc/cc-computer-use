@@ -1,7 +1,7 @@
 """
 窗口与进程（core.coordinator.windows）—— 列窗口、等窗口、启动应用。
 
-`launch_app` 是**应用进沙箱的正路**：它走 `display.app_env()`（含私有 AT-SPI 总线
+`launch_app` 是**应用进沙箱的正路**：它走 `session.MANAGER.app_env()`（含私有 AT-SPI 总线
 地址），而单纯 `subprocess.Popen` 起的进程既不在沙箱屏上、也连不上私有总线。
 """
 
@@ -14,7 +14,7 @@ import threading
 import time
 
 from ...utils.errors import ComputerUseError
-from .. import display
+from .. import session
 from .hooks import _exclusive_screen, _needs_display, log
 
 # 已知「会话总线单实例」应用的**去单实例参数**（2026-09-24 实测新增）。
@@ -105,7 +105,7 @@ class WindowMixin:
         # ⚠️ 用 app_env 而非 env_for：前者多一层「沙箱内应用 a11y 处理」
         # （isolated 模式下把 AT_SPI_BUS_ADDRESS 指向沙箱私有 AT-SPI 总线，
         #   见 core/display 的 at_spi_bus 子模块与 manager 的说明）
-        env = display.app_env()
+        env = session.MANAGER.app_env()
         try:
             proc = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, start_new_session=True)
@@ -121,10 +121,17 @@ class WindowMixin:
                          name=f"reap-{proc.pid}").start()
         if settle:
             time.sleep(settle)
-        log.info("launch_app: pid=%s display=%s cmd=%s", proc.pid, env["DISPLAY"], command)
+        # ⚠️ 这里必须用 .get() 而不是 env["DISPLAY"] 裸下标：`DISPLAY` 是 X11 概念，
+        # 非 Linux 的 app_env() 里根本没有这个键，裸下标会 KeyError（未来必踩）。
+        # 回退到 target_label() 是为了让「应用被放到哪儿了」这句话在任何平台都说得出来。
+        target = env.get("DISPLAY") or session.MANAGER.target_label()
+        log.info("launch_app: pid=%s target=%s cmd=%s", proc.pid, target, command)
         # 回报**实际执行**的 argv（可能被 _desingleton_argv 补过参数）：模型据此知道
         # 自己那条命令被改成了什么，不必去翻日志，也免得下次自己再加一遍。
-        return {"pid": proc.pid, "command": command, "display": env["DISPLAY"], "argv": argv}
+        # 键名 `display` 本轮**刻意不改**：三个手动 story 直接断言它
+        # （manual_shell_story.py 用正则 '"display"\s*:\s*"(:[\d.]+)"'），
+        # 改成 `target` 是后续轮次的显式决定，要连同那三个 story 一起改。
+        return {"pid": proc.pid, "command": command, "display": target, "argv": argv}
 
     @_needs_display
     def list_windows(self, limit: int = 100) -> list[dict]:

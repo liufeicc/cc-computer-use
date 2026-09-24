@@ -29,24 +29,15 @@ from ..base import Element, ElementDetail, QueryResult, Rect, UINode
 
 log = get_logger(__name__)
 
-# 可交互角色（有操作意义的），过滤纯装饰 panel/label —— 复用 demo/probe_element.py
-INTERACTIVE_ROLES = {
-    "push button", "toggle button", "menu item", "menu", "check box",
-    "radio button", "text", "entry", "combo box", "list item", "list",
-    "table cell", "slider", "scroll bar", "spin button", "hyperlink",
-    "tab", "tree item", "page tab", "tool button", "split pane",
-    "table", "tree", "tree table", "filler", "label", "panel",
-}
-
-# 真正「可操作」的角色子集（用于判断节点是否值得分配 ref / interactive_only 过滤）
-ACTIONABLE_ROLES = {
-    "push button", "toggle button", "menu item", "check box", "radio button",
-    "entry", "combo box", "list item", "slider", "scroll bar", "spin button",
-    "hyperlink", "tab", "page tab", "tool button", "tree item", "table cell",
-}
-
-# 纯噪声角色（无名字时直接丢弃，省 token）
-NOISE_ROLES = {"filler", "panel", "unknown", "section", "scroll pane"}
+# 角色词表已迁到 `backend/base.py`（理由见那里的注释：词表是跨平台契约的一部分，
+# 而 `core/serializer.py` 作为平台无关层不该 import 某个平台的实现）。
+# **在本模块原处再导出**，是因为既有引用点（本模块 `_collect` 里的两处判定）与
+# 任何从 `atspi` 取这些名字的调用方都无需改动——迁移只改「定义在哪」，不改「谁能拿到」。
+from ..base import (  # noqa: E402,F401  —— 放在此处而非文件顶部，跟随原定义位置
+    ACTIONABLE_ROLES,
+    INTERACTIVE_ROLES,
+    NOISE_ROLES,
+)
 
 # do_action 时优先选择的动作名（按优先级）—— 复用 demo/action_vs_coord.py
 _PREFERRED_ACTIONS = ("click", "press", "activate", "open", "select", "jump")

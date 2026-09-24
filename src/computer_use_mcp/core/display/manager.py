@@ -17,10 +17,12 @@ from .at_spi_bus import AtSpibusMixin
 from .env import EnvMixin
 from .host_geom import HostGeomMixin
 from .lifecycle import LifecycleMixin
+from .provider import SessionProviderMixin
 from .wm import WmMixin
 
 
-class DisplayManager(LifecycleMixin, AtSpibusMixin, WmMixin, HostGeomMixin, EnvMixin):
+class DisplayManager(LifecycleMixin, AtSpibusMixin, WmMixin, HostGeomMixin, EnvMixin,
+                     SessionProviderMixin):
     """
     隔离沙箱模式的唯一 DISPLAY 来源。
 
@@ -30,7 +32,13 @@ class DisplayManager(LifecycleMixin, AtSpibusMixin, WmMixin, HostGeomMixin, EnvM
       - 沙箱内起一个最小 WM（i3），让焦点类操作可用；
       - 起一条**私有 AT-SPI 总线**做 a11y 隔离（并清扫跨会话残留）；
       - 判定用户是否把键鼠伸进了沙箱，注入前礼让；
-      - 给出「注入该指向哪块屏」与「子进程该拿什么 env」。
+      - 给出「注入该指向哪块屏」与「子进程该拿什么 env」；
+      - 以 `SessionProvider` 的形状对外（`SessionProviderMixin`，层 3 的 Linux 实现）。
+
+    ⚠️ `SessionProviderMixin` **刻意排在基类列表最后**：它引入的方法名
+    （kind/ensure_ready/require/guard/capabilities/target_label）目前与前面几个 mixin
+    无重名，排在最后可以保证即便将来撞名，**既有的实现优先**——反过来会让本 mixin
+    悄悄顶掉既有方法，而那是会被 55 处测试补丁直接打空的那种失效。
 
     ⚠️ 本模块**不得 import backend/***：inject.py 反向依赖本模块取 DISPLAY，反向导入会
     循环。`user_inside_sandbox` 所需的宿主侧 xdotool 只读查询在 `host_geom` 里独立实现。

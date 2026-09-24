@@ -18,7 +18,7 @@ ref 分配：
 from __future__ import annotations
 
 from ..backend.base import UINode
-from ..backend.linux.atspi import ACTIONABLE_ROLES, NOISE_ROLES
+from ..backend.base import ACTIONABLE_ROLES, NOISE_ROLES
 from ..utils.refs import RefTable
 
 
