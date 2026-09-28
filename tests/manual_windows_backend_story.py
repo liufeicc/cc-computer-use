@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import io
 import json
 import pathlib
 import subprocess
@@ -346,8 +347,89 @@ def main(argv: list[str] | None = None) -> int:
             got2.strip() == replacement,
             f"读回 {got2[:60]!r}，期望恰好 {replacement!r}")
 
-    print("=== 8) 未实现的部分必须**报错**而不是返回空 ===")
-    for name in ("screenshot", "read_text"):
+    print("=== 8) 抓屏与点击反馈（本节判据全是外部可观测的）===")
+    # ⚠️ 这一节存在的理由：抓屏/预览/点后对比的**平台相关部分只有「抓哪块屏」一句话**，
+    #    故实现复用了平台中立的 `backend/screen.py`。那种复用最容易出的错是
+    #    「在 Linux 上全绿、到真机上是黑的」——所以判据不能只看"没抛异常"。
+    try:
+        from PIL import Image
+    except Exception as exc:  # noqa: BLE001
+        _ok("客体上有 pillow", False, str(exc))
+        return _finish(args)
+
+    data, meta = backend.screenshot(max_side=800)
+    _ok("screenshot 返回了字节", bool(data), f"{len(data)} 字节, meta={meta}")
+
+    # ① 元数据必须与**解码后的真实尺寸**一致 —— 不一致的话模型按 origin/scale 换算
+    #    出来的每个坐标都是错的，而图看着完全正常。
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except Exception as exc:  # noqa: BLE001
+        _ok("截出来的 bytes 是一张能解码的图", False, f"{type(exc).__name__}: {exc}")
+        img = None
+    if img is not None:
+        _ok("截出来的 bytes 是一张能解码的图", True, f"{img.format} {img.size}")
+        _ok("meta 的 width/height 与解码后的实际尺寸一致",
+            (meta.get("width"), meta.get("height")) == img.size,
+            f"meta={meta.get('width')}x{meta.get('height')} 实际={img.size}")
+
+        # ② **不是纯色** —— 空白/黑屏抓取是这类功能的经典失败，且**不报错**：
+        #    DEMO 里 PrintWindow 就返回过 api_ok=True 却是一张全黑图。
+        #    判据取灰度极差：纯色图极差为 0，正常桌面（有任务栏、窗口边框）远大于此。
+        gray = img.convert("L")
+        lo, hi = gray.getextrema()
+        _ok("抓到的不是纯色图（空白/黑屏抓取的经典失败）", hi - lo > 20,
+            f"灰度极差 = {hi - lo}（纯色会是 0）")
+
+    # ③ 预览图：准星像素必须 = 落点 − 裁剪后原点。
+    #    写死半宽的话越靠屏幕边缘指得越离谱，而这个功能存在的唯一理由就是「位置对不对」。
+    fg_rect = backend.active_window_rect()
+    if fg_rect is None or fg_rect.is_empty():
+        _ok("取到前台窗口矩形（预览需要落点）", False)
+    else:
+        px = fg_rect.x + min(60, fg_rect.w // 2)
+        py = fg_rect.y + min(20, fg_rect.h // 2)      # 标题栏附近，必然有像素
+        shot = backend.click_preview(px, py)
+        _ok("click_preview 返回了图（四样反馈的总开关）", shot is not None,
+            "返回 None 会连锁掐掉预览图/落点文字/偏差数值/点后变化 全部四样")
+        if shot is not None:
+            ox, oy = shot.meta["origin"]
+            _ok("准星像素 == 落点 − 裁剪后原点",
+                shot.meta["crosshair"] == [px - ox, py - oy],
+                f"落点=({px},{py}) origin=({ox},{oy}) crosshair={shot.meta['crosshair']}")
+            _ok("预览图不缩放（scale 恒为 1，模型不需要乘法）",
+                shot.meta.get("scale") == 1, f"scale={shot.meta.get('scale')}")
+            _ok("预览 meta 带 region（点后对比要靠它再抓同一块）",
+                bool(shot.meta.get("region")), f"region={shot.meta.get('region')}")
+
+            # ④ 点后变化：返回 0..1 的数
+            frac = backend.change_fraction_since(tuple(shot.meta["region"]), shot.image)
+            _ok("change_fraction_since 返回 0..1 的数",
+                frac is not None and 0.0 <= frac <= 1.0, f"变化占比 = {frac}")
+
+    # ⑤ ★ 落点证据必须真的读得出来 —— 这条同时验 `describe_point` 的键名修复。
+    #    初版 Windows 发的是自造方言（`window`/`class`/`hwnd`），而消费方
+    #    `core/coordinator/landing.py` 读的是 `ev["window_title"]` / `ev["window_rect"]`
+    #    —— 恒为 None，于是「落点：窗口「…」 WxH」整行**静默消失**。
+    if fg_rect is not None and not fg_rect.is_empty():
+        cx, cy = fg_rect.x + fg_rect.w // 2, fg_rect.y + 10
+        ev = backend.describe_point(cx, cy, with_text=False)
+        print(f"   describe_point({cx},{cy}) = {ev}")
+        # 判据就是**消费方读的那两个键**：非 None 才说明那一行拼得出来
+        _ok("落点证据带 window_title（消费方读的就是这个键）",
+            ev.get("window_title") is not None, f"ev={ev}")
+        rect = ev.get("window_rect")
+        _ok("落点证据带 window_rect 且是 4 个数字",
+            isinstance(rect, list) and len(rect) == 4
+            and all(isinstance(v, int) for v in rect), f"window_rect={rect}")
+        # 交叉校验：窗口标题应与前台窗口标题一致（落在前台窗口上，就该报它）
+        _ok("落点窗口标题与前台窗口标题一致",
+            ev.get("window_title") == backend.active_window_title(),
+            f"{ev.get('window_title')!r} vs {backend.active_window_title()!r}")
+
+    print("=== 9) 未实现的部分必须**报错**而不是返回空 ===")
+    for name in ("read_text",):
         try:
             getattr(backend, name)()
             _ok(f"{name} 抛错", False, "居然没抛")
