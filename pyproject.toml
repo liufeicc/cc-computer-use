@@ -7,20 +7,21 @@ name = "computer-use-mcp"
 version = "0.1.0"
 description = "让 AGENT 直接使用 Linux 桌面的 MCP server：AT-SPI 无障碍结构化感知 + 元素级操作，替代截图+坐标点击"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [{ name = "liufei" }]
 license = { text = "MIT" }
 
 # 运行时依赖（pygobject/Atspi 通过 conda-forge 安装，见 README；此处声明纯 Python 依赖）
 #
-# ⚠️ 地板为什么是 3.11 而不是 3.12（2026-09-28 改）
-#   原先是 3.12（就是本机 conda 环境的版本，属"随手写的"）。真机实测：Windows 客体的
-#   Python 是 **3.11**，而 `server.py` 里有一个跨行 f-string 表达式 —— 那是 PEP 701
-#   (3.12) 才允许的语法，3.11 下**连 import 都失败**（`SyntaxError: unterminated
-#   string literal`，报错位置看着像引号写错，实际是版本不够）。那处写法已改掉，
-#   且 `tests/test_static_health.py` 现在有一条守卫专拦这种"比地板更新的语法"。
-#   降地板不是放宽承诺：全仓再无任何 3.12-only 语法或 stdlib API（已逐项核过），
-#   且 Windows 端到端故事正是跑在 3.11 上。
+# ⚠️ 关于地板 = 3.12（2026-09-28 记一笔，免得下次又走弯路）
+#   一度因为**真机客体装的是 3.11**（而 3.11 下 `server.py` 里一个跨行 f-string
+#   是 PEP 701 语法、会让整个模块 import 失败），把地板降到过 3.11。
+#   **那条路是反的**：声明是给用户看的契约，不该为了迁就一台测试机而放宽 ——
+#   正确做法是**把环境升到声明的要求**。故地板回到 3.12，客体另装了
+#   `C:\Users\lf\py312\python.exe`（3.12.10）并复验。
+#   顺带记两条实测：① 3.12 **3.12.11 起只发源码包**，`python-3.12.14-amd64.exe`
+#   是 404 —— **最后一个带 Windows 安装器的是 3.12.10**；② 判断"包下好了没"
+#   不能只看"下载没报错"（镜像返回 HTML 错误页也是 200），要判大小 + `MZ` 头。
 dependencies = [
     "mcp>=1.2",
     "cryptography",

@@ -222,13 +222,8 @@ def _selftest() -> int:
     info = session.MANAGER.ensure_ready()
     print(f"[selftest] session = {json.dumps(info, ensure_ascii=False)}")
     caps = session.MANAGER.capabilities()
-    # ⚠️ 这个 dict **必须先赋给变量**，不能内联进 f-string 里跨行写。
-    #    跨行的 f-string 表达式是 **Python 3.12（PEP 701）** 才允许的语法，3.11 的
-    #    词法分析器直接报 `SyntaxError: unterminated string literal` —— 而报错位置
-    #    指向这一行，看着像"引号写错了"，实际是"解释器版本低了"。
-    #    真机实测（2026-09-28）：Windows 客体是 3.11，**整个 server 模块因此一个都
-    #    import 不进来**，而本机开发环境是 3.12，永远看不到。故全仓禁用这种写法
-    #    （守卫 `test_static_health.py::test_no_pep701_syntax_in_src`）。
+    # 先拼成变量再打印：7 个字段铺开写比塞进一行 f-string 里清楚得多
+    # （那行会变成三层引号嵌套、跨行、还要靠 `ensure_ascii=False` 收尾）。
     caps_json = json.dumps({
         "target": caps.target,
         "input_isolated": caps.input_isolated,

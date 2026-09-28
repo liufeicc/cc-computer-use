@@ -519,3 +519,51 @@ def test_clear_first_false_does_not_send_keys():
 
     assert [c for c in backend.calls if c[0] == "key"] == []
     assert ("type", "追加内容") in backend.calls
+
+
+# ==================== ⑨ stdio 编码：Windows 上不做这件事会直接崩 ====================
+
+def test_configure_stdio_forces_utf8(monkeypatch):
+    """
+    `main()` 必须把 stdout/stderr 显式设成 UTF-8。
+
+    ⚠️ 这条对应真机一次**很讽刺的崩溃**（2026-09-28，中文版 Windows 11）：
+    `--selftest` 把所有检查都跑完了，**在最后一行** `print("[selftest] ✅ OK")` 抛
+    `UnicodeEncodeError: 'gbk' codec can't encode character '\\u2705'` —— 退出码成了 1。
+    根因不是"控制台不支持 emoji"，而是 **stdout 是管道时 Python 用 locale 编码**
+    （中文机 = cp936/GBK），而 ✅/❌/⚠️ 都不在 GBK 里；`chcp 65001` 也救不了
+    （它改的是控制台，管不到 Python 对**管道**的编码选择）。
+
+    这条与"地板是 3.11 还是 3.12"**无关** —— 中文 Windows 上它照样会发生，
+    所以地板改回去之后这条守卫与修法都得留着。
+    """
+    from computer_use_mcp import server
+
+    calls: list[dict] = []
+
+    class _Stream:
+        def reconfigure(self, **kw):  # noqa: ANN003, ANN202
+            calls.append(kw)
+
+    monkeypatch.setattr(server.sys, "stdout", _Stream())
+    monkeypatch.setattr(server.sys, "stderr", _Stream())
+    server._configure_stdio()
+
+    assert len(calls) == 2, f"两个流都要设，实际只设了 {len(calls)} 个"
+    assert all(c.get("encoding") == "utf-8" for c in calls), f"没设成 utf-8：{calls}"
+    assert all(c.get("errors") == "replace" for c in calls), (
+        f"没加 errors='replace' —— 真遇到编码不了的环境宁可显示成 ?，也别让进程死在一句日志上：{calls}"
+    )
+
+
+def test_configure_stdio_survives_a_stream_that_refuses(monkeypatch):
+    """反向：流不支持 reconfigure（冻结产物/被重定向）时**不许**把主流程炸掉。"""
+    from computer_use_mcp import server
+
+    class _Hostile:
+        def reconfigure(self, **kw):  # noqa: ANN003, ANN202
+            raise ValueError("这个流不支持 reconfigure")
+
+    monkeypatch.setattr(server.sys, "stdout", _Hostile())
+    monkeypatch.setattr(server.sys, "stderr", _Hostile())
+    server._configure_stdio()          # 不该抛
