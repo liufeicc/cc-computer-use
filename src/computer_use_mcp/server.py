@@ -18,6 +18,8 @@ backend 不可用时（非 Linux / AT-SPI 加载失败 / 无障碍开关未开�
 
 from __future__ import annotations
 
+import sys  # noqa: E402 —— `_configure_stdio` 在模块级用它（main 里那个 import 是局部的）
+
 # ① 必须最先执行：配置 GI 环境（在任何 import gi 之前）
 from . import _bootstrap
 
@@ -220,11 +222,23 @@ def _selftest() -> int:
     info = session.MANAGER.ensure_ready()
     print(f"[selftest] session = {json.dumps(info, ensure_ascii=False)}")
     caps = session.MANAGER.capabilities()
-    print(f"[selftest] capabilities = {json.dumps({'target': caps.target,
-          'input_isolated': caps.input_isolated, 'screen_isolated': caps.screen_isolated,
-          'a11y_isolated': caps.a11y_isolated, 'strong_mode': caps.strong_mode,
-          'unimplemented': list(caps.unimplemented), 'notes': list(caps.notes)},
-          ensure_ascii=False)}")
+    # ⚠️ 这个 dict **必须先赋给变量**，不能内联进 f-string 里跨行写。
+    #    跨行的 f-string 表达式是 **Python 3.12（PEP 701）** 才允许的语法，3.11 的
+    #    词法分析器直接报 `SyntaxError: unterminated string literal` —— 而报错位置
+    #    指向这一行，看着像"引号写错了"，实际是"解释器版本低了"。
+    #    真机实测（2026-09-28）：Windows 客体是 3.11，**整个 server 模块因此一个都
+    #    import 不进来**，而本机开发环境是 3.12，永远看不到。故全仓禁用这种写法
+    #    （守卫 `test_static_health.py::test_no_pep701_syntax_in_src`）。
+    caps_json = json.dumps({
+        "target": caps.target,
+        "input_isolated": caps.input_isolated,
+        "screen_isolated": caps.screen_isolated,
+        "a11y_isolated": caps.a11y_isolated,
+        "strong_mode": caps.strong_mode,
+        "unimplemented": list(caps.unimplemented),
+        "notes": list(caps.notes),
+    }, ensure_ascii=False)
+    print(f"[selftest] capabilities = {caps_json}")
 
     backend = _make_backend()
     # M-43：`is_available()` 会一路走到 AT-SPI 的 `get_desktop(0) + get_child_count()`。
@@ -277,6 +291,29 @@ def _selftest() -> int:
     return 0
 
 
+def _configure_stdio() -> None:
+    """
+    把 stdout/stderr 显式设成 UTF-8 —— **Windows 上不做这件事会直接崩**。
+
+    实测（2026-09-28，中文版 Windows 11）：`--selftest` 跑完全部检查、在**最后一行**
+    `print("[selftest] ✅ OK")` 抛 `UnicodeEncodeError: 'gbk' codec can't encode
+    character '\\u2705'`。根因不是"控制台不支持 emoji"，而是 **stdout 是管道时
+    Python 用 locale 编码**（中文机 = cp936/GBK），而 ✅/❌/⚠️ 都不在 GBK 里；
+    `chcp 65001` 也救不了（它改的是控制台，管不到 Python 对**管道**的编码选择）。
+    后果很讽刺：检查全做完了，最后一行把自己打崩，退出码变成 1。
+
+    ⚠️ 与 MCP 的 stdio 传输**不冲突**：SDK 自己就会把线缆重包成 UTF-8
+    （`mcp/server/stdio.py`：`TextIOWrapper(..., encoding="utf-8")`），这里改的是
+    `sys.stdout` 这个文本层，底层 buffer 不变。`errors="replace"` 是兜底：
+    真遇到编码不了的环境，宁可显示成 `?`，也不要让整个进程死在一句日志上。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 —— 冻结产物/被重定向的流可能不支持
+            pass
+
+
 def main() -> None:
     """
     入口：默认以 stdio 传输运行 MCP server；--selftest 则只自检后退出。
@@ -287,6 +324,7 @@ def main() -> None:
 
     # 再次确保环境就绪（冻结后 _bootstrap 已在 import 时执行，这里幂等保险）
     _bootstrap.setup_gi_environment()
+    _configure_stdio()
     if "--selftest" in sys.argv[1:]:
         sys.exit(_selftest())
     # 隔离沙箱**不在此启动**（惰性）：本进程是 Claude Code 会话启动即常驻拉起的 stdio

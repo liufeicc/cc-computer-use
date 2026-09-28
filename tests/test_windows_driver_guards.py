@@ -624,3 +624,171 @@ def test_windows_backend_reuses_the_neutral_screen_layer():
     for call in ("screen.grab_desktop(", "screen.encode_image(",
                  "screen.build_click_preview(", "screen.changed_fraction("):
         assert call in src, f"Windows 后端里找不到 {call} —— 中立的像素层没被用上。"
+
+
+# ==================== ⑧ 坐标点击"先聚焦"聚焦的必须是**落点下的窗口** ====================
+
+class _Win32Spy:
+    """把 `driver.win32` 里那几个与焦点有关的函数换成探针（在 Linux 上也能跑）。"""
+
+    def __init__(self, monkeypatch, fg_hwnd: int, at_point_hwnd: int) -> None:
+        from computer_use_mcp.backend.windows.driver import win32
+
+        self.mod = win32
+        self.calls: list[tuple[str, tuple]] = []
+        self.fg_hwnd = fg_hwnd
+        self.at_point_hwnd = at_point_hwnd
+
+        def rec(name):  # noqa: ANN001, ANN202
+            def _f(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+                self.calls.append((name, a))
+                return None
+            return _f
+
+        def send_mouse_button(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+            self.calls.append(("send_mouse_button", a))
+            self.mouse_kwargs = kw
+            return {"ok": True}
+
+        monkeypatch.setattr(win32, "foreground_window", lambda: self.fg_hwnd)
+        monkeypatch.setattr(win32, "window_from_point",
+                            lambda x, y: (self.calls.append(("window_from_point", (x, y))),
+                                          7000 + int(x))[1])
+        monkeypatch.setattr(win32, "root_ancestor",
+                            lambda h: (self.calls.append(("root_ancestor", (h,))),
+                                       self.at_point_hwnd)[1])
+        monkeypatch.setattr(win32, "set_foreground_window", rec("set_foreground_window"))
+        monkeypatch.setattr(win32, "send_mouse_button", send_mouse_button)
+        monkeypatch.setattr(win32, "send_mouse_drag",
+                            lambda *a, **kw: {"ok": True})
+
+    def named(self, name: str) -> list[tuple]:
+        return [a for n, a in self.calls if n == name]
+
+
+def test_click_at_focuses_the_window_under_the_point_not_the_current_foreground(monkeypatch):
+    """
+    `click_at(focus_window=True)` 传给输入层的 hwnd 必须是**落点下的顶层窗口**。
+
+    ⚠️ 为什么单列一条：初版写的是 `hwnd = win32.foreground_window()` —— 把**当前前台**
+    再设一遍，恒等于空操作。它不报错、不掉测试、真机上"看着也能点中"（因为物理点击
+    本身也会激活窗口），所以**只能靠这条断言钉住**：故意让"当前前台"与"落点下窗口"
+    是两个不同的值，然后看它到底用了哪个。
+    """
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    spy = _Win32Spy(monkeypatch, fg_hwnd=111, at_point_hwnd=222)
+    assert WindowsBackend().click_at(120, 340) is True
+
+    assert spy.mouse_kwargs.get("hwnd") == 222, (
+        f"传给输入层的 hwnd={spy.mouse_kwargs.get('hwnd')}，期望落点下那个窗口(222)。"
+        f"若等于 111（当前前台）说明又退回成「把前台再设一遍」的空操作了。"
+    )
+    assert spy.named("window_from_point") == [(120, 340)], (
+        f"必须按**落点**查窗口，实际调用：{spy.named('window_from_point')}"
+    )
+
+
+def test_click_at_without_focus_does_not_touch_windows_at_all(monkeypatch):
+    """
+    反向：`focus_window=False` 时**不许**去查/抢窗口（滚动就走这条路，抢焦点是纯副作用）。
+    """
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    spy = _Win32Spy(monkeypatch, fg_hwnd=111, at_point_hwnd=222)
+    assert WindowsBackend().click_at(10, 20, focus_window=False) is True
+
+    assert spy.mouse_kwargs.get("hwnd") == 0, f"不该抢焦点，实际 hwnd={spy.mouse_kwargs}"
+    assert spy.named("window_from_point") == [], "没让抢焦点却去查了落点窗口"
+    assert spy.named("set_foreground_window") == [], "没让抢焦点却去设了前台"
+
+
+def test_drag_at_focuses_the_window_under_the_start_point(monkeypatch):
+    """
+    拖拽抢焦点取**起点**下的窗口：意图对象由起点决定（终点只是落点），
+    与 `describe_point` 只取起点证据是同一口径。
+    """
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    spy = _Win32Spy(monkeypatch, fg_hwnd=111, at_point_hwnd=333)
+    assert WindowsBackend().drag_at(50, 60, 500, 600) is True
+
+    assert spy.named("window_from_point") == [(50, 60)], (
+        f"应按起点查窗口，实际：{spy.named('window_from_point')}"
+    )
+    assert spy.named("set_foreground_window") == [(333,)], (
+        f"应把起点下的窗口设到前台，实际：{spy.named('set_foreground_window')}"
+    )
+
+
+def test_describe_point_reports_the_top_level_window(monkeypatch):
+    """
+    落点证据里的 `window_title` / `window_rect` 必须来自**顶层窗口**，不是子控件。
+
+    ⚠️ 真机实测（2026-09-28）：`WindowFromPoint` 在窗口主体上常返回**子控件**
+    （编辑区、画布…），而子控件的 `GetWindowText` 是空的 → 落点那行变成
+    『落点：窗口「?」』，模型分不清自己点在哪扇窗上 —— 而落点证据存在的唯一理由
+    就是回答这个问题。**它是静默的**：那一行还是照样拼得出来，只是没有标题。
+    先前的真机断言之所以通过，是因为采样点正好落在**标题栏**（非客户区，
+    `WindowFromPoint` 直接给顶层窗）—— 采样点挑得好掩盖了缺陷。
+    """
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    spy = _Win32Spy(monkeypatch, fg_hwnd=111, at_point_hwnd=999)
+    monkeypatch.setattr(spy.mod, "window_text", lambda h: f"标题{h}")
+    monkeypatch.setattr(spy.mod, "window_rect", lambda h: (10, 20, 30, 40))
+
+    ev = WindowsBackend().describe_point(300, 400)
+
+    assert spy.named("window_from_point") == [(300, 400)], "要按落点查窗口"
+    assert spy.named("root_ancestor") == [(7300,)], (
+        f"查到的子窗口要上溯到顶层，实际：{spy.named('root_ancestor')}"
+    )
+    assert ev["window_title"] == "标题999", (
+        f"标题必须来自顶层窗口(999)，实际 {ev['window_title']!r} —— "
+        f"若为 None 说明报的是子控件（它的 GetWindowText 是空的）"
+    )
+    assert ev["window_id"] == hex(999), f"window_id 也应是顶层窗口：{ev['window_id']}"
+
+
+# ==================== ⑨ DPI 感知必须在**构造后端**时设死 ====================
+#
+# 2026-09-28 真机实测的根因（数据见 backend.py 的模块 docstring 与
+# `docs/PR/windows-driver/probe_dpi_flip.py`）：感知度原先只在"第一次碰 UIA"时才设，
+# 于是**进程跑到一半坐标空间会翻转** —— 碰 UIA 前 SM_CXSCREEN=1280x673、
+# 同一扇窗矩形 (703,95,1230,474)；碰 UIA 后变成 1920x1009 与 (1055,143,1846,712)。
+# 表现是"点标题栏却点到了桌面"，而每一层都报 ok，**只在缩放 ≠100% 的机器上出现**。
+
+
+def test_windows_backend_pins_dpi_awareness_at_construction(monkeypatch):
+    """
+    构造 `WindowsBackend` 的那一刻就必须设 DPI 感知 —— 不能拖到第一次碰 UIA。
+
+    这是"整个进程生命周期只有**一个**坐标空间"的唯一保证。拖到惰性设置的话，
+    翻转之前取到的矩形（虚拟化坐标）会被翻转之后的注入（物理坐标）解释，
+    而**每一层返回值都是 ok**，只在非 100% 缩放的机器上表现为"点偏"。
+    """
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+    from computer_use_mcp.backend.windows.driver import _uia, win32
+
+    calls: list[str] = []
+    monkeypatch.setattr(win32, "set_dpi_awareness_v2",
+                        lambda: (calls.append("set_dpi_awareness_v2"), {"ok": True})[1])
+    monkeypatch.setattr(win32, "dpi_awareness_now", lambda: {"stub": True})
+    monkeypatch.setattr(_uia, "_dpi_state", None)      # 复位幂等缓存，否则上面打桩不会被执行
+
+    WindowsBackend()
+
+    assert calls == ["set_dpi_awareness_v2"], (
+        "构造 WindowsBackend 时没有设 DPI 感知 —— 于是它只会在第一次碰 UIA 时才设，"
+        "进程的坐标空间会在跑到一半时翻转（非 100% 缩放的机器上表现为点偏）。"
+    )
+
+
+def test_windows_backend_exposes_the_dpi_result_for_diagnostics():
+    """设感知度的结果要留在实例上（`ok=False` 时**整份坐标数据都不可信**，得能查）。"""
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    assert hasattr(WindowsBackend(), "_dpi"), (
+        "实例上没有 _dpi —— 感知度设置的结果没被留下，真机排查时无从判断坐标可不可信。"
+    )

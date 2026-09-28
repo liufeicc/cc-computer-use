@@ -7,11 +7,20 @@ name = "computer-use-mcp"
 version = "0.1.0"
 description = "让 AGENT 直接使用 Linux 桌面的 MCP server：AT-SPI 无障碍结构化感知 + 元素级操作，替代截图+坐标点击"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 authors = [{ name = "liufei" }]
 license = { text = "MIT" }
 
 # 运行时依赖（pygobject/Atspi 通过 conda-forge 安装，见 README；此处声明纯 Python 依赖）
+#
+# ⚠️ 地板为什么是 3.11 而不是 3.12（2026-09-28 改）
+#   原先是 3.12（就是本机 conda 环境的版本，属"随手写的"）。真机实测：Windows 客体的
+#   Python 是 **3.11**，而 `server.py` 里有一个跨行 f-string 表达式 —— 那是 PEP 701
+#   (3.12) 才允许的语法，3.11 下**连 import 都失败**（`SyntaxError: unterminated
+#   string literal`，报错位置看着像引号写错，实际是版本不够）。那处写法已改掉，
+#   且 `tests/test_static_health.py` 现在有一条守卫专拦这种"比地板更新的语法"。
+#   降地板不是放宽承诺：全仓再无任何 3.12-only 语法或 stdlib API（已逐项核过），
+#   且 Windows 端到端故事正是跑在 3.11 上。
 dependencies = [
     "mcp>=1.2",
     "cryptography",
@@ -20,6 +29,11 @@ dependencies = [
     # 点击光圈用（backend/linux/ring.py）：纯 Python 的 X11 客户端，走 socket、不链 libX11，
     # 故不引入「产物库与系统库混装」那类风险。缺包时只是光圈不显示，点击照常。
     "python-xlib",
+    # Windows UIA 驱动（`backend/windows/driver/_uia.py` 是它**唯一**的 import 点）。
+    # ⚠️ 原先漏声明了：真机上是手动 `pip install uiautomation` 才跑起来的。
+    #    漏了在开发机上**看不出来** —— Linux 侧被 sys_platform 标记挡住不装，
+    #    而 Windows 侧只会在真机上以「驱动不可用」的形式暴露（2026-09-28 补齐）。
+    "uiautomation; sys_platform == 'win32'",
     # Windows OCR：调**系统自带**的 Windows.Media.Ocr（backend/windows/driver/ocr.py）。
     # 选它的理由（真机实测）：零安装、无需打包工程、隐藏桌面可用 —— 详见该模块 docstring。
     #

@@ -423,3 +423,49 @@ def test_inject_window_title_handles_missing(monkeypatch):
     assert inj.window_title("123") is None, "空标题应归一为 None，而不是空串"
     monkeypatch.setattr(inj, "_read_titles", lambda wids: ["DBeaver"])
     assert inj.window_title("123") == "DBeaver"
+
+
+# ---------- 命令行分词必须分平台（Windows 上反斜杠不是转义符） ----------
+#
+# 2026-09-28 真机实测：`shlex.split` 默认 POSIX 规则，会把 Windows 路径里的反斜杠
+# 当转义符吃掉 —— `launch_app("notepad.exe C:\Users\lf\e2e.txt")` 变成
+# `['notepad.exe', 'C:Userslfe2e.txt']`，应用拿到一个不存在的路径。**它不报错**
+# （记事本会自己弹"新建"），排查时看不出是分词干的。Linux 上永远重现不了。
+
+
+def test_split_command_keeps_windows_backslashes(monkeypatch):
+    """在 Windows 语义下（非 posix），路径里的反斜杠必须原样保留。"""
+    from computer_use_mcp.core import session
+    from computer_use_mcp.core.coordinator.windows import _split_command
+
+    monkeypatch.setattr(session, "IS_LINUX", False)
+
+    assert _split_command(r"notepad.exe C:\Users\lf\e2e.txt") == [
+        "notepad.exe", r"C:\Users\lf\e2e.txt"], "反斜杠被吃掉了（POSIX 分词规则）"
+    # 非 posix 模式会把引号留在 token 里 —— 必须去掉成对引号，否则应用拿到带引号的路径
+    assert _split_command(r'notepad.exe "C:\Program Files\a b.txt"') == [
+        "notepad.exe", r"C:\Program Files\a b.txt"]
+    # 单引号同样处理
+    assert _split_command("app.exe 'C:\\a b.txt'") == ["app.exe", r"C:\a b.txt"]
+
+
+def test_split_command_still_uses_posix_rules_on_linux(monkeypatch):
+    """反向：Linux 上**不许**改成非 posix —— 那会让 `--title='a b'` 变成带引号的怪东西。"""
+    from computer_use_mcp.core import session
+    from computer_use_mcp.core.coordinator.windows import _split_command
+
+    monkeypatch.setattr(session, "IS_LINUX", True)
+
+    assert _split_command("zenity --title='a b' --text=hi") == [
+        "zenity", "--title=a b", "--text=hi"]
+    assert _split_command("zenity --title=\"a b\"") == ["zenity", "--title=a b"]
+
+
+def test_split_command_still_raises_on_unclosed_quotes(monkeypatch):
+    """引号不闭合仍要抛 ValueError（调用方靠它转成 ComputerUseError，见上一条回归）。"""
+    from computer_use_mcp.core import session
+    from computer_use_mcp.core.coordinator.windows import _split_command
+
+    monkeypatch.setattr(session, "IS_LINUX", True)
+    with pytest.raises(ValueError):
+        _split_command("zenity --title='未闭合")

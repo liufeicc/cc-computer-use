@@ -48,6 +48,30 @@ _DESINGLETON_ARGS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _split_command(command: str) -> list[str]:
+    """
+    命令行 → argv。**按平台选分词规则**（`shlex` 的 posix 模式是 POSIX shell 规则）。
+
+    ⚠️ 为什么必须分平台（2026-09-28 真机实测）：`shlex.split` 默认 `posix=True`，
+    而 POSIX 规则里**反斜杠是转义符**。于是 Windows 上一条再正常不过的命令
+
+        launch_app("notepad.exe C:\\Users\\lf\\e2e.txt")
+
+    会被切成 `['notepad.exe', 'C:Userslfe2e.txt']` —— 反斜杠全被吃掉，应用拿到一个
+    不存在的路径。**它不报错**，只是"文件没打开"（记事本会自己弹"新建"），
+    排查时完全看不出是分词的问题。Linux 上没有这个现象（那里反斜杠本就该转义），
+    所以这是又一条「开发机上永远看不到」的 Windows 专属缺陷。
+
+    非 posix 模式下 `shlex` 会**把引号留在 token 里**（`'"a b"'`），所以要去掉
+    成对的包裹引号 —— 否则传给应用的就不是路径而是 `"C:\\a b.txt"`（带引号的字符串）。
+    """
+    posix = session.IS_LINUX
+    argv = shlex.split(command, posix=posix)
+    if posix:
+        return argv
+    return [a[1:-1] if len(a) >= 2 and a[0] == a[-1] and a[0] in "\"'" else a for a in argv]
+
+
 def _desingleton_argv(argv: list[str]) -> list[str]:
     """
     给已知的单实例应用补上去单实例参数；未列出、或调用方已经自己加了 → 原样返回。
@@ -92,7 +116,7 @@ class WindowMixin:
         遇到时请把该应用自己的开关补进表里。
         """
         try:
-            argv = shlex.split(command)
+            argv = _split_command(command)
         except ValueError as exc:
             # 引号不闭合等语法错。若不拦，ValueError 不是 ComputerUseError，会穿透
             # tools/ 的 except 到 MCP 层，模型只看到 "Error executing tool launch_app"。

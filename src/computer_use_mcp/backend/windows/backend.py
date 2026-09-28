@@ -35,6 +35,25 @@ OCR 走**系统自带的 `Windows.Media.Ocr`**（选型与实测证据见 `drive
 
 ⚠️ 本平台**唯一**的接口不对称：OCR 没有置信度（`SUPPORTS_TEXT_CONFIDENCE = False`），
 `min_conf` 不生效。这一条必须**如实转告**模型，不能让它以为自己筛过了。
+
+═══ ★ DPI 感知必须在**构造后端时**就设死（2026-09-28 真机实测的根因）═══
+
+原先感知度是"惰性"设的：只有第一次碰 UIA（`_uia.import_uia()`）才调
+`set_dpi_awareness_v2()`。**这在 150% 缩放的机器上会中途翻转坐标空间**，实测数据
+（`docs/PR/windows-driver/probe_dpi_flip.py`，客体 1920x1009、dmLogPixels=144）：
+
+    碰 UIA 之前           碰 UIA 之后
+    DPI 感知 = 0（未感知）  →  2（PER_MONITOR_AWARE_V2）
+    SM_CXSCREEN = 1280x673  →  1920x1009
+    同一个窗口的矩形 = (703,95,1230,474) → (1055,143,1846,712)
+
+后果是一条**只在非 100% 缩放机器上出现**的错位：翻转前拿到的坐标（虚拟化空间）
+被翻转后的注入按另一个空间解释 —— 端到端 story 里就表现为"点标题栏却点到了桌面、
+前台被踢成 Program Manager"，而每一层的返回值都是 ok。
+
+修法：**在 `__init__` 里就把感知度设成 V2**。构造发生在 `get_backend()`，也就是
+server 进程启动时（早于任何工具调用），于是整个进程生命周期只有**一个**坐标空间。
+`import uiautomation` 那半件事仍保持惰性（它更重，且顺序由 `_uia` 固化）。
 """
 
 from __future__ import annotations
@@ -94,6 +113,11 @@ class WindowsBackend(Backend):
         self._error: str = ""
         # OCR 引擎惰性创建：首次要枚举语言、挑引擎，不该在每次构造后端时做
         self._ocr_reader: Any = None
+        # ⚠️ **但 DPI 感知必须在这一刻就设**，它是唯一不能拖的（`import uiautomation` 那
+        #    半件事仍留到 `_uia()`）。它买的是「整个进程生命周期里所有坐标都在同一个
+        #    空间」—— 拖到"第一次碰 UIA 才设"会让坐标空间**中途翻转**，
+        #    详见模块 docstring 的「DPI 感知必须在构造后端时就设死」。
+        self._dpi: dict[str, Any] = _uia.ensure_dpi_awareness()
 
     # ---------- 就绪 ----------
 
@@ -526,6 +550,19 @@ class WindowsBackend(Backend):
 
     # ---------- 坐标注入 ----------
 
+    @staticmethod
+    def _window_under_point(x: int, y: int) -> int:
+        """
+        落点 (x, y) 下的**顶层**窗口句柄；取不到返回 0（= 不抢焦点，别猜一个）。
+
+        ⚠️ 必须 `window_from_point` 之后再 `root_ancestor`：前者给的是**最深**的子窗口
+        （可能是个按钮），拿子窗去 `SetForegroundWindow` 是错的（要顶层窗）。
+        """
+        try:
+            return win32.root_ancestor(win32.window_from_point(int(x), int(y)))
+        except Exception:  # noqa: BLE001 —— 取不到就当没有，抢焦点本就是尽力而为
+            return 0
+
     def click_at(self, x: int, y: int, button: int = 1, focus_window: bool = True,
                  repeat: int = 1, delay_ms: int = 100) -> bool:
         """
@@ -534,8 +571,14 @@ class WindowsBackend(Backend):
         ⚠️ 双击靠 `repeat=2` + `delay_ms` 交给输入层定时，**不要**让调用方连调两次：
         两次独立调用之间夹着落点证据、OCR、变化对比（实测约 0.5s），
         必然超过系统双击阈值而被认成两次单击 —— X11 侧为此吃过一次亏，Windows 同理。
+
+        ⚠️ `focus_window` 抢的是**落点下的那个窗口**，不是"当前前台"。
+        初版写的是 `hwnd = win32.foreground_window()` —— 那是**把当前前台再设一遍**，
+        恒等于空操作，与 `base.py` 的契约（"先激活/聚焦**所在窗口**"）不符；
+        而这个错误**不会报任何错**，只会让"点击被激活动作吃掉"那类现象继续存在
+        （Linux 侧对此的说明见 `linux/inject/pointer.py`）。2026-09-28 真机复核后改正。
         """
-        hwnd = win32.foreground_window() if focus_window else 0
+        hwnd = self._window_under_point(x, y) if focus_window else 0
         return bool(win32.send_mouse_button(
             x, y, button=button, repeat=repeat, delay_ms=delay_ms,
             focus_window=focus_window, hwnd=hwnd).get("ok"))
@@ -546,11 +589,14 @@ class WindowsBackend(Backend):
         坐标级拖拽。**必须插值分步**（原因见 `win32.send_mouse_drag`）。
 
         失败**不重试**：重试一次拖拽 = 再拖一遍（文件移动两次、画两笔），后果不对称。
+
+        ⚠️ 抢焦点取**起点**下的窗口：拖拽的"意图对象"由起点决定（终点只是落点），
+        `describe_point` 也只取起点的落点证据，两处口径一致。
         """
         if focus_window:
-            fg = win32.foreground_window()
-            if fg:
-                win32.set_foreground_window(fg)
+            hwnd = self._window_under_point(x1, y1)
+            if hwnd:
+                win32.set_foreground_window(hwnd)
         return bool(win32.send_mouse_drag(x1, y1, x2, y2, button=button, steps=steps).get("ok"))
 
     def type_text(self, text: str) -> bool:
@@ -659,7 +705,14 @@ class WindowsBackend(Backend):
         """
         out: dict[str, Any] = {"x": int(x), "y": int(y)}
         try:
-            hwnd = win32.window_from_point(x, y)
+            # ⚠️ 必须取**顶层**窗口（`_window_under_point` 里做了 `root_ancestor`）。
+            #    2026-09-28 真机实测：直接 `window_from_point` 常拿到**子控件**（编辑区/画布），
+            #    子控件的 `GetWindowText` 是**空**的 → `window_title=None`，于是落点那一行
+            #    显示成『落点：窗口「?」 839x569』—— 模型据此**分不清自己点在哪扇窗上**，
+            #    而落点证据存在的唯一理由就是回答这个问题。
+            #    （先前那条真机断言之所以通过，是因为它取的点正好在标题栏上——那属于
+            #      非客户区，`WindowFromPoint` 直接返回顶层窗。**采样点挑得好掩盖了缺陷**。）
+            hwnd = self._window_under_point(x, y)
             if hwnd:
                 out["window_id"] = f"0x{hwnd:x}"
                 out["window_title"] = win32.window_text(hwnd) or None
