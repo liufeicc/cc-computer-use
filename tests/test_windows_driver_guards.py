@@ -792,3 +792,79 @@ def test_windows_backend_exposes_the_dpi_result_for_diagnostics():
     assert hasattr(WindowsBackend(), "_dpi"), (
         "实例上没有 _dpi —— 感知度设置的结果没被留下，真机排查时无从判断坐标可不可信。"
     )
+
+
+# ==================== ⑩ 墙钟预算必须覆盖「找根窗口」那一段 ====================
+#
+# 2026-09-28 真机实测（`docs/PR/windows-driver/probe_chromium_scale.py`）：
+# Edge（Chromium）读树总耗时 **14.4s**，而 `_TREE_DEADLINE_S` 是 12s ——
+# 原来的 deadline 是在 `_roots_for` **之后**才算起的，而"找根"本身要
+# `ControlFromHandle(hwnd)`，Chromium 的 a11y 是**懒建**的，第一次碰它可能好几秒。
+# 于是**总耗时能超出预算而 notice 是空的** —— 恰好在最需要它说话的时候不说话。
+
+
+def test_tree_deadline_is_armed_before_root_resolution(monkeypatch):
+    """
+    预算必须**先武装**：找根窗口那一段要是超了预算，就不该再往下遍历，且要报出来。
+
+    ⚠️ 判据不能写成"notice 里有墙钟字样"（那只证明最后判过一次），必须证明
+    **遍历真的没发生** —— 否则"预算漏掉了一段"依旧能全绿。
+    """
+    import time as _time
+
+    from computer_use_mcp.backend.windows import backend as bmod
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    b = WindowsBackend()
+    monkeypatch.setattr(bmod, "_TREE_DEADLINE_S", 0.05)
+    monkeypatch.setattr(WindowsBackend, "ensure_available", lambda self: None)
+
+    seen: list[str] = []
+
+    def slow_roots(self, scope, app, deadline=None):  # noqa: ANN001, ANN202
+        _time.sleep(0.2)                    # 比预算还久（模拟 Chromium 懒建树）
+        assert deadline is not None, "找根时应当已经拿到预算（deadline 得先武装）"
+        return [("fake", object())], []
+
+    monkeypatch.setattr(WindowsBackend, "_roots_for", slow_roots)
+    monkeypatch.setattr(WindowsBackend, "_build_tree",
+                        lambda *a, **k: seen.append("build"))
+
+    res = b.get_tree(scope="app", app="fake")
+
+    assert seen == [], (
+        "预算在找根阶段就用完了，却仍然去遍历了 —— 说明 deadline 是在找根**之后**"
+        "才算起的，最慢的那一步（Chromium 首次 ControlFromHandle）落在预算之外。"
+    )
+    assert "墙钟上限" in res.notice, f"超预算没报出来：{res.notice!r}"
+
+
+def test_find_deadline_is_armed_before_root_resolution(monkeypatch):
+    """`find` 同一处形状，同样钉住（它原先也是先找根、后武装预算）。"""
+    import time as _time
+
+    from computer_use_mcp.backend.windows import backend as bmod
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    b = WindowsBackend()
+    monkeypatch.setattr(bmod, "_FIND_DEADLINE_S", 0.05)
+    monkeypatch.setattr(WindowsBackend, "ensure_available", lambda self: None)
+    monkeypatch.setattr(WindowsBackend, "_uia", lambda self: object())
+
+    def slow_elem(self, row):  # noqa: ANN001, ANN202
+        _time.sleep(0.2)
+        return object()
+
+    monkeypatch.setattr(WindowsBackend, "_element_of", slow_elem)
+    # `window_rows` 走驱动层，打桩成两扇窗（全都要 ControlFromHandle）
+    from computer_use_mcp.backend.windows.driver import apps
+    monkeypatch.setattr(apps, "window_rows",
+                        lambda limit=1000: [{"id": "0x1", "app": "a", "title": "A",
+                                             "class": "C"},
+                                            {"id": "0x2", "app": "b", "title": "B",
+                                             "class": "C"}])
+
+    res = b.find(text="x")
+
+    assert res.items == [], "预算在找根阶段就用完了，不该有任何命中"
+    assert "墙钟上限" in res.notice, f"超预算没报出来：{res.notice!r}"

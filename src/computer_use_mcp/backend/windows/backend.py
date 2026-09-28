@@ -19,6 +19,11 @@ Windows 的 UIA 是跨进程 COM，**不会崩宿主**，但**遍历很贵**：�
 `max_nodes=400` 在 Windows 上意味着 5~8 秒。**墙钟 deadline 是必须的**，
 不能只靠节点数上限（这一条是从真机测出来的数字推出来的，不是推测）。
 
+⚠️ 2026-09-28 补测：**Chromium 类应用比上面那个估计还慢** —— Edge 实测暖读
+26.6 ms/节点、冷读 **36.9 ms/节点**，且"首次碰它"（`ControlFromHandle`，会触发
+Chromium 懒建 a11y 树）单独就要 **2.43s**。后者原先落在墙钟预算**之外**，现已纳入
+（见 `get_tree` 里"预算先武装"那段注释）。
+
 ═══ 本轮已实现 / 未实现（诚实边界）═══
 
 已实现：UIA 能覆盖的一切 —— 读树、搜索、元素级动作、坐标注入、窗口枚举，
@@ -90,6 +95,13 @@ _APP_TOUCH_BUDGET = 8
 _TREE_APP_BUDGET = 8
 # 整次 get_tree 的墙钟上限。按 13~21ms/节点反推：400 节点 ≈ 5~8s，
 # 故给到 12s 留出"首次访问 provider 惰性建树"的余量。
+#
+# ⚠️ 2026-09-28 真机实测（`docs/PR/windows-driver/probe_chromium_scale.py`，Edge）：
+# Chromium 类应用**比这个估计慢不少** —— 暖读 26.6 ms/节点、**冷读 36.9 ms/节点**。
+# 于是 12s 在它们身上只够约 300~400 节点，真实网页必然被截断。
+# 这是**刻意的取舍**：宁可给一棵不完整的树并明说"已触墙钟上限"，
+# 也不要让工具调用卡上一分钟（那会把"省往返"这条主线整个吃掉）。
+# 故下面 notice 里的数字写的是**实测区间**（13~37），不再只报乐观的那个下界。
 _TREE_DEADLINE_S = 12.0
 # find 的墙钟上限（搜索比整树遍历更容易失控：它要下钻到叶子）
 _FIND_DEADLINE_S = 10.0
@@ -212,28 +224,37 @@ class WindowsBackend(Backend):
                 "想扫整个桌面请显式用 scope='desktop'。")
         self.ensure_available()
 
-        roots, notices = self._roots_for(scope, app)
+        # ⚠️ **墙钟预算必须先武装，再去找根窗口**（2026-09-28 真机实测改）。
+        #    原先 deadline 在 `_roots_for` **之后**才算起 —— 而 `_roots_for` 会做
+        #    `ControlFromHandle(hwnd)`，Chromium/Electron 的 a11y 是**懒建**的，
+        #    第一次碰它可能要好几秒（实测 Edge：整次读树 14.4s，其中 `_roots_for`
+        #    与首次遍历各占一截）。于是"总耗时"可以远超预算而 notice 是空的 ——
+        #    恰恰在最需要它说话的时候（树最大、最慢）不说。
+        deadline = time.monotonic() + _TREE_DEADLINE_S
+        roots, notices = self._roots_for(scope, app, deadline=deadline)
         forest: list[UINode] = []
         counter = {"n": 0}
-        deadline = time.monotonic() + _TREE_DEADLINE_S
 
         for label, element in roots:
-            if counter["n"] >= max_nodes:
+            if counter["n"] >= max_nodes or time.monotonic() > deadline:
                 break
             forest.append(self._build_tree(label, element, 1, max_depth,
                                            max_nodes, counter, deadline))
-            if time.monotonic() > deadline:
-                notices.append(
-                    f"⚠️ 读树已达**墙钟上限**（{_TREE_DEADLINE_S:.0f}s，本平台遍历约 "
-                    f"13~21ms/节点）：结果不完整，请缩小范围（用 scope='active_window'")
-                break
+        # 超时只在这里判一次：`_build_tree` 内部也会按同一个 deadline 提前收手，
+        # 故"有没有超"与"停在哪"用的是同一个判据，不会出现两处口径不一致。
+        if time.monotonic() > deadline:
+            notices.append(
+                f"⚠️ 读树已达**墙钟上限**（{_TREE_DEADLINE_S:.0f}s，本平台遍历约 "
+                f"13~37ms/节点，Chromium 类应用偏慢）：结果不完整，"
+                f"请缩小范围（用 scope='active_window'）")
         if counter["n"] >= max_nodes:
             notices.append(
                 f"⚠️ 节点数已达上限（{max_nodes}），树被截断；"
                 f"需要更多请调大 max_nodes 或缩小 scope。")
         return QueryResult(items=forest, notice="　".join(notices))
 
-    def _roots_for(self, scope: str, app: str | None) -> tuple[list[tuple[str, Any]], list[str]]:
+    def _roots_for(self, scope: str, app: str | None,
+                   deadline: float | None = None) -> tuple[list[tuple[str, Any]], list[str]]:
         """
         scope → 一组「(应用名, UIA 根元素)」。
 
@@ -245,6 +266,15 @@ class WindowsBackend(Backend):
         """
         uia = self._uia()
         notices: list[str] = []
+
+        def out_of_time() -> bool:
+            """预算用完了没有（`deadline=None` 表示调用方没给预算，按"没超"处理）。"""
+            return deadline is not None and time.monotonic() > deadline
+
+        def deadline_notice(covered: int) -> str:
+            return (f"⚠️ 找根窗口时就已用完墙钟预算（{_TREE_DEADLINE_S:.0f}s），"
+                    f"只覆盖了前 {covered} 个应用；请用 app= 指定目标。")
+
         rows = apps.window_rows(limit=1000)
 
         if scope == "active_window":
@@ -260,12 +290,19 @@ class WindowsBackend(Backend):
                 picked = [r for r in rows if needle in (r["title"] or "").lower()]
             if not picked:
                 return [], [f"没有名为 {app!r} 的应用或窗口"]
-            picked = picked[:_APP_TOUCH_BUDGET]
-            return [(r["app"] or r["title"], self._element_of(r)) for r in picked], notices
+            # ⚠️ 这里也逐窗判预算：`_element_of` 是一次跨进程的 `ControlFromHandle`，
+            #    对 Chromium/Electron 这类懒建树的应用，**第一次**就可能花掉几秒。
+            out: list[tuple[str, Any]] = []
+            for row in picked[:_APP_TOUCH_BUDGET]:
+                if out_of_time():
+                    notices.append(deadline_notice(len(out)))
+                    break
+                out.append((row["app"] or row["title"], self._element_of(row)))
+            return out, notices
 
         # desktop：受应用数预算约束
         seen_apps: set[str] = set()
-        out: list[tuple[str, Any]] = []
+        out = []
         for row in rows:
             key = row["app"] or row["class"]
             if key in seen_apps:
@@ -274,6 +311,9 @@ class WindowsBackend(Backend):
                 notices.append(
                     f"⚠️ 桌面应用数已达上限（{_TREE_APP_BUDGET}），只覆盖了前 "
                     f"{_TREE_APP_BUDGET} 个应用；需要别的应用请用 scope='app' 指定。")
+                break
+            if out_of_time():
+                notices.append(deadline_notice(len(out)))
                 break
             seen_apps.add(key)
             out.append((key, self._element_of(row)))
@@ -374,18 +414,26 @@ class WindowsBackend(Backend):
         text_l = (text or "").lower() or None
         role_l = (role or "").lower() or None
 
+        # ⚠️ 与 `get_tree` 同一条纪律：**预算先武装，再去找搜索根**
+        #    （`_element_of` 是跨进程的 ControlFromHandle，Chromium 这类懒建树的应用
+        #    第一次碰它就可能花掉几秒；放预算外面 = 最慢的那一步不受约束）。
+        deadline = time.monotonic() + _FIND_DEADLINE_S
+
+        rows = apps.window_rows(limit=1000)
         if app:
-            roots = [(r["app"] or r["title"], self._element_of(r))
-                     for r in apps.window_rows(limit=1000)
-                     if (app.lower() in (r["app"] or "").lower()
-                         or app.lower() in (r["title"] or "").lower())][:_APP_TOUCH_BUDGET]
+            cand = [r for r in rows
+                    if (app.lower() in (r["app"] or "").lower()
+                        or app.lower() in (r["title"] or "").lower())]
         else:
-            roots = [(r["app"] or r["class"], self._element_of(r))
-                     for r in apps.window_rows(limit=_APP_TOUCH_BUDGET)]
+            cand = rows[:_APP_TOUCH_BUDGET]
+        roots: list[tuple[str, Any]] = []
+        for r in cand[:_APP_TOUCH_BUDGET]:
+            if time.monotonic() > deadline:
+                break
+            roots.append((r["app"] or r["title"], self._element_of(r)))
 
         hits: list[Element] = []
         notices: list[str] = []
-        deadline = time.monotonic() + _FIND_DEADLINE_S
         seen = {"n": 0}
 
         def visit(label: str, element: Any, depth: int) -> None:  # noqa: ANN401
