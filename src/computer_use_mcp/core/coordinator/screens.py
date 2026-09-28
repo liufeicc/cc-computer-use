@@ -144,9 +144,14 @@ class ScreenMixin:
                     scope_used = "screen"   # 取不到活动窗口（如空桌面）→ 退回全屏
 
         blocks = self.backend.read_text(reg, min_conf=min_conf)
+        # ⚠️ `min_conf` 在有些平台**不生效**（Windows 自带 OCR 没有置信度）。
+        #    不能让它静默变成 no-op —— 模型会以为自己筛掉了低质量结果。
+        #    支持时这段是空串，不占输出。
+        conf_note = self.backend.min_conf_notice(min_conf)
         if not blocks:
-            return ("(未识别到文本。可能：该区域确实没有文字、tesseract 未安装，"
-                    "或语言包缺中文——见 CLAUDE.md 的 OCR 依赖说明)")
+            return ("(未识别到文本。可能：该区域确实没有文字、OCR 引擎缺语言包，"
+                    "或语言包缺中文——见 CLAUDE.md 的 OCR 依赖说明)"
+                    + (f"\n{conf_note}" if conf_note else ""))
 
         truncated = len(blocks) > max_items
         shown = blocks[:max_items]
@@ -156,7 +161,8 @@ class ScreenMixin:
             r = b.rect
             out.append(f"[{ref}] {b.text}  @ ({r.x},{r.y}) {r.w}x{r.h}")
         header = (f"识别范围={scope_used} region={list(reg) if reg else '全屏'}，"
-                  f"共 {len(blocks)} 块文本" + (f"，已截断显示前 {max_items} 块" if truncated else ""))
+                  f"共 {len(blocks)} 块文本" + (f"，已截断显示前 {max_items} 块" if truncated else "")
+                  + (f"\n{conf_note}" if conf_note else ""))
         body = "\n".join(out)
         return (f"{header}\n{body}\n\n"
                 f"（坐标已是**屏幕绝对坐标**，可直接 click(x=..,y=..)；"

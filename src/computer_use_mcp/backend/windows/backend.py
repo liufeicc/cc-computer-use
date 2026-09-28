@@ -29,8 +29,12 @@ Windows 的 UIA 是跨进程 COM，**不会崩宿主**，但**遍历很贵**：�
 且 `pyproject.toml` 早已声明 mss/pillow 为依赖）。**不要再写"抓屏需要独立的平台 API"**——
 那句话是初版的错误判断，实测不成立。
 
-**未实现**：`read_text`（OCR）。它抛明确错误而不是返回空 —— 返回空会被读成
-"界面上没有文字"，把"功能没做"伪装成"没找到"，是本项目最忌讳的静默。
+**未实现**：无 —— 23 个抽象方法 + 全部可选能力（含 OCR）都已落地。
+OCR 走**系统自带的 `Windows.Media.Ocr`**（选型与实测证据见 `driver/ocr.py`），
+不需要随包带 tesseract、也不需要用户装任何东西。
+
+⚠️ 本平台**唯一**的接口不对称：OCR 没有置信度（`SUPPORTS_TEXT_CONFIDENCE = False`），
+`min_conf` 不生效。这一条必须**如实转告**模型，不能让它以为自己筛过了。
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ from ..base import (
     TextBlock,
 )
 from .driver import _uia, actions, apps, nodes, session_info, win32
+from .driver import ocr as ocr_mod
 
 log = get_logger(__name__)
 
@@ -76,12 +81,19 @@ class WindowsBackend(Backend):
 
     name = "windows"
 
+    # ★ 自带 OCR 引擎**不提供置信度**（`OcrWord` 只有 BoundingRect/Text），
+    #   故 `TextBlock.conf` 只能是常数占位、`min_conf` 不生效。
+    #   如实声明它 —— 让参数静默变成 no-op 比不支持它更糟。见 base.py 的说明。
+    SUPPORTS_TEXT_CONFIDENCE = False
+
     def __init__(self) -> None:
         # 刻意**不在 __init__ 里** import uiautomation / 建 COM 对象：
         # 构造发生在 `get_backend()`，而那是任何工具调用都会走的路径；
         # 把重活推迟到真正要用时（首次 `_uia()`），失败面也更容易定位。
         self._uia_mod: Any = None
         self._error: str = ""
+        # OCR 引擎惰性创建：首次要枚举语言、挑引擎，不该在每次构造后端时做
+        self._ocr_reader: Any = None
 
     # ---------- 就绪 ----------
 
@@ -571,20 +583,57 @@ class WindowsBackend(Backend):
     def read_text(self, region: tuple[int, int, int, int] | None = None,
                   min_conf: float = 40.0) -> list[TextBlock]:
         """
-        **本轮未实现** —— OCR 是独立的下一轮切片。
+        OCR 读取一块区域 —— **走系统自带的 `Windows.Media.Ocr`**（不是 tesseract）。
 
-        引擎已经定了：**tesseract**（复用 Linux 上已调优的那条管线——TSV 解析、上采样、
-        PNG `compress_level=1`、`OMP_THREAD_LIMIT=1` 限单线程）。`ocr.py` 的平台耦合只有
-        `display.env_for()` 一处，故移植成本不高；它没做，是因为**本轮的边界是
-        「把点击反馈这条链闭死」**，而 OCR 会引入一个新的「用户需自行安装」项。
+        选型理由与实测证据见 `driver/ocr.py` 的模块 docstring（结论：零安装、无需打包工程、
+        隐藏桌面可用）。这里只负责"抓哪一块"：不传 region 时取**活动窗口**的矩形 ——
+        与 Linux 侧同口径，因为整屏 OCR 明显更慢。
 
-        ⚠️ 抛错而不是返回空列表：返回空会被读成「这个界面上没有文字」，
-        把「功能没做」伪装成「没找到」。
+        ⚠️ `min_conf` **在本平台上不生效**（引擎不提供置信度），见
+        `SUPPORTS_TEXT_CONFIDENCE`。这里刻意不抛错也不假装过滤。
         """
-        raise BackendUnavailableError(
-            "Windows 后端的 read_text（OCR）尚未实现（下一轮的独立切片）。"
-            "当前可用的感知通道是 UIA 无障碍树：get_ui_tree / find_element / element_info。"
-        )
+        region = region or self._active_window_region()
+        if region is None:
+            raise ComputerUseError(
+                "read_text 需要 region，或至少有一个活动窗口可供推断范围"
+            )
+        img, origin = screen.grab_desktop(tuple(int(v) for v in region))
+        return self.read_text_from_image(img, origin, min_conf=min_conf)
+
+    def read_text_from_image(self, img: Any, origin: tuple[int, int],  # noqa: ANN401
+                             min_conf: float = 40.0) -> list[TextBlock]:
+        """
+        对**已经抓好的一张图**做 OCR（不重新抓屏），坐标以 origin 为图像左上角的屏幕位置。
+
+        复用预览图那次抓屏是刻意的：落点文字/偏差识别应该用**同一块像素**，
+        而且要用那张**没画过准星**的原始图（红线横穿文字会降低识别率）。
+
+        ⚠️ 与 Linux 侧的一处**真实差异**，别当成 bug：Windows 引擎不提供置信度，
+        故返回的 `TextBlock.conf` 是**常数占位**（见 `driver/ocr.py` 的 `_CONF_PLACEHOLDER`）。
+        用 `SUPPORTS_TEXT_CONFIDENCE` 如实声明，调用方据此告诉模型 `min_conf` 不生效。
+        """
+        try:
+            return self._ocr().read_image(img, origin, min_conf=min_conf)
+        except BackendUnavailableError:
+            raise                       # 缺包/没语言：是环境问题，直说
+        except Exception as exc:  # noqa: BLE001
+            raise ComputerUseError(f"Windows OCR 失败: {exc}") from exc
+
+    def _ocr(self):  # noqa: ANN202
+        """惰性建 `OcrReader`（首次会枚举语言、挑引擎，不该在 `__init__` 里做）。"""
+        if self._ocr_reader is None:
+            self._ocr_reader = ocr_mod.OcrReader()
+        return self._ocr_reader
+
+    def _active_window_region(self) -> tuple[int, int, int, int] | None:
+        """活动窗口的 (x,y,w,h)；取不到返回 None。"""
+        try:
+            r = self.active_window_rect()
+        except Exception:  # noqa: BLE001
+            return None
+        if r is None or r.is_empty():
+            return None
+        return (int(r.x), int(r.y), int(r.w), int(r.h))
 
     def describe_point(self, x: int, y: int, with_text: bool = False) -> dict[str, Any]:
         """

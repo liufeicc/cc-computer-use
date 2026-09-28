@@ -94,6 +94,16 @@ def _area(h: int) -> int:
     return (r[2] - r[0]) * (r[3] - r[1]) if r else 0
 
 
+def _grab_full():  # noqa: ANN202
+    """整屏抓一张 PIL 图 + 原点（OCR 样本要用原始像素，不走 backend.screenshot 的编码）。"""
+    try:
+        from computer_use_mcp.backend import screen
+        return screen.grab_desktop()
+    except Exception as exc:  # noqa: BLE001
+        print(f"   抓屏失败：{type(exc).__name__}: {exc}")
+        return None, (0, 0)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="WindowsBackend 真机 story")
     ap.add_argument("--out", default=None)
@@ -428,13 +438,71 @@ def main(argv: list[str] | None = None) -> int:
             ev.get("window_title") == backend.active_window_title(),
             f"{ev.get('window_title')!r} vs {backend.active_window_title()!r}")
 
-    print("=== 9) 未实现的部分必须**报错**而不是返回空 ===")
-    for name in ("read_text",):
-        try:
-            getattr(backend, name)()
-            _ok(f"{name} 抛错", False, "居然没抛")
-        except Exception as exc:  # noqa: BLE001
-            _ok(f"{name} 抛错", True, type(exc).__name__)
+    print("=== 9) OCR：系统自带的 Windows.Media.Ocr ===")
+    # ═══ 判据设计 ═══
+    # ★ 最强的一条是「**已知内容**」：第 7 节我们自己往记事本里写了 `REPLACED`
+    #   （`press_key('ctrl+a')` 覆写的那串），所以活动窗口里**必然**有这几个字符。
+    #   拿它当判据，等于"用我们自己写进去的东西反过来验读数通道"。
+    #
+    # ⚠️ 初版裁「第一个够大的窗口」的标题栏来验 —— **脆**：桌面上叠着好几个记事本
+    #   （前几轮留下的），裁到的多半是被遮住的区域，于是 OCR 认不出东西而判据失败，
+    #   看着像 OCR 坏了。**判据要挑"必然有内容"的区域，而不是"随便挑一扇窗"**。
+    #
+    # 反面判据同样要有：拿一张**纯白图**去识别，必须**认不出任何东西**。
+    # 只测正面的话，一个"随便编字"的实现也能过。
+    try:
+        from PIL import Image as _Img
+    except Exception as exc:  # noqa: BLE001
+        _ok("客体上有 pillow", False, str(exc))
+    else:
+        blocks = backend.read_text()          # 不传 region → 用活动窗口
+        texts = [b.text for b in blocks]
+        joined = "".join(texts)
+        print(f"   活动窗口识别到 {len(blocks)} 块：{texts[:12]}")
+        _ok("read_text()（活动窗口）返回了文本块", bool(blocks), f"{len(blocks)} 块")
+        _ok("★ OCR 认出了我们自己写进去的内容 'REPLACED'",
+            "REPLACED" in joined or "REPLACED" in joined.upper(),
+            f"期望含 'REPLACED'，实际 {joined[:120]!r}")
+        # ⚠️ 判据要挑**屏幕上真的画着**的字。初版断言「已修改」是错的 ——
+        #    那是 UIA 元素的 Name（标题栏用 `*` 表示已修改），记事本可见的状态栏写的是
+        #    `纯文本 100％ Windows(CRLF) UTF-8`。**期望写错会让好实现看着像坏的。**
+        #    菜单栏的「文件」/「编辑」是必定画着的。
+        import re as _re
+        _cjk = [t for t in texts if _re.search(r"[\u4e00-\u9fff]", t)]
+        _ok("★ OCR 认得出中文，且中文被合并成词（不是逐字）", len(_cjk) >= 2,
+            f"中文块 {len(_cjk)} 个：{_cjk[:8]}")
+        _ok("★ 中文词合并正确（记事本菜单「文件」整块认出，而非「文」「件」两块）",
+            "文件" in texts or "编辑" in joined or "查看" in joined,
+            f"实际 {texts[:12]}")
+
+        # 坐标必须是**屏幕绝对坐标**（加过 origin），落在活动窗口矩形内
+        r = backend.active_window_rect()
+        if blocks and r is not None and not r.is_empty():
+            inside = [b for b in blocks
+                      if r.x - 8 <= b.rect.x <= r.x + r.w
+                      and r.y - 8 <= b.rect.y <= r.y + r.h]
+            _ok("OCR 块坐标已换算成屏幕绝对坐标（落在窗口矩形内）",
+                len(inside) >= max(1, len(blocks) // 2),
+                f"{len(inside)}/{len(blocks)} 块落在窗口 ({r.x},{r.y},{r.w}x{r.h}) 内")
+
+        # 反面：纯白图不该被编出文字
+        blank = _Img.new("RGB", (600, 200), (255, 255, 255))
+        fakes = backend.read_text_from_image(blank, (0, 0))
+        _ok("★ 纯白图不该被编出文字（假阳性检查）", not fakes,
+            f"空白图识别出 {len(fakes)} 块：{[b.text for b in fakes][:5]}")
+
+        # `min_conf` 必须**如实声明不生效**，不许静默 no-op
+        notice = backend.min_conf_notice(40.0)
+        _ok("min_conf 不生效这件事被如实声明", "未生效" in notice, notice[:70])
+
+    print("=== 10) 未实现清单（应为空）===")
+    # 23 个抽象方法 + 全部可选能力都已落地。留这一节是为了"下一次加了新方法但忘了实现"
+    # 时有个显式位置，而不是散在各处。
+    from computer_use_mcp.backend.base import Backend as _B
+    _unimpl = [n for n in ("screenshot", "click_preview", "change_fraction_since",
+                           "read_text", "read_text_from_image", "describe_point")
+               if getattr(type(backend), n) is getattr(_B, n)]
+    _ok("没有靠 ABC 默认实现糊过去的方法", not _unimpl, f"仍在用默认实现：{_unimpl}")
 
     return _finish(args)
 

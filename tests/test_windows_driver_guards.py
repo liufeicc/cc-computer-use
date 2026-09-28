@@ -426,34 +426,183 @@ def test_windows_backend_is_instantiable_on_this_platform():
     assert "windows" in type(backend).__module__
 
 
-def test_windows_backend_declares_unimplemented_parts_loudly():
+def test_windows_backend_has_no_unimplemented_parts_left():
     """
-    `read_text`（OCR）本平台没实现 —— 必须**抛明确错误**，不许返回空列表。
+    Windows 后端**不该再有"未实现"的方法** —— 有的话必须**响亮抛错**，不许返回空。
 
-    这条守的是一类**认知**错误：返回一个空列表会被模型读成「这儿没有文字」，
-    把"功能没做"伪装成"界面的内容就是这样"。本项目对静默的判据一向是宁可报错
-    （同 `_require_sandbox` 拒绝执行而不是回落宿主）。
+    这条守的是一类**认知**错误：返回一张空图 / 一个空列表，会被模型读成
+    「这个界面是黑的」/「这儿没有文字」，把"功能没做"伪装成"界面的内容就是这样"。
 
-    ⚠️ **`screenshot` 已经不在本清单里了**（2026-09-28）。初版把它算作"需要独立平台 API"
-    而抛错，后来查明那个判断是错的：`mss` 本来就跨平台（Windows 侧走 GDI）且已是
-    声明依赖，真正 Linux 专属的只有「抓哪块屏」。
-    故本清单从两项收窄到一项 —— 这是**推进**，不是放宽：
-    仍要抛错的只剩 OCR 一件。把 `screenshot` 加回这张清单会让本用例变红，
-    提醒你去看 `test_windows_backend_reuses_the_neutral_screen_layer`。
+    ⚠️ 本用例是从旧版**收窄再反转**来的：旧版断言「`screenshot` 与 `read_text` 都必须抛
+    BackendUnavailableError」—— 那是当时的诚实边界。后来 `screenshot` 先落地（查明
+    "抓屏需要独立平台 API"是错误判断），`read_text` 也在 2026-09-28 用系统自带的
+    `Windows.Media.Ocr` 落地。**两项都推进了，所以清单空了** —— 这是好事。
+    把某个方法加回"必须抛错"的清单，说明它是真的又退回去了。
     """
-    import pytest as _pytest
-
     from computer_use_mcp.backend.base import Backend
     from computer_use_mcp.backend.windows.backend import WindowsBackend
-    from computer_use_mcp.utils.errors import BackendUnavailableError
 
-    backend = WindowsBackend()
-    with _pytest.raises(BackendUnavailableError):
-        backend.read_text()
-    # 正控：反过来，已经实现的那三个**不许**再抛"未实现"（否则本用例在自欺）。
-    assert backend.screenshot is not Backend.screenshot
-    assert backend.click_preview is not Backend.click_preview
-    assert backend.change_fraction_since is not Backend.change_fraction_since
+    # 全部可选能力都必须有本平台的实现，不许靠 ABC 默认的 None/[] 糊过去
+    for name in ("screenshot", "click_preview", "change_fraction_since",
+                 "read_text", "read_text_from_image", "describe_point"):
+        assert getattr(WindowsBackend, name) is not getattr(Backend, name), (
+            f"WindowsBackend 没有覆写 {name} —— 它正走 ABC 的默认实现（返回空/None），"
+            f"那会把「功能没做」伪装成「那儿什么都没有」。"
+        )
+
+
+def test_windows_ocr_declares_that_min_conf_is_not_honoured():
+    """
+    ★ 自带 OCR 没有置信度 —— `min_conf` 必须**如实声明不生效**，不许静默变 no-op。
+
+    为什么这条要紧：`get_screen_text` 上挂着 `min_conf` 参数，而 `TextBlock.conf` 的
+    唯一消费点就是按它过滤。Windows 引擎（`Windows.Media.Ocr`）的 `OcrWord` 只有
+    `BoundingRect` 与 `Text`（2026-09-28 实测，词级/行级都没有 confidence 字段），
+    所以 `conf` 只能填常数 —— 于是 `min_conf` 什么都不筛。
+
+    模型若以为筛选发生了，就会把噪声当成可信结果。**让参数静默变 no-op 比不支持它更糟。**
+    """
+    from computer_use_mcp.backend.base import Backend
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    assert WindowsBackend.SUPPORTS_TEXT_CONFIDENCE is False
+    # 正控：别的平台默认为 True（否则这条"声明"就成了全体适用的噪声）
+    assert Backend.SUPPORTS_TEXT_CONFIDENCE is True
+
+    note = WindowsBackend().min_conf_notice(40.0)
+    assert note, "不支持置信度却没给出任何说明 —— min_conf 会静默失效"
+    assert "未生效" in note and "40" in note, f"说明没把「没生效」和取值说清楚：{note!r}"
+
+    # 支持时必须是**空串**（否则每次 get_screen_text 都多一行噪声）。
+    # 这里不实例化 Backend（它是抽象类），只用一个带旗标的最小替身调未绑定方法。
+    class _Supports:
+        SUPPORTS_TEXT_CONFIDENCE = True
+
+    assert Backend.min_conf_notice(_Supports(), 40.0) == ""
+
+
+def test_winrt_is_imported_in_exactly_one_place():
+    """
+    `import winrt` 全仓**只允许出现在** `driver/ocr.py`（同 `_uia.py` 的 uiautomation 纪律）。
+
+    好处：缺包时的错误信息只有一处要维护；换绑定只改一个文件；守卫可以断言这条
+    而不是靠纪律。
+    """
+    importers: list[str] = []
+    for path in _py_files(_SRC):
+        text = path.read_text(encoding="utf-8")
+        tree = ast.parse(text, str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(a.name == "winrt" or a.name.startswith("winrt.")
+                       for a in node.names):
+                    importers.append(str(path.relative_to(_SRC)))
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.module == "winrt" or node.module.startswith("winrt."):
+                    importers.append(str(path.relative_to(_SRC)))
+
+    assert importers, (
+        "全仓没有一处 import winrt —— 本规则的正控失败（OCR 要么没做，要么换了别的绑定）"
+    )
+    allowed = {"backend/windows/driver/ocr.py"}
+    stray = sorted(set(importers) - allowed)
+    assert not stray, (
+        f"这些地方绕过了单点直接 import winrt：{stray}。"
+        f"请改走 backend/windows/driver/ocr.py —— 理由见本用例 docstring。"
+    )
+
+
+# ==================== ③c OCR 的中文合并（纯逻辑，Linux 上可测）====================
+
+class _Word:
+    """照真 UIA/WinRT 形状的假词：只有 `.text` 与 `.bounding_rect`。"""
+
+    def __init__(self, text: str, x: float, y: float, w: float, h: float) -> None:
+        self.text = text
+        self.bounding_rect = type("R", (), {"x": x, "y": y, "width": w, "height": h})()
+
+
+def test_ocr_merges_consecutive_cjk_chars_into_one_block():
+    """
+    ★ **中文必须合并**，否则 `get_screen_text` 会逐字列出，模型读不出词。
+
+    Windows OCR 把中文逐字切成 word（`了解有关此图片的信息` → 6 个各含一字的词），
+    若照搬"一个词一个 TextBlock"，输出会是：
+        `[5] 了 @ (982,83)`、`[6] 解 @ (999,83)` …
+    —— 模型找不到「回收站」这个词，也就不知道该点哪儿，而这正是该工具存在的唯一理由。
+
+    判据取**文本**（是不是单个 CJK 字符）而不是几何间距：后者要靠实测调阈值，
+    标点间距与字号都会让它飘。
+    """
+    from computer_use_mcp.backend.windows.driver.ocr import _merge_runs
+
+    words = [_Word(t, 100 + i * 17, 50, 17, 16) for i, t in enumerate("回收站")]
+    got = _merge_runs(words)
+    assert len(got) == 1, f"三个中文单字应并成一块，实际 {got}"
+    text, box = got[0]
+    assert text == "回收站"
+    # 并集矩形：起点取最左，宽度覆盖整段 —— 中心才是这段文字的中心
+    assert box[0] == 100 and box[2] == 17 * 3, f"并集矩形不对：{box}"
+
+
+def test_ocr_keeps_latin_words_separate():
+    """拉丁词**不许**合并 —— 与 tesseract / Linux 侧的口径一致。"""
+    from computer_use_mcp.backend.windows.driver.ocr import _merge_runs
+
+    got = _merge_runs([_Word("Microsoft", 0, 0, 60, 16), _Word("Edge", 70, 0, 30, 16)])
+    assert [t for t, _ in got] == ["Microsoft", "Edge"], got
+
+
+def test_ocr_mixed_cjk_and_latin_merges_only_the_cjk_run():
+    """混排：中文段并成一块，拉丁词各自成块，顺序不变。"""
+    from computer_use_mcp.backend.windows.driver.ocr import _merge_runs
+
+    words = ([_Word(t, i * 17, 0, 17, 16) for i, t in enumerate("回收站")]
+             + [_Word("Microsoft", 60, 0, 60, 16)]
+             + [_Word(t, 130 + i * 17, 0, 17, 16) for i, t in enumerate("文件夹")])
+    got = _merge_runs(words)
+    assert [t for t, _ in got] == ["回收站", "Microsoft", "文件夹"], got
+
+
+def test_ocr_strips_only_the_spaces_between_cjk():
+    """
+    「CJK 空格 CJK」里的空格是引擎硬加的，要消掉；**拉丁词之间的空格是真的，不能动**。
+
+    实测 Windows 的行级 `text` 就是带空格的：`'了 解 有 关 此 图'`。
+    """
+    from computer_use_mcp.backend.windows.driver.ocr import _CJK_SPACE
+
+    assert _CJK_SPACE.sub("", "了 解 有 关") == "了解有关"
+    assert _CJK_SPACE.sub("", "Microsoft Edge") == "Microsoft Edge"
+    # 中↔拉之间那个空格**要保留**（它是真的排版空格，不是引擎硬加的）
+    assert _CJK_SPACE.sub("", "回 收 站 Microsoft Edge") == "回收站 Microsoft Edge"
+
+
+def test_ocr_blocks_offset_by_origin():
+    """
+    ★ OCR 给的是**图内像素**，返回必须是**屏幕绝对坐标**（加 origin）。
+
+    漏了这一步的表现：模型拿到一组"看起来合理"的坐标，点下去整体偏一个截图原点，
+    而没有任何报错 —— 与 `grab_rgb` 的 origin 契约同一类坑。
+    """
+
+    class _R:
+        lines = None
+
+        def __init__(self) -> None:
+            ln = type("L", (), {})()
+            ln.words = [_Word("文", 10, 20, 17, 16), _Word("字", 27, 20, 17, 16)]
+            ln.text = "文 字"
+            self.lines = [ln]
+
+    from computer_use_mcp.backend.windows.driver.ocr import OcrReader
+
+    blocks = OcrReader._blocks_from_result(_R(), (1000, 500))
+    assert len(blocks) == 1
+    b = blocks[0]
+    assert b.text == "文字"
+    assert (b.rect.x, b.rect.y) == (1010, 520), f"没加上 origin：{b.rect}"
+    assert b.conf > 0, "conf 是占位常数，但不应为 0（会被 min_conf 默认 40 滤掉）"
 
 
 def test_windows_backend_reuses_the_neutral_screen_layer():

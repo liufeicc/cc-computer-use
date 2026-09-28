@@ -20,6 +20,20 @@ dependencies = [
     # 点击光圈用（backend/linux/ring.py）：纯 Python 的 X11 客户端，走 socket、不链 libX11，
     # 故不引入「产物库与系统库混装」那类风险。缺包时只是光圈不显示，点击照常。
     "python-xlib",
+    # Windows OCR：调**系统自带**的 Windows.Media.Ocr（backend/windows/driver/ocr.py）。
+    # 选它的理由（真机实测）：零安装、无需打包工程、隐藏桌面可用 —— 详见该模块 docstring。
+    #
+    # ⚠️ 必须带平台标记：这些包**只有 win_amd64 的 wheel**，Linux 上装会退化成源码构建并失败。
+    # ⚠️ winrt-Windows.Foundation / .Collections 不会被自动拉进来（实测漏装会让
+    #    `available_recognizer_languages` 报 ModuleNotFoundError），故显式列出。
+    "winrt-runtime; sys_platform == 'win32'",
+    "winrt-Windows.Media.Ocr; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging; sys_platform == 'win32'",
+    "winrt-Windows.Storage; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams; sys_platform == 'win32'",
+    "winrt-Windows.Globalization; sys_platform == 'win32'",
+    "winrt-Windows.Foundation; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

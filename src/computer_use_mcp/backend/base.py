@@ -229,6 +229,29 @@ class Backend(ABC):
     SELECT_ALL_COMBO: str = "ctrl+a"
     DELETE_KEY: str = "Delete"
 
+    # OCR 出来的文本块**有没有置信度**（`TextBlock.conf` 是不是真值）。
+    #
+    # 为什么要有这个旗标：`get_screen_text` 上挂着 `min_conf` 参数，而 `conf` 的唯一
+    # 消费点就是按它过滤。Windows 自带引擎（`Windows.Media.Ocr`）**不提供置信度** ——
+    # `OcrWord` 只有 `BoundingRect` 与 `Text`。那时 `conf` 只能填常数，`min_conf`
+    # 于是**静默失效**：模型以为自己筛掉了低质量结果，其实什么都没筛。
+    #
+    # 所以声明它不是"可选装饰"，而是让调用方**如实转告**模型「本平台 min_conf 不生效」。
+    # 让参数静默变成 no-op，比不支持它更糟。
+    SUPPORTS_TEXT_CONFIDENCE: bool = True
+
+    def min_conf_notice(self, min_conf: float) -> str:
+        """
+        本平台对 `min_conf` 的说明；能如实履行时返回空串（**不占输出**）。
+
+        为什么做成方法而不是让调用方读旗标：措辞要能随平台变，而且**不支持时
+        必须把"我在骗你"这件事说清楚** —— 只回一句"不支持"模型还是会以为筛选发生了。
+        """
+        if self.SUPPORTS_TEXT_CONFIDENCE:
+            return ""
+        return (f"⚠️ 本平台 OCR 不提供置信度，min_conf={min_conf:g} **未生效**"
+                f"（返回的文本块没有经过任何质量筛选，请自行判断）。")
+
     @abstractmethod
     def is_available(self) -> bool:
         """当前平台/会话是否可用（AT-SPI 能加载、无障碍开关已开等）。"""
