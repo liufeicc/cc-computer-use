@@ -798,6 +798,17 @@ class WindowsBackend(Backend):
 
         Linux 侧的同名方法比这里多一步 `ring.clear_now()`（先把屏上的点击光圈抹掉）——
         光圈是 X11 专属的观感层，Windows 没有，故**这一步不存在**，而不是漏了。
+
+        ⚠️⚠️ **隐藏桌面上这条会失败**（2026-09-28 实测，`:300` 起的隐藏桌面里
+        `mss` 的 `BitBlt` 直接抛 `ScreenShotError`）。根因是**屏幕 DC 属于交互桌面**：
+        非交互桌面上没有显示设备在渲染，从屏幕 DC 拷贝必然失败。
+        **可用的替代品是 `PrintWindow(hwnd, PW_RENDERFULLCONTENT)`**（按窗口渲染，
+        不经过屏幕 DC）—— 同一次实测里 `api_ok=True`、灰度极差 249，且拿它喂 OCR
+        能认出刚写进去的文字。将来真做"隐藏桌面隔离"时，**抓屏这一路必须换成按窗口
+        渲染**，`click_preview` / `change_fraction_since` 同理（它们都建立在同一张图上）。
+        同一次实测还发现 `SendInput` 在隐藏桌面上返回 `sent: 0 / GetLastError=5`
+        （ERROR_ACCESS_DENIED）—— 即**坐标级注入也不可用**，只有元素级 UIA 动作可用。
+        探针与数据：`docs/PR/windows-driver/probe_hidden_desktop_input.py`。
         """
         img, origin = screen.grab_desktop(region)
         return screen.encode_image(img, origin, region=region,
