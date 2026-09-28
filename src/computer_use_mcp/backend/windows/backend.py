@@ -21,9 +21,15 @@ Windows 的 UIA 是跨进程 COM，**不会崩宿主**，但**遍历很贵**：�
 
 ═══ 本轮已实现 / 未实现（诚实边界）═══
 
-已实现：UIA 能覆盖的一切 —— 读树、搜索、元素级动作、坐标注入、窗口枚举。
-**未实现**：`screenshot` 与 `read_text`（抓屏与 OCR 需要各自的一套平台 API，
-是独立的下一轮）。它们**抛明确错误**而不是返回空 —— 返回空会被读成
+已实现：UIA 能覆盖的一切 —— 读树、搜索、元素级动作、坐标注入、窗口枚举，
+以及**抓屏与点击反馈**（`screenshot` / `click_preview` / `change_fraction_since`）。
+
+⚠️ 这三样的平台相关部分**只有「抓哪块屏」这一件事**，而 Windows 没有 DISPLAY 这个概念，
+所以像素活全部复用平台中立的 `backend/screen.py`（`mss` 本来就跨平台，Windows 侧走 GDI，
+且 `pyproject.toml` 早已声明 mss/pillow 为依赖）。**不要再写"抓屏需要独立的平台 API"**——
+那句话是初版的错误判断，实测不成立。
+
+**未实现**：`read_text`（OCR）。它抛明确错误而不是返回空 —— 返回空会被读成
 "界面上没有文字"，把"功能没做"伪装成"没找到"，是本项目最忌讳的静默。
 """
 
@@ -33,10 +39,13 @@ import time
 from typing import Any
 
 from ...utils.errors import BackendUnavailableError, ComputerUseError
+from ...utils.logging import get_logger
+from .. import screen
 from ..base import (
     ACTIONABLE_ROLES,
     UINode,
     Backend,
+    ClickPreview,
     Element,
     ElementDetail,
     QueryResult,
@@ -44,6 +53,8 @@ from ..base import (
     TextBlock,
 )
 from .driver import _uia, actions, apps, nodes, session_info, win32
+
+log = get_logger(__name__)
 
 # ── 预算（口径见模块 docstring）──────────────────────────────────────────
 #
@@ -555,49 +566,57 @@ class WindowsBackend(Backend):
             return False
         return bool(win32.send_key_combo(vks).get("ok"))
 
-    # ---------- 本轮未实现（诚实报错，不返回空）----------
-
-    def screenshot(self, region: tuple[int, int, int, int] | None = None,
-                   max_side: int | None = None, fmt: str = "jpeg",
-                   quality: int = 85) -> tuple[bytes, dict[str, Any]]:
-        """
-        **本轮未实现** —— 抓屏需要一套独立的平台 API（`BitBlt`/`PrintWindow`），
-        是下一轮的独立切片。
-
-        ⚠️ 这里**抛错而不是返回空图**：返回一张空图会被模型当成"这个界面是黑的"，
-        把"功能没做"伪装成"界面内容如此"。本项目对"静默"的判据一向是宁可报错。
-        """
-        raise BackendUnavailableError(
-            "Windows 后端的 screenshot 尚未实现（抓屏是下一轮的独立切片）。"
-            "当前可用的感知通道是 UIA 无障碍树：get_ui_tree / find_element / element_info。"
-        )
+    # ---------- 本轮仍未实现（诚实报错，不返回空）----------
 
     def read_text(self, region: tuple[int, int, int, int] | None = None,
                   min_conf: float = 40.0) -> list[TextBlock]:
-        """**本轮未实现** —— OCR 需要另一套引擎（`Windows.Media.Ocr` 或随包 tesseract）。"""
+        """
+        **本轮未实现** —— OCR 是独立的下一轮切片。
+
+        引擎已经定了：**tesseract**（复用 Linux 上已调优的那条管线——TSV 解析、上采样、
+        PNG `compress_level=1`、`OMP_THREAD_LIMIT=1` 限单线程）。`ocr.py` 的平台耦合只有
+        `display.env_for()` 一处，故移植成本不高；它没做，是因为**本轮的边界是
+        「把点击反馈这条链闭死」**，而 OCR 会引入一个新的「用户需自行安装」项。
+
+        ⚠️ 抛错而不是返回空列表：返回空会被读成「这个界面上没有文字」，
+        把「功能没做」伪装成「没找到」。
+        """
         raise BackendUnavailableError(
-            "Windows 后端的 read_text（OCR）尚未实现。"
-            "若目标应用有 UIA 树，请优先用 get_ui_tree —— 那比 OCR 快且准。"
+            "Windows 后端的 read_text（OCR）尚未实现（下一轮的独立切片）。"
+            "当前可用的感知通道是 UIA 无障碍树：get_ui_tree / find_element / element_info。"
         )
 
     def describe_point(self, x: int, y: int, with_text: bool = False) -> dict[str, Any]:
         """
-        落点证据：这个坐标下面是哪个窗口/控件（**不含 OCR**）。
+        落点证据：这个坐标下面是哪扇窗、底下的控件叫什么。
 
-        ⚠️ Linux 侧的同名方法在 `with_text=True` 时会做一小块 OCR 读出落点文字。
-        这边 OCR 未实现，故 `with_text` **只影响是否附带控件名字**（UIA 的 `Name`），
-        **绝不**假装读了像素 —— 报告里因此没有"落点文字"字段而不是给一个空串，
-        后者会被读成"那儿没字"。
+        ⚠️⚠️ **键名必须与 ABC 契约一致**（`backend/base.py:449-453`）：
+        `{"x","y","window_id","window_title","window_rect","text","conf"}`。
+
+        初版这里返回的是 `{"point","window","class","hwnd","control","control_type"}`——
+        自造了一套方言。后果是消费方 `core/coordinator/landing.py:358-364` 读
+        `ev.get("window_title")` / `ev.get("window_rect")` **恒为 None**，于是
+        「落点：窗口「…」 WxH」整行**静默消失**，不报错、不掉任何测试。
+        而落点证据正是「`ok=True` 只说明事件发出去了」这句话的解药。
+        改法是**这边向契约对齐**，不是改消费方去兼容两种方言——那会让契约变成两份。
+
+        与 Linux 侧的差异（如实记下，不假装）：
+          · 落点**文字**（`text`/`conf`）来自 OCR，本平台未实现 → **这两个键不出现**
+            （而不是给空串：空串会被读成「那儿没字」）。
+          · `with_text=True` 时改报 UIA 的控件名与类型，用 `control`/`control_type` 两个
+            **额外**键（Linux 没有对应物，不冲突）。注意 UIA 的 `Name` **不是**像素上
+            写着的字，别把它当 OCR 结果读。
+          · `window_id` 是 HWND，格式与 Linux 的 X11 窗口 id 一样只作标识用。
         """
-        out: dict[str, Any] = {"point": [x, y]}
+        out: dict[str, Any] = {"x": int(x), "y": int(y)}
         try:
             hwnd = win32.window_from_point(x, y)
             if hwnd:
-                out["window"] = win32.window_text(hwnd) or None
-                out["class"] = win32.class_name(hwnd)
-                out["hwnd"] = f"0x{hwnd:x}"
+                out["window_id"] = f"0x{hwnd:x}"
+                out["window_title"] = win32.window_text(hwnd) or None
+                out["window_rect"] = list(win32.window_rect(hwnd) or []) or None
             else:
-                out["window"] = None
+                out["window_title"] = None
         except Exception:  # noqa: BLE001 —— 落点证据绝不让主操作失败
             pass
         if with_text:
@@ -609,3 +628,67 @@ class WindowsBackend(Backend):
             except Exception:  # noqa: BLE001
                 pass
         return out
+
+    # ---------- 抓屏与点击反馈（平台中立的像素活交给 backend/screen.py）----------
+    #
+    # 为什么这里几乎不用写平台代码：`mss` 本来就是跨平台的（Windows 侧走 GDI），
+    # 而 `pyproject.toml` 早已把 mss/pillow 声明成依赖。Linux 侧真正专属的只有
+    # **「抓哪块屏」**（`core/display.effective_display()`）与旧版 mss 的换 env 兼容路径
+    # —— Windows 没有 DISPLAY 这个概念，那个问题不存在。
+    #
+    # ⚠️ 本模块的 docstring 里原先写着「抓屏需要一套独立的平台 API（BitBlt/PrintWindow）」，
+    #    那句话**是错的**（已改）。真正的分工是 `backend/screen.py` 出像素活、
+    #    `backend/linux/grab.py` 出「抓哪块屏」—— 见 screen.py 的模块 docstring。
+
+    def screenshot(self, region: tuple[int, int, int, int] | None = None,
+                   max_side: int | None = None, fmt: str = "jpeg",
+                   quality: int = 85) -> tuple[bytes, dict[str, Any]]:
+        """
+        截图，返回 (bytes, meta)。灰区兜底。
+
+        Linux 侧的同名方法比这里多一步 `ring.clear_now()`（先把屏上的点击光圈抹掉）——
+        光圈是 X11 专属的观感层，Windows 没有，故**这一步不存在**，而不是漏了。
+        """
+        img, origin = screen.grab_desktop(region)
+        return screen.encode_image(img, origin, region=region,
+                                   max_side=max_side, fmt=fmt, quality=quality)
+
+    def click_preview(self, x: int, y: int) -> ClickPreview | None:
+        """
+        抓「点击前」以落点为中心的小图并画准星 —— 它是**四样反馈的总开关**。
+
+        为什么它最要紧：消费方 `core/coordinator/landing.py` 里，本方法返回 None 会
+        **连锁掐掉全部四样**反馈（预览图 / 落点文字 / 偏差数值 / 点后变化）。
+        故它不是"锦上添花的一张图"，是整套坐标点击可信度的入口。
+
+        平台相关的只有抓屏那一句；裁剪、准星、编码都在 `screen.build_click_preview`
+        （它的 docstring 记着「准星像素 = 落点 − 裁剪后原点」为什么不能写死半宽）。
+        """
+        try:
+            x, y = int(x), int(y)
+            region = (x - screen.PREVIEW_HALF_W, y - screen.PREVIEW_HALF_H,
+                      screen.PREVIEW_HALF_W * 2, screen.PREVIEW_HALF_H * 2)
+            img, origin = screen.grab_desktop(region)
+            return screen.build_click_preview(img, origin, x, y, region=region)
+        except Exception as exc:  # noqa: BLE001 —— 预览图是附加证据，绝不拖垮点击
+            log.debug("click_preview 失败（不影响点击）: %s", exc)
+            return None
+
+    def change_fraction_since(self, region: tuple[int, int, int, int],
+                              before: Any) -> float | None:  # noqa: ANN401
+        """
+        再抓同一块并与 before（**原始图**，不是画过准星的那张）比较，返回变化像素占比；
+        任何失败返回 None —— 证据不得拖垮点击。
+        """
+        if before is None:
+            return None
+        try:
+            after, _origin = screen.grab_desktop(tuple(int(v) for v in region))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("点后抓屏失败（跳过变化对比）: %s", exc)
+            return None
+        try:
+            return screen.changed_fraction(before, after)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("变化对比失败: %s", exc)
+            return None

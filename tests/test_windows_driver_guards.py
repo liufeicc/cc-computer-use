@@ -428,18 +428,50 @@ def test_windows_backend_is_instantiable_on_this_platform():
 
 def test_windows_backend_declares_unimplemented_parts_loudly():
     """
-    `screenshot` / `read_text` 本轮没实现 —— 必须**抛明确错误**，不许返回空。
+    `read_text`（OCR）本平台没实现 —— 必须**抛明确错误**，不许返回空列表。
 
-    这条守的是一类**认知**错误：返回一张空图 / 一个空列表，会被模型读成
-    「这个界面是黑的」/「这儿没有文字」，把"功能没做"伪装成"界面的内容就是这样"。
-    本项目对静默的判据一向是宁可报错（同 `_require_sandbox` 拒绝执行而不是回落宿主）。
+    这条守的是一类**认知**错误：返回一个空列表会被模型读成「这儿没有文字」，
+    把"功能没做"伪装成"界面的内容就是这样"。本项目对静默的判据一向是宁可报错
+    （同 `_require_sandbox` 拒绝执行而不是回落宿主）。
+
+    ⚠️ **`screenshot` 已经不在本清单里了**（2026-09-28）。初版把它算作"需要独立平台 API"
+    而抛错，后来查明那个判断是错的：`mss` 本来就跨平台（Windows 侧走 GDI）且已是
+    声明依赖，真正 Linux 专属的只有「抓哪块屏」。
+    故本清单从两项收窄到一项 —— 这是**推进**，不是放宽：
+    仍要抛错的只剩 OCR 一件。把 `screenshot` 加回这张清单会让本用例变红，
+    提醒你去看 `test_windows_backend_reuses_the_neutral_screen_layer`。
     """
     import pytest as _pytest
 
+    from computer_use_mcp.backend.base import Backend
     from computer_use_mcp.backend.windows.backend import WindowsBackend
     from computer_use_mcp.utils.errors import BackendUnavailableError
 
     backend = WindowsBackend()
-    for method, args in (("screenshot", ()), ("read_text", ())):
-        with _pytest.raises(BackendUnavailableError):
-            getattr(backend, method)(*args)
+    with _pytest.raises(BackendUnavailableError):
+        backend.read_text()
+    # 正控：反过来，已经实现的那三个**不许**再抛"未实现"（否则本用例在自欺）。
+    assert backend.screenshot is not Backend.screenshot
+    assert backend.click_preview is not Backend.click_preview
+    assert backend.change_fraction_since is not Backend.change_fraction_since
+
+
+def test_windows_backend_reuses_the_neutral_screen_layer():
+    """
+    Windows 的抓屏/预览/点后对比必须复用 `backend/screen.py`，**不许自己写一套像素活**。
+
+    为什么值得钉住：初版把这三样判成「需要 BitBlt/PrintWindow 的独立平台 API」，
+    于是 Windows 上半点反馈都没有（`click_preview` 返回 None 会**连锁掐掉全部四样**
+    反馈：预览图 / 落点文字 / 偏差数值 / 点后变化）。而事实是它们的平台相关部分
+    只有「抓哪块屏」一句话。
+
+    判据是**源码文本**（导入关系），不是行为 —— 因为行为在 Linux 上跑不了
+    （`grab_desktop` 要真屏）。所以配一条正控：`screen` 模块本身必须真的被导入。
+    """
+    src = (_WINPKG / "backend.py").read_text(encoding="utf-8")
+    assert "from .. import screen" in src, (
+        "Windows 后端没有导入 backend/screen.py —— 抓屏要么没做，要么又自己写了一套。"
+    )
+    for call in ("screen.grab_desktop(", "screen.encode_image(",
+                 "screen.build_click_preview(", "screen.changed_fraction("):
+        assert call in src, f"Windows 后端里找不到 {call} —— 中立的像素层没被用上。"

@@ -1,5 +1,5 @@
 """
-屏幕抓取（backend/linux/grab）—— 截图与 OCR 共用的**唯一**抓屏入口。
+屏幕抓取（backend/linux/grab）—— Linux 侧「抓哪块屏」的**唯一**入口。
 
 为什么要单独一层：截图（backend.screenshot）与 OCR（ocr.OcrReader）都要把某个 display
 的像素抓成 PIL 图像，而「抓哪个屏」必须经 core/display.effective_display()（沙箱隔离的
@@ -10,6 +10,23 @@
 （`display.host_display()` → `user_inside_sandbox` 的礼让检查），而 GRAB_LOCK 只挡得住
 grab_rgb 彼此。故首次抓屏会探测一次 `mss.mss(display=…)` 是否可用，可用就**再也不动 env**，
 锁也一并省掉；只有旧版 mss 才走那条带副作用的兼容路径。
+
+═══ ★ 与本层的分工：纯像素的活已经搬去 `backend/screen.py` ═══
+
+`clamp_region` / `draw_crosshair` / `changed_fraction` 是**纯 PIL/纯算术**，跟平台无关，
+故实现在 `backend/screen.py`，本模块只**重导出**它们：
+
+    from ..screen import changed_fraction, clamp_region as _clamp_region, draw_crosshair
+
+⚠️ 重导出**不是为了好看**，是为了让 `tests/` 里 20+ 处
+`monkeypatch.setattr(grab_mod, "<名字>", …)` 继续生效（名字与对象都还在）。
+⚠️ 由此有一条必须守的纪律：**Linux 的生产代码继续经 `grab.*` 调用这三个名字**
+（`grab.draw_crosshair` 这种属性查找），别改调 `screen.*` —— 那样补丁会**静默打空**
+（名字还在、setattr 成功，但生产代码不再读它 → 用例照绿而零覆盖）。
+只有 Windows 才直接调 `screen.*`。
+
+留下来的全是**真的只属于 Linux** 的东西：`effective_display()`（抓哪块屏）、
+旧版 mss 的换 env 兼容路径与它的锁。
 """
 
 from __future__ import annotations
@@ -21,6 +38,10 @@ from typing import Any
 from ...core import display
 from ...utils.errors import BackendUnavailableError, ComputerUseError
 from ...utils.logging import get_logger
+# ★ 平台中立的三件（实现在 backend/screen.py）。重导出**是刻意的**：保住
+#   `monkeypatch.setattr(grab_mod, "<名字>", …)` 这些补丁点（理由见模块 docstring）。
+#   ⚠️ 生产代码继续经 `grab.*` 调它们，别改调 `screen.*`。
+from ..screen import changed_fraction, clamp_region as _clamp_region, draw_crosshair  # noqa: F401
 
 log = get_logger(__name__)
 
@@ -47,37 +68,6 @@ def _probe_display_kwarg(disp: str) -> bool:
         return True
     except TypeError:
         return False
-
-
-def _clamp_region(
-    region: tuple[int, int, int, int], virtual: dict,
-) -> dict[str, int]:
-    """
-    把 region 与「全部显示器并集」求交，返回 mss 的 monitor dict（M-39）。
-
-    为什么必须 clamp：`describe_point(with_text=True)` 的落点文字探测框是「落点周围
-    半宽 160 / 半高 32」，在**屏幕边缘**必然越界（x=50 → left=-110）。mss 对越界矩形
-    直接抛 ScreenShotError，被 `_text_near` 吞掉 —— 结果是屏幕边缘的按钮**永远拿不到
-    落点文字**，而且失败原因被静默，看起来像「那儿没字」。
-
-    ⚠️ 原点取**裁剪后**的左上角（返回值里的 left/top），不是原始 region 的左上角：
-    调用方（OCR / `_text_near`）用「原点 + 图内偏移」换算屏幕坐标，用原始值会让
-    边缘那一块的文字坐标整体偏出去。
-    """
-    vx, vy = int(virtual["left"]), int(virtual["top"])
-    vw, vh = int(virtual["width"]), int(virtual["height"])
-    x, y, w, h = (int(v) for v in region)
-
-    left = max(x, vx)
-    top = max(y, vy)
-    right = min(x + w, vx + vw)
-    bottom = min(y + h, vy + vh)
-    if right <= left or bottom <= top:
-        raise ComputerUseError(
-            f"截图区域完全落在屏幕之外: region={[x, y, w, h]}，"
-            f"屏幕并集=({vx},{vy},{vw}x{vh})"
-        )
-    return {"left": left, "top": top, "width": right - left, "height": bottom - top}
 
 
 def _grab_raw(disp: str, region: tuple[int, int, int, int] | None, use_kwarg: bool):
@@ -173,67 +163,3 @@ def grab_rgb(
         raise ComputerUseError(f"抓屏像素解码失败: {exc}") from exc
     return img, origin
 
-
-def draw_crosshair(
-    img: Any, px: int, py: int, color: tuple[int, int, int] = (255, 0, 0),
-    radius: int = 16, arm: int = 26,
-) -> None:
-    """
-    就地在图上画「十字准星」（红十字 + 小圆环），标出**实际落点**在图中哪个像素。
-
-    两点刻意的设计：
-      1. **先画深色描边、再叠红色**：纯红细线在深色/红色 UI 上会消失（灰区应用深色主题
-         很常见），而准星一旦看不见，这张图就从「证据」变成「误导」。描边让它在任何
-         底色上都可辨。
-      2. **只画线，不写字**：图像上的文字要选字体、吃分辨率、还可能被 OCR 当成界面文本；
-         落点的坐标本来就在 meta 文本里（更精确、更省 token）。
-
-    为什么画在**图上**而不是屏幕上的光圈（见 ring.py）：光圈是给人看的、随点击闪一下
-    就没了；准星是给模型看的、必须与「点击前那一瞬」的像素绑定在一起。
-
-    就地修改（返回 None），不碰编码——编码仍由调用方在**唯一**位点完成。
-    """
-    from PIL import ImageDraw
-
-    d = ImageDraw.Draw(img)
-    # 深色描边（粗一层），保证在亮底/暗底上都看得见
-    d.line([(px - arm, py), (px + arm, py)], fill=(0, 0, 0), width=3)
-    d.line([(px, py - arm), (px, py + arm)], fill=(0, 0, 0), width=3)
-    d.ellipse([px - radius - 1, py - radius - 1, px + radius + 1, py + radius + 1],
-              outline=(0, 0, 0), width=3)
-    # 红色主体
-    d.line([(px - arm, py), (px + arm, py)], fill=color, width=1)
-    d.line([(px, py - arm), (px, py + arm)], fill=color, width=1)
-    d.ellipse([px - radius, py - radius, px + radius, py + radius], outline=color, width=1)
-
-
-def changed_fraction(
-    img_a: Any, img_b: Any, threshold: int = 20,
-) -> float:
-    """
-    两张**同尺寸**图之间「变化像素的占比」（0.0~1.0），用于判断点击有没有被界面响应。
-
-    为什么需要它：`ok=True` 只说明「事件发出去了」。同一小块在**点前/点后**各拍一张再比，
-    「几乎没变」就是「这一下大概率点空了」的物理证据——它**不需要知道模型想点谁**，
-    是对「落点文字/偏差数值」的独立第二信号（两者一起看才不易误判：偏 45px 但界面变了
-    = 按钮热区比文字大、其实点中了）。
-
-    判据用「灰度差 > threshold 的像素占比」而非逐像素相等：光标闪烁、抗锯齿、动画这类
-    噪声会让逐像素比较永远为「变」，那样这个信号就没用了。
-
-    尺寸不同（屏幕布局在两次抓取之间变了）时抛 ComputerUseError——不是同尺寸的图比较
-    没有意义，静默返回 0 会被读成「界面没变」。
-    """
-    from PIL import ImageChops
-
-    if img_a.size != img_b.size:
-        raise ComputerUseError(
-            f"变化对比的两张图尺寸不一致: {img_a.size} vs {img_b.size}（屏幕布局变了？）"
-        )
-    diff = ImageChops.difference(img_a.convert("L"), img_b.convert("L"))
-    total = img_a.size[0] * img_a.size[1]
-    if total <= 0:
-        return 0.0
-    hist = diff.histogram()
-    changed = sum(hist[threshold + 1:])   # 灰度差 > threshold 视为「变了」
-    return changed / total

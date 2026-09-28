@@ -77,7 +77,14 @@ _DISPLAY_IMPORTERS_ALLOWED = {
 }
 
 # `core/` 不得 import 的平台 backend 包前缀（`backend.base` 不在其中，那是契约本身）。
-_PLATFORM_BACKEND_PREFIXES = ("backend.linux.", "backend.windows.", "backend.mac.")
+#
+# ⚠️ `backend.screen.` 也在内（2026-09-28 加）：它**名字上**是平台的，但内容是平台中立的
+# 像素工具（mss/PIL）。加进来不是说它"属于某个平台"，而是因为**它同样不是契约**——
+# `core/` 要用后端能力只能经 `backend.base` 的 ABC（`self.backend.screenshot(...)`），
+# 不该直接去摸实现层的工具函数。这条前缀少一个，这一整类越界就**静默不设防**：
+# 守卫照绿，因为它压根没在看那个模块。
+_PLATFORM_BACKEND_PREFIXES = ("backend.linux.", "backend.windows.", "backend.mac.",
+                              "backend.screen.")
 
 
 def _rel_py_files(root: pathlib.Path) -> list[pathlib.Path]:
@@ -155,7 +162,10 @@ def test_core_does_not_reach_into_platform_backends():
     #    更严的正则来"证明尺子好用"——那种自证是循环论证。
     for form in ("from ..backend.linux.atspi import ACTIONABLE_ROLES",
                  "from computer_use_mcp.backend.windows.driver import uia",
-                 "import backend.mac.session"):
+                 "import backend.mac.session",
+                 # ⚠️ 新加的前缀必须**在这条正控里出现**：不出现的话，前缀清单里多写一个
+                 #    字符串只是自我安慰 —— 尺子认不认得出它，没有任何东西在验。
+                 "from ..backend.screen import grab_desktop"):
         mods = _modules_of(form)
         assert any(m.startswith(p) for m in mods for p in _PLATFORM_BACKEND_PREFIXES), \
             f"尺子认不出这种写法：{form!r}（解析出 {mods}）—— 绝对/相对两种写法必须归一"

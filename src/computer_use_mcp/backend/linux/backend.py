@@ -20,6 +20,7 @@ from ...core import geometry
 from ...utils.errors import BackendUnavailableError, ComputerUseError
 from ...utils.logging import get_logger
 from ..base import Backend, ClickPreview, ElementDetail, QueryResult, Rect, TextBlock, UINode
+from .. import screen
 from . import grab, ring
 from .atspi import AtspiReader
 from .inject import XdotoolInjector
@@ -468,37 +469,13 @@ class LinuxBackend(Backend):
         # 先把可能还在屏上的点击光圈抹掉：`act_sequence` 里「click 步紧接 screenshot 步」
         # 只隔 ~250ms，而圈的寿命是 1.5s——不清理就会把红圈拍进图里，模型可能把它当成
         # 界面元素。无圈时这只是一次布尔判断，零成本。
+        # ⚠️ 这一步**留在 Linux 侧**、不进 `backend/screen.py`：光圈是 X11 专属的观感层，
+        #    抓屏那层不该知道它的存在（Windows 没有光圈）。
         ring.clear_now()
         img, origin = grab.grab_rgb(region)
-        orig_w, orig_h = img.size
-        meta: dict[str, Any] = {
-            "format": fmt, "region": list(region) if region else None,
-            # ⚠️ origin = 图像像素 (0,0) 对应的**屏幕绝对坐标**（I-8）。全屏抓取抓的是
-            # 显示器并集，其原点不保证是 (0,0)——副屏在主屏左/上时是负值。模型要靠
-            # 「屏幕坐标 = origin + 图上坐标 × scale」换算，缺了 origin 就会整体偏一个屏宽。
-            "origin": [origin[0], origin[1]],
-            "source_size": [orig_w, orig_h],
-        }
-        if max_side and max(orig_w, orig_h) > max_side:
-            ratio = max_side / max(orig_w, orig_h)
-            new_size = (max(1, int(orig_w * ratio)), max(1, int(orig_h * ratio)))
-            # LANCZOS：缩小时保留文字边缘锐度，缩小后模型仍能看清小字
-            img = img.resize(new_size, Image.LANCZOS)
-            meta["resized"] = [img.width, img.height]
-            # ⚠️ scale 是「图像像素 → 屏幕像素」的倍数（屏幕坐标 = 图上坐标 × scale）。
-            # 少了它，模型只能**猜**这张图缩了多少，据此算出的落点必然偏——实测踩到过。
-            meta["scale"] = orig_w / img.width
-        meta["width"], meta["height"] = img.size
-
-        buf = io.BytesIO()
-        if fmt == "png":
-            # 去掉 optimize=True（数百毫秒纯 CPU 浪费且肉眼无差异），低压缩等级快一个量级
-            img.save(buf, format="PNG", compress_level=1)
-        else:
-            img.save(buf, format="JPEG", quality=quality)
-        png = buf.getvalue()
-        meta["bytes"] = len(png)
-        return png, meta
+        # 缩放 + meta + 编码：与平台无关，实现在 backend/screen.py（Windows 复用同一份）。
+        return screen.encode_image(img, origin, region=region,
+                                   max_side=max_side, fmt=fmt, quality=quality)
 
     # ---------- 点击预览图（给模型看的「我瞄到哪了」）----------
     # 以落点为中心裁剪的半宽/半高（480x300）。为什么是这个尺寸：足够容纳「目标 + 周围一圈
@@ -512,48 +489,30 @@ class LinuxBackend(Backend):
 
         实现逻辑（每一步都有失败保护——预览图是**附加证据**，拿不到绝不能让点击失败）：
           1. region = 以 (x,y) 为中心 480x300；`grab_rgb` 内部会把它与屏幕并集求交
-             （`_clamp_region`），故屏幕边缘的点击也不会越界报错。
-          2. **准星像素 = 落点 − 裁剪后原点**（★ 本方法最容易写错的一行）：`_clamp_region`
-             在屏幕边缘会改变原点，若图省事写死 `HALF_W`，则**越靠屏幕边缘的按钮准星指得
-             越离谱**——而这个功能存在的唯一理由就是「位置对不对」，那就是主动误导级 bug。
-          3. 落点不在返回图内（极端越界）→ 返回 None：宁可不发图，也不发一张指错的图。
-          4. 准星画在**副本**上，原始图随 ClickPreview 一起返回：同一块像素后面还要用于
-             OCR（红线横穿文字会降低识别率）与「点前后对比」（红线会被误当变化）。
-          5. 编码 **只做一次**：抓 → 画 → 存 JPEG。**不缩放**（scale 恒为 1），故 meta 里
-             的 `crosshair` 就是屏幕坐标换算的直接依据，模型不需要任何乘法。
-             `subsampling=0`（4:4:4）是必须的：默认的 4:2:0 会把 1px 细红线的色度糊掉，
-             模型看到一团粉雾、反而看不清十字中心落在哪个像素。
+             （`screen.clamp_region`），故屏幕边缘的点击也不会越界报错。
+          2-5. 裁剪 → 画准星 → 编码，**全部在 `backend/screen.py::build_click_preview` 里**
+             （与平台无关，Windows 复用同一份；它的 docstring 记着准星像素为什么必须是
+             「落点 − 裁剪后原点」、以及 `subsampling=0` 为什么不能省）。
+             本方法只负责**抓屏**（Linux 的「抓哪块屏」）与把 `grab.draw_crosshair`
+             作为 `annotate` 传下去（保住测试补丁点，理由见下面那行注释）。
         """
-        try:
-            import io
-        except Exception as exc:  # noqa: BLE001
-            log.debug("click_preview: 依赖缺失 %s", exc)   # pragma: no cover - 环境级问题
-            return None
         try:
             x, y = int(x), int(y)
             region = (x - self._PREVIEW_HALF_W, y - self._PREVIEW_HALF_H,
                       self._PREVIEW_HALF_W * 2, self._PREVIEW_HALF_H * 2)
             img, origin = grab.grab_rgb(region)
-            px, py = x - origin[0], y - origin[1]
-            if not (0 <= px < img.width and 0 <= py < img.height):
+            # 裁剪 → 画准星 → 编码：与平台无关，实现在 backend/screen.py（Windows 复用）。
+            # ⚠️ `annotate` 必须传 `grab.draw_crosshair`（**属性查找**，不是提前抄下来的
+            #    绑定方法）：`tests/test_ring_and_preview.py` 有 2 处
+            #    `monkeypatch.setattr(grab_mod, "draw_crosshair", …)`，改成直调
+            #    `screen.draw_crosshair` 会让那些补丁**静默打空**（名字还在、setattr 成功，
+            #    但生产代码不再读它 → 用例照绿而零覆盖）。
+            shot = screen.build_click_preview(
+                img, origin, x, y, region=region, annotate=grab.draw_crosshair)
+            if shot is None:
                 log.debug("click_preview: 落点 (%s,%s) 不在裁剪图内 origin=%s size=%s",
                           x, y, origin, img.size)
-                return None
-            annotated = img.copy()          # 准星只画在副本上（原始图留给 OCR / 像素对比）
-            grab.draw_crosshair(annotated, px, py)
-            buf = io.BytesIO()
-            annotated.save(buf, format="JPEG", quality=85, subsampling=0)
-            data = buf.getvalue()
-            meta: dict[str, Any] = {
-                "kind": "click_preview", "format": "jpeg",
-                "x": x, "y": y,
-                "region": [region[0], region[1], region[2], region[3]],
-                "origin": [origin[0], origin[1]],
-                "crosshair": [px, py],          # 十字中心在**图上**的像素位置
-                "scale": 1,                     # 未缩放：图上 1 像素 = 屏幕 1 像素
-                "width": img.width, "height": img.height, "bytes": len(data),
-            }
-            return ClickPreview(data=data, meta=meta, image=img)
+            return shot
         except Exception as exc:  # noqa: BLE001
             log.debug("click_preview 失败（不影响点击）: %s", exc)
             return None
