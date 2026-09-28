@@ -238,10 +238,10 @@ class WindowsBackend(Backend):
         return self._uia().ControlFromHandle(hwnd)
 
     def _app_label(self, hwnd: int) -> str:
-        return w.process_basename(w.pid_of_window(hwnd)) or w.class_name(hwnd)
+        return win32.process_basename(win32.pid_of_window(hwnd)) or win32.class_name(hwnd)
 
     def _foreground_hwnd(self) -> int:
-        return w.foreground_window()
+        return win32.foreground_window()
 
     def _build_tree(self, label: str, element: Any, depth: int, max_depth: int,  # noqa: ANN401
                     max_nodes: int, counter: dict, deadline: float) -> UINode:
@@ -254,13 +254,17 @@ class WindowsBackend(Backend):
         少一半跨进程往返）。
         """
         counter["n"] += 1
+        role = nodes.role_of(self._safe(element, "ControlTypeName"),
+                             self._safe(element, "ClassName"))
         node = UINode(
-            role=nodes.role_of(self._safe(element, "ControlTypeName"),
-                               self._safe(element, "ClassName")),
+            role=role,
             name=self._safe(element, "Name") or "",
             app=label,
             depth=depth,
-            actions=nodes.actions_of(element),
+            # ⚠️ 传 role：树遍历是**批量**路径，按 `_PROBE_ROLES` 门控（每次 Pattern
+            # 探测 ~2.6ms 跨进程调用，400 节点全探要多花约 7 秒，见 nodes 里的成本注释）。
+            # 单个元素的追问走 `element_info`，那条**不门控**、给的是事实。
+            actions=nodes.actions_of(element, role=role),
             states=nodes.states_of(element),
             value=nodes.value_of(element),
             rect=self._rect_of(element),
@@ -347,7 +351,7 @@ class WindowsBackend(Backend):
                 name = self._safe(child, "Name") or ""
                 crole = nodes.role_of(self._safe(child, "ControlTypeName"),
                                       self._safe(child, "ClassName"))
-                acts = nodes.actions_of(child)
+                acts = nodes.actions_of(child, role=crole)
                 match_text = (text_l in name.lower()) if text_l else True
                 match_role = (role_l in crole) if role_l else True
                 actionable = bool(acts) or crole in ACTIONABLE_ROLES
@@ -434,7 +438,7 @@ class WindowsBackend(Backend):
         hwnd = self._top_hwnd_of(native)
         if not hwnd:
             return None
-        r = w.window_rect(hwnd)
+        r = win32.window_rect(hwnd)
         return Rect(x=r[0], y=r[1], w=r[2] - r[0], h=r[3] - r[1]) if r else None
 
     def _top_hwnd_of(self, native: Any) -> int:  # noqa: ANN401
@@ -508,8 +512,8 @@ class WindowsBackend(Backend):
         两次独立调用之间夹着落点证据、OCR、变化对比（实测约 0.5s），
         必然超过系统双击阈值而被认成两次单击 —— X11 侧为此吃过一次亏，Windows 同理。
         """
-        hwnd = w.foreground_window() if focus_window else 0
-        return bool(w.send_mouse_button(
+        hwnd = win32.foreground_window() if focus_window else 0
+        return bool(win32.send_mouse_button(
             x, y, button=button, repeat=repeat, delay_ms=delay_ms,
             focus_window=focus_window, hwnd=hwnd).get("ok"))
 
@@ -521,10 +525,10 @@ class WindowsBackend(Backend):
         失败**不重试**：重试一次拖拽 = 再拖一遍（文件移动两次、画两笔），后果不对称。
         """
         if focus_window:
-            fg = w.foreground_window()
+            fg = win32.foreground_window()
             if fg:
-                w.set_foreground_window(fg)
-        return bool(w.send_mouse_drag(x1, y1, x2, y2, button=button, steps=steps).get("ok"))
+                win32.set_foreground_window(fg)
+        return bool(win32.send_mouse_drag(x1, y1, x2, y2, button=button, steps=steps).get("ok"))
 
     def type_text(self, text: str) -> bool:
         """
@@ -537,7 +541,7 @@ class WindowsBackend(Backend):
         """
         if not text:
             return True
-        return bool(w.send_unicode_text(text).get("ok"))
+        return bool(win32.send_unicode_text(text).get("ok"))
 
     def press_key(self, combo: str) -> bool:
         """
@@ -549,7 +553,7 @@ class WindowsBackend(Backend):
         vks = actions.parse_combo(combo)
         if not vks:
             return False
-        return bool(w.send_key_combo(vks).get("ok"))
+        return bool(win32.send_key_combo(vks).get("ok"))
 
     # ---------- 本轮未实现（诚实报错，不返回空）----------
 
@@ -587,10 +591,10 @@ class WindowsBackend(Backend):
         """
         out: dict[str, Any] = {"point": [x, y]}
         try:
-            hwnd = w.window_from_point(x, y)
+            hwnd = win32.window_from_point(x, y)
             if hwnd:
-                out["window"] = w.window_text(hwnd) or None
-                out["class"] = w.class_name(hwnd)
+                out["window"] = win32.window_text(hwnd) or None
+                out["class"] = win32.class_name(hwnd)
                 out["hwnd"] = f"0x{hwnd:x}"
             else:
                 out["window"] = None

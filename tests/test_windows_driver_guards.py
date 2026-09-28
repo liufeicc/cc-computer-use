@@ -140,6 +140,59 @@ def test_driver_modules_import_on_this_platform():
     )
 
 
+# ==================== ③b Pattern 判定不许走 getattr ====================
+
+def test_pattern_probing_never_uses_getattr_with_a_default():
+    """
+    Windows 驱动层里**不许**出现 `getattr(…, "IsXxxPatternAvailable", 默认值)`。
+
+    ═══ 这条守卫的来历（2026-09-28 真机事故）═══
+
+    `nodes.actions_of()` 原先正是这么写的，而真机实测它**恒为 False**：
+    `uiautomation.Control` 根本没有 `IsInvokePatternAvailable` 这类属性，
+    而 `getattr(x, name, 默认值)` 把「**属性不存在**」与「**属性为 False**」
+    混成了一件事 —— 名字写错不报错、只静默给默认值。后果是所有元素的动作表恒为空，
+    元素级 do_action（本项目的第一原则）整条路是死的，**而单测全绿**：
+    桩对象恰好长着我臆想出来的那个属性，守卫在拿虚构验证虚构。
+
+    ⚠️ 所以这条守卫**不能**写成"断言属性名拼对了"（那还是靠人记得），
+    只能写成"**禁止这个语法形状**" —— 让"写错的属性名静默变成默认值"在构造上不可能。
+    正确的路只有一条：`_uia.resolve_pattern()` 拿数值 + `element.GetPattern(id)`，
+    名字写错会在 `resolve_pattern` 里响亮地抛。
+
+    正控：驱动层里必须**确实存在** `GetPattern` 调用 —— 否则本规则是"禁止了一切，
+    包括正确写法"，那样它会在把实现删空之后照样全绿。
+    """
+    bad: list[str] = []
+    has_get_pattern = False
+    for path in _py_files(_WINPKG):
+        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                fn = node.func
+                if isinstance(fn, ast.Attribute) and fn.attr == "GetPattern":
+                    has_get_pattern = True
+                # getattr(x, "字面量", 默认值) —— 三参形式才是危险的（吞掉 AttributeError）
+                if (isinstance(fn, ast.Name) and fn.id == "getattr"
+                        and len(node.args) >= 3
+                        and isinstance(node.args[1], ast.Constant)
+                        and isinstance(node.args[1].value, str)
+                        and "PatternAvailable" in node.args[1].value):
+                    bad.append(f"{path.name}:{node.lineno} "
+                               f'getattr(…, "{node.args[1].value}", …)')
+
+    assert has_get_pattern, (
+        "驱动层里一处 `GetPattern` 调用都没有 —— 本规则的正控失败，"
+        "它现在禁止的是一切（包括唯一正确的写法），等于失效。"
+    )
+    assert not bad, (
+        "驱动层出现了 `getattr(元素, \"IsXxxPatternAvailable\", 默认值)`：\n  "
+        + "\n  ".join(bad)
+        + "\n这种写法会把「属性不存在」与「属性为 False」混为一谈（见本用例 docstring）。"
+        "\n改用 `_uia.resolve_pattern(名字)` + `element.GetPattern(id)`。"
+    )
+
+
 # ==================== ④ DPI 前置不许被绕过 ====================
 
 def test_dpi_awareness_is_set_before_importing_uia():

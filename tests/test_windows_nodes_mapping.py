@@ -180,42 +180,166 @@ def test_unknown_control_type_degrades_to_unknown_role():
 
 # ── 判据 ③：动作表 ──────────────────────────────────────────────────────
 
-def test_actions_reflect_supported_patterns():
-    el = _Fake(IsInvokePatternAvailable=True, IsKeyboardFocusable=True)
+# ── 动作探测：桩必须复刻**真 API 的形状** ────────────────────────────────
+#
+# ⚠️⚠️ 这一节是被一次真机事故逼出来的（2026-09-28），改之前请先读完。
+#
+# 初版 `actions_of` 写的是 `getattr(element, "IsInvokePatternAvailable", False)`，
+# 而初版桩**恰好长着**这个属性 —— 于是守卫全绿，证明了一件假事。真机上那个属性
+# 根本不存在（`uiautomation.Control` 没有它），`getattr` 的默认值把「属性不存在」
+# 与「属性为 False」混成一件事，结果**所有元素的动作表恒为空**，
+# 元素级 do_action（本项目的第一原则）整条路是死的，而没有任何一条测试变红。
+#
+# 教训有两条，都体现在下面：
+#   ① **桩只能复刻真对象的形状，不能复刻"我以为它有的属性"**。现在桩只认
+#      `GetPattern(patternId)` —— 那是真基类上确实存在的方法。
+#   ② **期望值必须独立于实现写下**。若从 `nodes._PATTERN_ACTIONS` 反推期望，
+#      改坏了名字测试照样绿 —— 那是同一类自证循环。
+#
+# 真机上的那一半由 `docs/PR/windows-driver/probe_actions_cost.py` 负责：
+# 它把 `PatternId` 常量表整个打出来，并验证两条路判定一致。
+
+# 独立写下的期望：我们的动作名 → uiautomation 的 `PatternId` 成员名。
+# 与 `nodes._PATTERN_ACTIONS` 比对，改了名字就必须同步改这里。
+_EXPECTED_PATTERN_NAMES: dict[str, set[str]] = {
+    "invoke": {"InvokePattern"},
+    "toggle": {"TogglePattern"},
+    "select": {"SelectionItemPattern"},
+    "expand": {"ExpandCollapsePattern"},
+    "set_value": {"ValuePattern", "RangeValuePattern"},
+}
+
+# 桩内部用的合成 id：只要**同一张表内自洽**即可（真 id 由真机上的
+# `_uia.resolve_pattern` 给，单测不该依赖它的数值）。
+_FAKE_IDS: dict[str, int] = {
+    "InvokePattern": 10000,
+    "TogglePattern": 10015,
+    "SelectionItemPattern": 10010,
+    "ExpandCollapsePattern": 10005,
+    "ValuePattern": 10002,
+    "RangeValuePattern": 10003,
+}
+
+
+class _Pat:
+    """
+    照**真 UIA 形状**的假元素：动作只经 `GetPattern(patternId)` 回答。
+
+    `patterns` 是它支持的 `PatternId` 成员名；其余一律返回 None（真 `GetPattern`
+    对不支持的 Pattern 正是返回 None —— 它内部 catch 了 COMError）。
+    """
+
+    def __init__(self, patterns: tuple[str, ...] = (), **kw: object) -> None:
+        self._supported = {_FAKE_IDS[p] for p in patterns}
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+    def GetPattern(self, pattern_id: int):  # noqa: ANN201
+        return object() if pattern_id in self._supported else None
+
+
+@pytest.fixture
+def fake_ids(monkeypatch):
+    """把常量解析短路成合成 id —— Linux 上没有 uiautomation，真解析必然抛。"""
+    monkeypatch.setattr(nodes, "_PATTERN_ID_CACHE", dict(_FAKE_IDS))
+
+
+def test_pattern_names_match_the_expected_table():
+    """
+    实现里的 `PatternId` 成员名必须与我**独立写下的**期望一致。
+
+    ⚠️ 判据是"哪些名字"，不是"能不能跑"：名字写错时下面的行为测试**未必**变红
+    （桩认的是同一张假表），所以这条得单独钉住。
+    """
+    got: dict[str, set[str]] = {}
+    for name, action in nodes._PATTERN_ACTIONS:
+        got.setdefault(action, set()).add(name)
+    assert got == _EXPECTED_PATTERN_NAMES
+
+
+def test_actions_reflect_supported_patterns(fake_ids):
+    el = _Pat(patterns=("InvokePattern",), IsKeyboardFocusable=True)
     acts = nodes.actions_of(el)
     assert nodes.ACTION_INVOKE in acts
     assert nodes.ACTION_FOCUS in acts
-    assert nodes.ACTION_SELECT not in acts, "没声明 SelectionItem 却给出了 select"
+    assert nodes.ACTION_SELECT not in acts, "没支持 SelectionItem 却给出了 select"
 
 
-def test_expand_implies_collapse():
+def test_expand_implies_collapse(fake_ids):
     """同一个 Pattern 的反向操作要一起给 —— 只给 expand 的话模型无法收起一个展开的节点。"""
-    el = _Fake(IsExpandCollapsePatternAvailable=True)
-    acts = nodes.actions_of(el)
+    acts = nodes.actions_of(_Pat(patterns=("ExpandCollapsePattern",)))
     assert nodes.ACTION_EXPAND in acts and nodes.ACTION_COLLAPSE in acts
 
 
-def test_one_failing_pattern_does_not_lose_the_others():
+def test_one_failing_pattern_does_not_lose_the_others(fake_ids):
     """
     ⚠️ 某一次 Pattern 探测失败不该让整个元素丢掉动作表。
 
-    UIA 是跨进程调用：目标应用忙、元素刚失效，单次 `getattr` 抛异常是**常态**。
+    UIA 是跨进程调用：目标应用忙、元素刚失效，单次调用抛异常是**常态**。
     不兜住的表现是「这个按钮不能点」——而实际上只是那一下没读到。
     """
-    class _Partial:
-        IsInvokePatternAvailable = True
-
-        def __getattr__(self, name):  # noqa: ANN001
-            # 除 invoke 外一律炸
+    class _Partial(_Pat):
+        def GetPattern(self, pattern_id: int):  # noqa: ANN201
+            if pattern_id == _FAKE_IDS["InvokePattern"]:
+                return object()
             raise RuntimeError("模拟元素刚失效")
 
     acts = nodes.actions_of(_Partial())
-    assert nodes.ACTION_INVOKE in acts, "一个属性炸了就把已探测到的动作也丢了"
+    assert nodes.ACTION_INVOKE in acts, "一个 Pattern 炸了就把已探测到的动作也丢了"
 
 
-def test_actions_of_all_failing_element_is_empty_not_raising():
+def test_actions_of_all_failing_element_is_empty_not_raising(fake_ids):
     """全炸 → 空表，**不抛**。抛出来会把"读不到动作"升级成"整个工具调用失败"。"""
     assert nodes.actions_of(_Boom()) == []
+
+
+def test_role_gate_skips_probing_for_container_roles(fake_ids, monkeypatch):
+    """
+    树遍历（批量路径）按角色门控：容器角色**不去探** Pattern。
+
+    为什么要有这条：每次 `GetPattern` 是一次跨进程调用，真机冷路径实测 ~2.6ms，
+    每元素 6 个 —— 400 节点全探要多花约 7 秒，而整棵树的墙钟预算只有 12 秒。
+
+    ⚠️ 判据是"**有没有发起探测**"，不是"结果是不是空"：后者在桩上恒真，
+    等于没测（"门控生效"与"桩不支持"分不开）。所以这里数 `GetPattern` 的调用次数。
+    """
+    calls = {"n": 0}
+
+    class _Counting(_Pat):
+        def GetPattern(self, pattern_id: int):  # noqa: ANN201
+            calls["n"] += 1
+            return super().GetPattern(pattern_id)
+
+    el = _Counting(patterns=("InvokePattern",))
+    nodes.actions_of(el, role="panel")
+    assert calls["n"] == 0, "容器角色不该发起 Pattern 探测"
+
+    nodes.actions_of(el, role="push button")
+    assert calls["n"] > 0, "可操作角色必须真的探（否则门控把真动作也滤掉了）"
+
+
+def test_probing_is_not_gated_when_no_role_is_given(fake_ids):
+    """
+    `element_info` / `invoke` 这类**对单个元素的追问**不传 role，必须真探。
+
+    门控是批量路径的近似；对具体元素的追问要给事实。
+    """
+    el = _Pat(patterns=("InvokePattern",))
+    assert nodes.ACTION_INVOKE in nodes.actions_of(el)
+
+
+def test_unknown_pattern_name_raises_instead_of_silently_empty(monkeypatch):
+    """
+    ⚠️ 常量解析失败必须**响亮地炸**，不能被 per-pattern 的兜底吞成空表 ——
+    那正是 2026-09-28 那个 bug 的形状（"名字写错"退化成"这张表是空的"）。
+    """
+    def _boom(name: str) -> int:
+        raise RuntimeError(f"模拟 PatternId 里没有 {name!r}")
+
+    monkeypatch.setattr(nodes, "_PATTERN_ID_CACHE", {})   # 清缓存，逼它真去解析
+    monkeypatch.setattr(nodes._uia, "resolve_pattern", _boom)
+    with pytest.raises(RuntimeError, match="PatternId"):
+        nodes.actions_of(_Pat(patterns=("InvokePattern",)))
 
 
 # ── 判据 ④：状态与值 ─────────────────────────────────────────────────────

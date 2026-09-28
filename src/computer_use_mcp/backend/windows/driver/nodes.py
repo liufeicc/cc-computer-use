@@ -39,6 +39,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...base import ACTIONABLE_ROLES
+from . import _uia
+
 # ── 我们自己定的动作规范名（见模块 docstring 的说明）──────────────────────
 ACTION_INVOKE = "invoke"          # → InvokePattern
 ACTION_SELECT = "select"          # → SelectionItemPattern
@@ -46,8 +49,11 @@ ACTION_EXPAND = "expand"          # → ExpandCollapsePattern.Expand
 ACTION_COLLAPSE = "collapse"      # → ExpandCollapsePattern.Collapse
 ACTION_SET_VALUE = "set_value"    # → ValuePattern / RangeValuePattern
 ACTION_TOGGLE = "toggle"          # → TogglePattern
-ACTION_SCROLL = "scroll"          # → ScrollPattern
 ACTION_FOCUS = "focus"            # → SetFocus（不是 Pattern，但我们对外的统一动作）
+#
+# ⚠️ 刻意**没有** ACTION_SCROLL：`actions.py` 没实现滚动 Pattern 的调用，
+#    报出来等于宣称一个我们做不到的动作（滚动有专门的坐标级工具）。
+#    将来要加 Element 级滚动，先补 `actions.py` 的调用，再把它加回动作表。
 
 # ── ClassName → 角色（精确、跨版本稳定，**优先于 ControlType**）────────────
 #
@@ -142,37 +148,106 @@ def role_of(control_type: str | None, class_name: str | None) -> str:
 
 # ── UIA Pattern → 我们的动作名 ───────────────────────────────────────────
 #
-# 顺序即**优先级**：一个元素可能同时支持多个 Pattern（比如 ComboBox 既有
-# ExpandCollapse 又可能有 Value），`invoke()` 按这个顺序挑第一个能用的。
+# ⚠️⚠️ 这里**只能**用 `PatternId` 的成员名，且必须经 `_uia.resolve_pattern()` 拿 id，
+#     再走 `element.GetPattern(id)`。**绝不要**写回
+#     `getattr(element, "IsInvokePatternAvailable", False)` —— 那条路真机实测**恒为 False**：
+#
+#       · `uiautomation.Control` 根本没有 `IsXxxPatternAvailable` 这类属性，
+#         而 `getattr(x, name, 默认值)` 让「属性不存在」与「属性为 False」**无法区分** ——
+#         名字写错不报错、只静默给默认值。于是所有元素的动作表都是空的，
+#         元素级 do_action（本项目的第一原则）整条路是死的，而**单测全绿**：
+#         桩对象恰好长着我臆想出来的那个属性，守卫在拿虚构验证虚构。
+#
+#       · `GetInvokePattern()` 那些 getter 也不能用：它们定义在**控制类型子类**上而不在
+#         基类（`ButtonControl` 有 `GetInvokePattern`，**没有** `GetSelectionItemPattern`），
+#         `getattr` 会直接抛 AttributeError。唯一通用的入口是基类的 `GetPattern(patternId)`。
+#
+# 顺序即**优先级**：一个元素可能同时支持多个 Pattern（ComboBox 既有 ExpandCollapse
+# 又可能有 Value），`invoke()` 按这个顺序挑第一个能用的。
+#
+# 为什么**不列** ScrollPattern：全仓没有任何代码按动作名分支（`actions` 只被
+# `serializer` 当布尔信号 + 显示文本），而 `actions.py` 也**没有**实现滚动 Pattern 的
+# 调用 —— 报出来等于宣称一个我们做不到的动作。滚动有专门的坐标级工具。
 _PATTERN_ACTIONS: tuple[tuple[str, str], ...] = (
-    ("IsInvokePatternAvailable", ACTION_INVOKE),
-    ("IsTogglePatternAvailable", ACTION_TOGGLE),
-    ("IsSelectionItemPatternAvailable", ACTION_SELECT),
-    ("IsExpandCollapsePatternAvailable", ACTION_EXPAND),
-    ("IsValuePatternAvailable", ACTION_SET_VALUE),
-    ("IsRangeValuePatternAvailable", ACTION_SET_VALUE),
-    ("IsScrollPatternAvailable", ACTION_SCROLL),
+    ("InvokePattern", ACTION_INVOKE),
+    ("TogglePattern", ACTION_TOGGLE),
+    ("SelectionItemPattern", ACTION_SELECT),
+    ("ExpandCollapsePattern", ACTION_EXPAND),
+    ("ValuePattern", ACTION_SET_VALUE),
+    ("RangeValuePattern", ACTION_SET_VALUE),
 )
 
+# 哪些角色**值得**探 Pattern（2026-09-28 真机量的成本决定的）。
+#
+# 为什么需要门控：每次 `GetPattern` 是一次跨进程调用，冷路径实测 **~2.6 ms**，
+# 而每个元素要探 6 个。记事本 55 个节点里只有 36% 是这类角色 —— 全探会让
+# 400 节点的树多花约 7 秒，而整棵树的墙钟预算只有 12 秒。
+#
+# 门控的语义是**「这些角色才承载动作」**，不是"省点时间"：容器/标签类角色
+# （panel / filler / label / separator…）上的 Pattern 不是模型会去执行的动作。
+# ⚠️ 它是**有损**的：若某个容器角色其实带 InvokePattern，树里不会显示。
+# 代价可控的理由是 `element_info()` 与 `invoke()` 对**单个元素**一律真探、不走门控 ——
+# 模型对某个具体元素有疑问时，那条路给的是事实而不是门控的近似。
+_PROBE_ROLES: frozenset[str] = frozenset(ACTIONABLE_ROLES) | {
+    "text", "entry", "list", "tree", "table", "document", "calendar",
+}
 
-def actions_of(element) -> list[str]:  # noqa: ANN001 —— 库对象，无法标注
+
+def _pattern_id(name: str) -> int:
+    """
+    `PatternId` 成员名 → 数值，按名缓存。
+
+    ⚠️ 认不出**抛异常**（见 `_uia.resolve_pattern`）—— 这是这一层唯一的诊断出口：
+    `getattr` 的默认值会把"名字写错"变成"这张表是空的"，而抛出来才是响亮的。
+    """
+    if name not in _PATTERN_ID_CACHE:
+        _PATTERN_ID_CACHE[name] = _uia.resolve_pattern(name)
+    return _PATTERN_ID_CACHE[name]
+
+
+_PATTERN_ID_CACHE: dict[str, int] = {}
+
+
+def pattern_available(element, pattern_name: str) -> bool:  # noqa: ANN001
+    """
+    该元素是否支持某个 Pattern（`pattern_name` 是 `PatternId` 的成员名）。
+
+    `GetPattern` 内部已 catch COMError、不支持时返回 None，故这里只需判空。
+    异常仍让它冒出去 —— "元素已失效"与"不支持该 Pattern"是两件事。
+    """
+    return element.GetPattern(_pattern_id(pattern_name)) is not None
+
+
+def actions_of(element, role: str | None = None, probe: bool = True) -> list[str]:  # noqa: ANN001
     """
     该元素支持的动作（我们自己的规范名）。
 
-    ⚠️ **每个属性单独 try**：UIA 是跨进程调用，某个 Pattern 探测失败（目标应用忙、
+    `role` 给了就按 `_PROBE_ROLES` 门控（树遍历走这条，见常量处的成本说明）；
+    不给或 `probe=False` 的语义不同 —— **`element_info`/`invoke` 一律传 `probe=True`
+    且不传 role**，因为那是对单个元素的追问，必须是事实。
+
+    ⚠️ 每个 Pattern 单独 try：UIA 是跨进程调用，某个 Pattern 探测失败（目标应用忙、
     元素刚失效）不该让整个元素丢失动作列表 —— 那会表现成"这个按钮不能点"，
     而实际上只是那一次探测失败。与 `tree._snapshot` 的字段级 try 同一个理由。
     """
+    if role is not None and probe and role not in _PROBE_ROLES:
+        probe = False
     out: list[str] = []
-    for attr, action in _PATTERN_ACTIONS:
-        try:
-            if getattr(element, attr, False):
-                out.append(action)
-        except Exception:  # noqa: BLE001
-            pass
-    # ExpandCollapse 支持时补上 collapse（同一 Pattern 的反向操作）
-    if ACTION_EXPAND in out:
-        out.append(ACTION_COLLAPSE)
+    if probe:
+        # ⚠️ 常量解析必须在循环**之外**（`_pattern_id` 认不出名字会抛）：
+        #    放进 try 里就会被兜底吞掉 —— 于是"名字写错了"再次退化成"这张动作表是空的"，
+        #    正是 2026-09-28 那个 bug 的同一形状。
+        #    这一层要的是：**常量错 → 响亮地炸；单次探测失败 → 静默跳过**。两者分开。
+        resolved = [(action, _pattern_id(name)) for name, action in _PATTERN_ACTIONS]
+        for action, pid in resolved:
+            try:
+                if element.GetPattern(pid) is not None:
+                    out.append(action)
+            except Exception:  # noqa: BLE001
+                pass
+        # ExpandCollapse 支持时补上 collapse（同一 Pattern 的反向操作）
+        if ACTION_EXPAND in out:
+            out.append(ACTION_COLLAPSE)
     try:
         if getattr(element, "IsKeyboardFocusable", False):
             out.append(ACTION_FOCUS)
@@ -235,15 +310,17 @@ def value_of(element) -> Any:  # noqa: ANN001
     """
     取元素的值（输入框内容等）。取不到返回 `None` —— **不要**返回空串：
     "没有值"与"值是空字符串"是两件事，模型据此判断"这个框是空的"还是"这个控件没有值"。
+
+    ⚠️ 判定走 `GetPattern(id)`，**不是** `getattr(element, "IsValuePatternAvailable", …)` ——
+    后者在本库上恒为假（见 `_PATTERN_ACTIONS` 处的长注释）。
     """
     try:
-        v = getattr(element, "GetValuePattern", None)
-        if getattr(element, "IsValuePatternAvailable", False) and v is not None:
+        if element.GetPattern(_pattern_id("ValuePattern")) is not None:
             return element.GetValuePattern().Value
     except Exception:  # noqa: BLE001
         pass
     try:
-        if getattr(element, "IsTextPatternAvailable", False):
+        if element.GetPattern(_pattern_id("TextPattern")) is not None:
             return element.GetTextPattern().DocumentRange.GetText(-1)
     except Exception:  # noqa: BLE001
         pass

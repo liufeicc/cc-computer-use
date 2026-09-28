@@ -157,22 +157,22 @@ def invoke(element, action: str | None = None) -> bool:  # noqa: ANN001
             return False
 
     if wanted == nodes.ACTION_INVOKE:
-        if not getattr(element, "IsInvokePatternAvailable", False):
+        if not nodes.pattern_available(element, "InvokePattern"):
             return False
         element.GetInvokePattern().Invoke()
         return True
     if wanted == nodes.ACTION_SELECT:
-        if not getattr(element, "IsSelectionItemPatternAvailable", False):
+        if not nodes.pattern_available(element, "SelectionItemPattern"):
             return False
         element.GetSelectionItemPattern().Select()
         return True
     if wanted == nodes.ACTION_TOGGLE:
-        if not getattr(element, "IsTogglePatternAvailable", False):
+        if not nodes.pattern_available(element, "TogglePattern"):
             return False
         element.GetTogglePattern().Toggle()
         return True
     if wanted in (nodes.ACTION_EXPAND, nodes.ACTION_COLLAPSE):
-        if not getattr(element, "IsExpandCollapsePatternAvailable", False):
+        if not nodes.pattern_available(element, "ExpandCollapsePattern"):
             return False
         pat = element.GetExpandCollapsePattern()
         if wanted == nodes.ACTION_EXPAND:
@@ -197,10 +197,10 @@ def set_value(element, text: str) -> bool:  # noqa: ANN001
         focus(element)
     except Exception:  # noqa: BLE001 —— 聚焦失败不该阻断写值（有些控件不可聚焦但可写）
         pass
-    if getattr(element, "IsValuePatternAvailable", False):
+    if nodes.pattern_available(element, "ValuePattern"):
         element.GetValuePattern().SetValue(text)
         return True
-    if getattr(element, "IsRangeValuePatternAvailable", False):
+    if nodes.pattern_available(element, "RangeValuePattern"):
         element.GetRangeValuePattern().SetValue(float(text))
         return True
     return False

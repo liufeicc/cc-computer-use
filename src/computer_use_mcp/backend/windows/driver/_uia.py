@@ -72,6 +72,52 @@ class WindowsDriverUnavailable(RuntimeError):
     """Windows 驱动层不可用（缺库、非 Windows、或平台 API 调用失败）。"""
 
 
+# ── PatternId / PropertyId 的单点解析 ────────────────────────────────────
+#
+# ⚠️ 这两个函数的存在理由是一条**真机上才暴露的**教训（2026-09-28）：
+#
+# `nodes.actions_of()` 原先写的是 `getattr(element, "IsInvokePatternAvailable", False)`。
+# 真机实测它**恒为 False** —— `uiautomation` 的 `Control` 根本没有这个属性，而
+# `getattr(x, name, 默认值)` 把「属性不存在」和「属性为 False」**混成了一件事**：
+# 属性名写错不报错、只静默给默认值。于是所有元素的动作表都是空的，
+# 元素级 do_action 那条路（本项目的第一原则）整个是死的，而单测全绿——
+# 因为桩对象恰好长着那个我臆想出来的属性，**守卫在拿虚构验证虚构**。
+#
+# 第二层更隐蔽：`GetInvokePattern()` 这类 getter 定义在**控制类型子类**上而不在基类
+# （`ButtonControl` 有 `GetInvokePattern` 却**没有** `GetSelectionItemPattern`），
+# `getattr` 直接抛 AttributeError。所以唯一通用的入口是基类的 `GetPattern(patternId)`，
+# 而 patternId 只能从 `PatternId` 常量表来。
+#
+# 结论：**Pattern 的判定只能走 `GetPattern(数值)`**，而"名字 → 数值"的翻译收在这里，
+# 认不出就抛 —— 让写错名字变成一次响亮的失败，而不是一张空动作表。
+
+
+def resolve_pattern(name: str) -> int:
+    """
+    `PatternId` 的成员名 → 数值 id（如 `"InvokePattern"` → 10000）。
+
+    ⚠️ 认不出**抛异常**、不返回 0 或 None：静默返回会把"名字写错了"表现成
+    "这个元素不支持该 Pattern"，正是上一条注释里那个坑的同一形状。
+    """
+    pid = getattr(import_uia().PatternId, name, None)
+    if pid is None:
+        raise WindowsDriverUnavailable(
+            f"uiautomation 的 PatternId 里没有 {name!r} —— 该库版本可能变了，"
+            f"请核对 PatternId 的成员名。"
+        )
+    return int(pid)
+
+
+def pattern_id_cls():  # noqa: ANN202 —— 库对象，无法标注
+    """`PatternId` 类本身（探针用来把常量表整体打出来核对）。"""
+    return import_uia().PatternId
+
+
+def property_id_cls():  # noqa: ANN202
+    """`PropertyId` 类本身。"""
+    return import_uia().PropertyId
+
+
 # ── 能力自检 ─────────────────────────────────────────────────────────────
 
 # 我们**依赖**的 uiautomation 对外 API。写死清单而不是 `hasattr` 探测：
