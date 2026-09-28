@@ -22,6 +22,7 @@ Win32 的 ctypes 绑定（backend.windows.driver.win32）。
 from __future__ import annotations
 
 import ctypes
+import time
 from ctypes import wintypes
 
 # ── 常量（只列我们用到的）──────────────────────────────────────────────────
@@ -60,9 +61,21 @@ ENUM_CURRENT_SETTINGS = 0xFFFFFFFF
 
 # SendInput
 INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
+# 键盘
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+KEYEVENTF_SCANCODE = 0x0008
 
 # ═══ 定宽别名：为什么不能直接用 `wintypes.DWORD` ═══
 #
@@ -517,12 +530,30 @@ class MOUSEINPUT(ctypes.Structure):
                 ("time", _DWORD), ("dwExtraInfo", ULONG_PTR)]
 
 
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", _WORD), ("wScan", _WORD), ("dwFlags", _DWORD),
+                ("time", _DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", _DWORD), ("wParamL", _WORD), ("wParamH", _WORD)]
+
+
 class _INPUT_U(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT)]
+    """
+    ⚠️ 三个成员**都要列**，即使我们只用其中两个。
+
+    `INPUT` 的 `cbSize` 必须等于 `sizeof(INPUT)`，而 union 的大小取**最大成员**。
+    漏掉 `mi` 会让 `sizeof` 变小 → `SendInput` **返回 0 且不报错**（它只是拒绝执行），
+    表现成"注入静默无效"。在 x64 上 `MOUSEINPUT`(32) 是最大的那个，所以加 `ki`/`hi`
+    不改变总大小 —— 有专门的守卫钉住 `sizeof(INPUT) == 40`（Linux 上就能跑）。
+    """
+
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
 
 
 class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_U)]
+    _fields_ = [("type", _DWORD), ("u", _INPUT_U)]
 
 
 def send_input_move_absolute(x: int, y: int) -> dict:
@@ -562,6 +593,198 @@ def send_input_move_absolute(x: int, y: int) -> dict:
         "normalized": [norm_x, norm_y],
         "virtual_desktop": [vx, vy, vw, vh],
     }
+
+
+def _send_inputs(inputs: list[INPUT]) -> dict:
+    """
+    一次 `SendInput` 提交**一串**事件。返回 `{"ok", "sent", "size"}`。
+
+    ⚠️ 为什么必须一次提交而不是循环单发：`SendInput` 原子地插入事件流，
+    分成 N 次调用时，**别的进程的输入有机会插进我们的事件之间**（用户碰一下鼠标、
+    输入法弹个候选窗），那样"按下 A 再按下 B"就可能变成"A、别人的事件、B"。
+    按键组合（Ctrl+S）尤其怕这个 —— 中间插入的松开事件会把组合拆散。
+    """
+    if not inputs:
+        return {"ok": True, "sent": 0}
+    arr = (INPUT * len(inputs))(*inputs)
+    u = user32()
+    u.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    u.SendInput.restype = wintypes.UINT
+    sent = int(u.SendInput(len(inputs), arr, ctypes.sizeof(INPUT)))
+    return {"ok": sent == len(inputs), "sent": sent,
+            "expected": len(inputs), "size": ctypes.sizeof(INPUT)}
+
+
+def _key_input(vk: int = 0, scan: int = 0, flags: int = 0) -> INPUT:
+    inp = INPUT(type=INPUT_KEYBOARD)
+    inp.u.ki = KEYBDINPUT(wVk=vk, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=0)
+    return inp
+
+
+def send_unicode_text(text: str) -> dict:
+    """
+    用 `KEYEVENTF_UNICODE` **按字符**投递一段文本。
+
+    ═══ 为什么这条路比 Linux 侧干净得多 ═══
+
+    Linux 上 `xdotool type` 遇到非 ASCII 会**临时改写全局键盘映射**
+    （XChangeKeyboardMapping）—— 输入期间用户物理键盘整体失灵，还要跟输入法抢 XKB。
+    所以 Linux 侧非 ASCII 必须绕到剪贴板，而剪贴板又要判"目标是不是终端"才能选粘贴键。
+
+    Windows 这边不存在这些问题：`KEYEVENTF_UNICODE` 直接把 `wScan` 当成 UTF-16 码元投递，
+    **完全绕开键盘布局**（不需要目标机器装了对应布局，也不会改任何全局状态）。
+    代价是它走的是"文本输入"而非"按键"，**不触发快捷键** —— 这正是我们要的：
+    输入文本就该只输入文本。
+
+    ⚠️ 用 UTF-16 **码元**逐位投递而不是 `ord(char)`：`ord()` 对 BMP 之外的字符
+    （emoji 等）返回 >0xFFFF 的码点，而 `wScan` 只有 16 位，会被静默截断成别的字。
+    Python 的 `utf-16-le` 编码正好把它拆成代理对，逐码元发出去就是对的。
+    """
+    payload = text.encode("utf-16-le")
+    inputs: list[INPUT] = []
+    for i in range(0, len(payload), 2):
+        code = payload[i] | (payload[i + 1] << 8)
+        inputs.append(_key_input(scan=code, flags=KEYEVENTF_UNICODE))
+        inputs.append(_key_input(scan=code, flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+    return _send_inputs(inputs)
+
+
+def send_key_combo(vks: list[tuple[int, bool]]) -> dict:
+    """
+    按下并松开一组键。入参是 `[(虚拟键码, 是否扩展键), …]`，**顺序即按下顺序**。
+
+    实现逻辑（顺序是有讲究的）：
+      1. 修饰键与主键**一并按下**（按给定顺序）；
+      2. **逆序**全部松开 —— 松开顺序反了会让某些应用看到"修饰键还按着"的中间态，
+         表现为快捷键偶发失灵（与 Linux 侧"先松主键再松修饰键"是同一个道理）。
+    """
+    downs = [_key_input(vk=vk, flags=(KEYEVENTF_EXTENDEDKEY if ext else 0))
+             for vk, ext in vks]
+    ups = [_key_input(vk=vk, flags=KEYEVENTF_KEYUP | (KEYEVENTF_EXTENDEDKEY if ext else 0))
+           for vk, ext in reversed(vks)]
+    return _send_inputs(downs + ups)
+
+
+def send_mouse_button(x: int, y: int, button: int = 1, repeat: int = 1,
+                      delay_ms: int = 100, focus_window: bool = False,
+                      hwnd: int = 0) -> dict:
+    """
+    移动指针到 `(x, y)` 并点击（可重复 = 双击/三击）。
+
+    ═══ ⚠️ 双击的间隔为什么必须在这里控 ═══
+
+    X11 侧为同一件事吃过大亏（当时的实现是"调用方连调两次 click"，
+    两次之间夹着落点证据、OCR、变化对比，约 0.5s，必然被认成两次单击）。
+    Windows 完全一样：**间隔必须交给输入层**。这里一次 `SendInput` 提交
+    `down/up` × repeat，中间用**服务端定时**而不是调用方往返 —— 调用方往返的间隔
+    不可控，而系统的双击阈值（默认约 500ms）是可预测的。
+
+    ⚠️ `delay_ms` 仍然是"提交后 sleep"而非"事件间隔"：`SendInput` 数组里没有时间戳
+    （`time=0` 表示用系统时间），所以同一批事件的间隔由**系统处理速度**决定，
+    通常远小于阈值。分多批提交并 sleep 才是真正可控的间隔 —— 本函数按批提交，
+    每批之间 sleep `delay_ms`，这样"两次点击"之间的间隔就是**我们说了算**。
+
+    `focus_window` 为真时先 `SetForegroundWindow`：坐标点击本身不需要前台，
+    但**某些应用会把非前台窗口的点击当成"激活"**而不触发按钮（与 Linux 侧
+    "合成点击被激活窗口吃掉"同一类现象）。故默认不抢焦点，由调用方声明。
+    """
+    if focus_window and hwnd:
+        set_foreground_window(hwnd)
+        time.sleep(0.05)
+
+    down_flag, up_flag = _BUTTON_FLAGS.get(button, _BUTTON_FLAGS[1])
+    vx, vy, vw, vh, _, _ = _virtual_metrics()
+    if vw <= 0 or vh <= 0:
+        return {"ok": False, "reason": "虚拟桌面度量为空（服务会话的典型症状）"}
+    norm_x = int(round((x - vx) * 65535 / max(vw - 1, 1)))
+    norm_y = int(round((y - vy) * 65535 / max(vh - 1, 1)))
+    move_flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+
+    batches: list[dict] = []
+    for i in range(max(1, repeat)):
+        if i:
+            time.sleep(max(0.0, delay_ms) / 1000.0)
+        inp_move = INPUT(type=INPUT_MOUSE)
+        inp_move.u.mi = MOUSEINPUT(dx=norm_x, dy=norm_y, mouseData=0,
+                                   dwFlags=move_flags, time=0, dwExtraInfo=0)
+        inputs = [inp_move]
+        for flag in (down_flag, up_flag):
+            one = INPUT(type=INPUT_MOUSE)
+            one.u.mi = MOUSEINPUT(dx=norm_x, dy=norm_y, mouseData=0,
+                                  dwFlags=flag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                                  time=0, dwExtraInfo=0)
+            inputs.append(one)
+        batches.append(_send_inputs(inputs))
+    return {"ok": all(b.get("ok") for b in batches), "batches": batches,
+            "repeat": repeat, "pointer": [x, y]}
+
+
+def send_mouse_drag(x1: int, y1: int, x2: int, y2: int, button: int = 1,
+                    steps: int = 10, hold: float = 0.01) -> dict:
+    """
+    从 `(x1,y1)` 按住拖到 `(x2,y2)`，中间**插值出多步移动**。
+
+    ⚠️ 必须插值（同 Linux 侧的实测教训）：只发一个"从 A 到 B"的移动事件时，
+    很多应用判定不出"按住拖动"（拖放目标不激活、画布不跟随、滚动条回弹），
+    表现是"拖了但没反应"而 `SendInput` 返回值完全正常。
+
+    ⚠️ 失败**不重试**：重试一次拖拽 = 再拖一遍（文件被移动两次、画布多画一笔）。
+    后果不对称，所以宁可报失败让调用方决定。
+
+    步数上限由调用方（`backend.base` 的常量）控制 —— 这里只保证 >= 1。
+    """
+    down_flag, up_flag = _BUTTON_FLAGS.get(button, _BUTTON_FLAGS[1])
+    vx, vy, vw, vh, _, _ = _virtual_metrics()
+    if vw <= 0 or vh <= 0:
+        return {"ok": False, "reason": "虚拟桌面度量为空"}
+    move_flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+
+    def _norm(px: int, py: int) -> tuple[int, int]:
+        return (int(round((px - vx) * 65535 / max(vw - 1, 1))),
+                int(round((py - vy) * 65535 / max(vh - 1, 1))))
+
+    n = max(1, steps)
+    seq: list[tuple[int, int, int]] = []          # (dx, dy, 额外 flag)
+    nx, ny = _norm(x1, y1)
+    seq.append((nx, ny, 0))
+    seq.append((nx, ny, down_flag))
+    for i in range(1, n + 1):
+        px = x1 + (x2 - x1) * i // n
+        py = y1 + (y2 - y1) * i // n
+        dx, dy = _norm(px, py)
+        seq.append((dx, dy, 0))
+    nx2, ny2 = _norm(x2, y2)
+    seq.append((nx2, ny2, up_flag))
+
+    # 逐事件提交 + 短 sleep：这里**不能**整串一次提交 —— 一次提交会被系统在
+    # 同一时刻处理完，中间没有"按住"的持续时间，与不插值没区别。
+    ok = True
+    for dx, dy, extra in seq:
+        inp = INPUT(type=INPUT_MOUSE)
+        inp.u.mi = MOUSEINPUT(dx=dx, dy=dy, mouseData=0,
+                              dwFlags=move_flags | extra, time=0, dwExtraInfo=0)
+        if not _send_inputs([inp]).get("ok"):
+            ok = False
+            break
+        if hold > 0:
+            time.sleep(hold)
+    return {"ok": ok, "steps": n, "from": [x1, y1], "to": [x2, y2],
+            "events": len(seq), "button": button}
+
+
+_BUTTON_FLAGS: dict[int, tuple[int, int]] = {
+    1: (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+    2: (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+    3: (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+}
+
+
+def _virtual_metrics() -> tuple[int, int, int, int, int, int]:
+    """`(x, y, w, h, screen_w, screen_h)` —— 归一化坐标要用前四个。"""
+    m = system_metrics()
+    return (int(m.get("SM_XVIRTUALSCREEN") or 0), int(m.get("SM_YVIRTUALSCREEN") or 0),
+            int(m.get("SM_CXVIRTUALSCREEN") or 0), int(m.get("SM_CYVIRTUALSCREEN") or 0),
+            int(m.get("SM_CXSCREEN") or 0), int(m.get("SM_CYSCREEN") or 0))
 
 
 # ── 顶层窗口枚举 ─────────────────────────────────────────────────────────
@@ -612,6 +835,163 @@ def is_usable_window(hwnd: int, min_side: int = 40) -> bool:
     if not window_text(hwnd):
         return False
     return has_ws_visible(hwnd)
+
+
+# ── 进程名（应用身份）────────────────────────────────────────────────────
+#
+# Linux 侧的应用名来自 `wmctrl -lpx` 的 WM_CLASS（AT-SPI 的 application name 与它基本对齐）。
+# Windows 上没有对应物，最接近的是**进程可执行文件名**：它稳定、人读、且与
+# "用户眼里这是哪个应用"一致（notepad / dbeaver / chrome）。
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def process_image_name(pid: int) -> str | None:
+    """
+    `QueryFullProcessImageNameW` → 完整映像路径（如 `C:\\Windows\\System32\\notepad.exe`）。
+
+    用 `PROCESS_QUERY_LIMITED_INFORMATION` 而不是 `PROCESS_QUERY_INFORMATION`：
+    前者在**受保护/更高完整性级别**的进程上也能成功，而后者会被拒绝。
+    拿不到时返回 None —— **不**返回"未知"之类的占位串，那会让调用方以为拿到了名字。
+    """
+    if not pid:
+        return None
+    try:
+        k = kernel32()
+        k.OpenProcess.argtypes = [_DWORD, wintypes.BOOL, _DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return None
+        try:
+            k.QueryFullProcessImageNameW.argtypes = [
+                wintypes.HANDLE, _DWORD, ctypes.c_wchar_p, ctypes.POINTER(_DWORD)]
+            k.QueryFullProcessImageNameW.restype = wintypes.BOOL
+            buf = ctypes.create_unicode_buffer(1024)
+            size = _DWORD(1024)
+            ok = k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+            return buf.value if ok else None
+        finally:
+            k.CloseHandle(h)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def process_basename(pid: int) -> str | None:
+    """
+    进程名（去目录、去 `.exe`、转小写）—— 即我们对外报的**应用名**。
+
+    为什么统一小写去扩展名：用户在 `find(app="Notepad")` 里写的、以及树上标的，
+    必须是同一个串；大小写与扩展名差异会造成"存在但搜不到"这类难查的问题。
+    """
+    path = process_image_name(pid)
+    if not path:
+        return None
+    base = path.replace("/", "\\").rsplit("\\", 1)[-1]
+    if base.lower().endswith(".exe"):
+        base = base[:-4]
+    return base.lower() or None
+
+
+# ── 显示器枚举 ───────────────────────────────────────────────────────────
+
+MONITORINFOF_PRIMARY = 0x1
+CCHDEVICENAME = 32
+
+
+class MONITORINFOEXW(ctypes.Structure):
+    """`MONITORINFOEXW`（`GetMonitorInfoW` 的输出，带设备名）。"""
+
+    _fields_ = [
+        ("cbSize", _DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", _DWORD),
+        ("szDevice", _WCHAR * CCHDEVICENAME),
+    ]
+
+
+def enum_monitors() -> list[dict]:
+    """
+    枚举显示器：`[{name, x, y, w, h, primary}]`。
+
+    ⚠️ 用 `rcMonitor`（**整块屏**）而不是 `rcWork`（去掉任务栏的可用区）：
+    这是给"模型判断坐标落在哪块屏"用的，任务栏那块也是屏的一部分；
+    拿 `rcWork` 会让最下沿的点击坐标被判成"不在任何屏上"。
+
+    `cm == 0` 时返回空列表并**由调用方决定怎么降级** —— 不在这里悄悄编一块假屏出来。
+    """
+    u = user32()
+    out: list[dict] = []
+    monitor_enum_proc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HANDLE, wintypes.HDC,
+        ctypes.POINTER(RECT), wintypes.LPARAM)
+
+    def _cb(hmon, _hdc, _lprect, _lparam):  # noqa: ANN001
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        try:
+            u.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFOEXW)]
+            u.GetMonitorInfoW.restype = wintypes.BOOL
+            if u.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                r = info.rcMonitor
+                out.append({
+                    "name": _wchars_to_str(info.szDevice),
+                    "x": int(r.left), "y": int(r.top),
+                    "w": int(r.right - r.left), "h": int(r.bottom - r.top),
+                    "primary": bool(info.dwFlags & MONITORINFOF_PRIMARY),
+                })
+        except Exception:  # noqa: BLE001 —— 单块屏取失败不该丢掉其余
+            pass
+        return True
+
+    u.EnumDisplayMonitors.argtypes = [wintypes.HDC, ctypes.c_void_p,
+                                      monitor_enum_proc, wintypes.LPARAM]
+    u.EnumDisplayMonitors.restype = wintypes.BOOL
+    u.EnumDisplayMonitors(None, None, monitor_enum_proc(_cb), 0)
+    return out
+
+
+# ── 置前（焦点）──────────────────────────────────────────────────────────
+
+def set_foreground_window(hwnd: int) -> bool:
+    """
+    `SetForegroundWindow`。
+
+    ⚠️ Windows **故意**限制谁能调用成功：只有当前拥有前台窗口的进程、或收到过用户输入的
+    进程才能把窗口提到前台（防"弹窗劫持"）。所以它**会失败**，而且失败是设计行为不是 bug。
+    调用方必须能接受 False 并继续（坐标点击本身不需要前台，只有键盘输入才需要）。
+    """
+    try:
+        u = user32()
+        u.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u.SetForegroundWindow.restype = wintypes.BOOL
+        return bool(u.SetForegroundWindow(wintypes.HWND(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def is_iconic(hwnd: int) -> bool:
+    """窗口是否最小化（`IsIconic`）。
+
+    最小化的窗口 `GetWindowRect` 会返回一个**历史位置的负坐标矩形**，
+    拿它算点击坐标必然打偏 —— 所以调用方要先判这个，再决定要不要还原。
+    """
+    try:
+        return bool(user32().IsIconic(wintypes.HWND(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def show_window(hwnd: int, cmd: int = 9) -> bool:
+    """`ShowWindow`（默认 SW_RESTORE=9）—— 把最小化的窗口还原，之后矩形才可信。"""
+    try:
+        u = user32()
+        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.ShowWindow.restype = wintypes.BOOL
+        return bool(u.ShowWindow(wintypes.HWND(hwnd), cmd))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ── 窗口查询 ─────────────────────────────────────────────────────────────

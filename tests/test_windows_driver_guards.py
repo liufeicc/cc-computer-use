@@ -123,6 +123,10 @@ def test_driver_modules_import_on_this_platform():
         "'computer_use_mcp.backend.windows.driver.tree',"
         "'computer_use_mcp.backend.windows.driver._uia',"
         "'computer_use_mcp.backend.windows.driver.dpi_probe',"
+        "'computer_use_mcp.backend.windows.driver.nodes',"
+        "'computer_use_mcp.backend.windows.driver.apps',"
+        "'computer_use_mcp.backend.windows.driver.actions',"
+        "'computer_use_mcp.backend.windows.backend',"
         "'computer_use_mcp.backend.windows.driver.probe'];"
         "[importlib.import_module(m) for m in mods];"
         "print('IMPORT_OK')"
@@ -321,3 +325,68 @@ def test_dpi_probe_report_keeps_the_two_verdicts_separate():
         "这正是最容易犯的错，必须留在文件里。"
     )
 
+
+
+# ==================== ⑦ WindowsBackend 必须满足 ABC 契约 ====================
+
+def test_windows_backend_implements_every_abstract_method():
+    """
+    `WindowsBackend` 必须把 `Backend` 的**每一个**抽象方法都实现掉。
+
+    ⚠️ 为什么要用测试钉住一个"类写全了没有"：漏掉一个抽象方法，Python 只在
+    **实例化时**才报 `TypeError: Can't instantiate abstract class` —— 而
+    `get_backend()` 是在 Windows 上被调用的，**这个错误在 Linux 的 CI 里永远看不见**。
+    等到真机上才发现，代价是一轮完整的构建 + 部署 + 复现。
+
+    判据取 `__abstractmethods__` 这个**运行时事实**，不是去比对源码里的 def 列表 ——
+    后者数得再全也证明不了"签名对得上"。
+    """
+    from computer_use_mcp.backend.base import Backend
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    assert issubclass(WindowsBackend, Backend)
+    missing = set(WindowsBackend.__abstractmethods__)
+    assert not missing, (
+        f"WindowsBackend 还有未实现的抽象方法：{sorted(missing)} —— "
+        f"它无法被实例化，而 `get_backend()` 正是在 Windows 上实例化它的地方"
+    )
+
+    # 正控：ABC 本身确实带抽象方法（否则 `__abstractmethods__` 恒空，本判据失效）
+    assert Backend.__abstractmethods__, "Backend 已无抽象方法，本判据失去意义"
+
+
+def test_windows_backend_is_instantiable_on_this_platform():
+    """
+    在 **Linux** 上也能构造出 `WindowsBackend` 实例。
+
+    这是"惰性绑定"纪律的直接检验：`__init__` 里若 import 了 uiautomation 或
+    建了 COM 对象，本用例当场炸。而那种写法会让 `get_backend()` 的失败面
+    从"工具调用时"提前到"构造时"，报错也离真正的原因更远。
+
+    ⚠️ 只构造、**不调任何方法** —— 调 `is_available()` 会尝试 `import uiautomation`，
+    那在 Linux 上当然失败（那是环境问题，不是结构问题）。本用例只问结构。
+    """
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    backend = WindowsBackend()
+    assert backend.name == "windows"
+    assert "windows" in type(backend).__module__
+
+
+def test_windows_backend_declares_unimplemented_parts_loudly():
+    """
+    `screenshot` / `read_text` 本轮没实现 —— 必须**抛明确错误**，不许返回空。
+
+    这条守的是一类**认知**错误：返回一张空图 / 一个空列表，会被模型读成
+    「这个界面是黑的」/「这儿没有文字」，把"功能没做"伪装成"界面的内容就是这样"。
+    本项目对静默的判据一向是宁可报错（同 `_require_sandbox` 拒绝执行而不是回落宿主）。
+    """
+    import pytest as _pytest
+
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+    from computer_use_mcp.utils.errors import BackendUnavailableError
+
+    backend = WindowsBackend()
+    for method, args in (("screenshot", ()), ("read_text", ())):
+        with _pytest.raises(BackendUnavailableError):
+            getattr(backend, method)(*args)

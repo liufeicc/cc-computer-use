@@ -534,7 +534,13 @@ def get_backend() -> Backend:
 
     实现逻辑：
       - Linux → LinuxBackend（AT-SPI + xdotool）。
-      - 其它平台 → 抛 BackendUnavailableError（Windows 第二阶段实现）。
+      - Windows → WindowsBackend（UIA + SendInput）。
+      - 其它平台 → 抛 BackendUnavailableError。
+
+    ⚠️ 这是全仓**仅有的两个**允许出现 `platform.system()` 的地方之一
+    （另一个是 `core/session.py`）—— 「平台分支在哪」必须只有一个答案，
+    否则又要靠 grep 去找散落的 `if platform`。由
+    `tests/test_platform_module_boundary.py` 兜住。
     """
     from ..utils.errors import BackendUnavailableError
 
@@ -543,6 +549,10 @@ def get_backend() -> Backend:
         from .linux.backend import LinuxBackend
 
         return LinuxBackend()
+    if system == "windows":
+        from .windows.backend import WindowsBackend
+
+        return WindowsBackend()
     raise BackendUnavailableError(
-        f"当前平台 '{system}' 暂不支持（Phase 1 仅 Linux；Windows 在 Phase 3）"
+        f"当前平台 '{system}' 暂不支持（已实现 Linux 与 Windows）"
     )
