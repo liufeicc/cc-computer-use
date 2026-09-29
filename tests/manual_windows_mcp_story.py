@@ -22,7 +22,11 @@ Windows 端到端 story：用 MCP stdio 客户端驱动**真的 server**（在�
 
     python Z:\\cc-computer-use\\tests\\manual_windows_mcp_story.py --out results/mcp_story.json
 
-⚠️ 前置：客体 Python ≥3.11 且装了 `mcp` / `uiautomation` / `pillow` / `mss` / PyWinRT，
+    # 驱动**冻结产物**（安装包里的那份）而不是源码 —— 打包链路改过之后必跑一遍：
+    set CC_CU_STORY_DIST=1
+    python ...\\manual_windows_mcp_story.py
+
+⚠️ 前置：客体 Python ≥3.12 且装了 `mcp` / `uiautomation` / `pillow` / `mss` / PyWinRT，
 且**用户已登录交互式会话**（UIA 与抓屏都要求桌面真在渲染）。
 """
 
@@ -220,7 +224,27 @@ def main(argv: list[str] | None = None) -> int:
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    c = Client([sys.executable, "-m", "computer_use_mcp.server"], env)
+
+    # CC_CU_STORY_DIST=1 → 驱动**冻结产物**，而不是源码。
+    # 与 Linux 侧 tests/manual_sandbox_story.py 同款开关，理由也一样：
+    # 冻结产物与源码是**两种运行形态**（依赖收集、sys.path、编码设置都可能不同），
+    # 源码上全过不能推出冻结产物上也能过 —— 必须各跑一遍。
+    # 产物路径可用 CC_CU_WIN_MCP_BIN 覆盖（客体上安装位置由安装器决定）。
+    dist = os.environ.get("CC_CU_WIN_MCP_BIN") or str(
+        _REPO / "dist" / "windows" / "payload" / "server" / "computer-use-mcp-bin.exe"
+    )
+    if os.environ.get("CC_CU_STORY_DIST") == "1":
+        if not os.path.exists(dist):
+            print(f"❌ CC_CU_STORY_DIST=1 但找不到冻结产物：{dist}")
+            print("   先跑 packaging/windows/build-windows.sh，或用 CC_CU_WIN_MCP_BIN 指定路径")
+            return 2
+        cmd = [dist]
+        print(f"   驱动冻结产物: {dist}")
+    else:
+        cmd = [sys.executable, "-m", "computer_use_mcp.server"]
+        print(f"   驱动源码 server: {sys.executable} -m computer_use_mcp.server")
+
+    c = Client(cmd, env)
     try:
         return _run(c, args)
     finally:

@@ -329,6 +329,66 @@ docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/d -v /tmp/o:/o ubuntu:22.04 \
 - **⚠️ `ubuntu:*` 官方 Docker 镜像自带文档瘦身规则**（`/etc/dpkg/dpkg.cfg.d/excludes`：`path-exclude=/usr/share/doc/*`，只 `path-include` 回 `copyright` 与 `changelog.*`）。**真实 Ubuntu 安装没有这条**（本机查过）。在容器里验收时会表现为「`README.Debian` / `THIRD-PARTY-LICENSES.txt` 没装上」—— 与我们的包无关，`verify-in-container.sh` 里已先把它挪走。
 - **合规**：deb 会重分发 **GPL-2+ 的 xclip / wmctrl**（还有 dbus-daemon 的双许可之一）等第三方二进制，必须随附 `THIRD-PARTY-LICENSES.txt`（`build-deb.sh` 已放进 `/usr/share/doc`）。
 
+## Windows 分发（`packaging/windows/`，2026-09-29 新增）
+
+产物是一个 **`cc-computer-use-<版本>-setup.exe`**（Inno Setup），装到
+`%LOCALAPPDATA%\Programs\cc-computer-use`，装完自动注册进 Claude Code。
+与 Linux 那套是**两条独立链路**（PyInstaller 不能交叉编译，必须在 Windows 上构建）。
+
+```bash
+CC_CU_VM_PASS='<密码>' bash packaging/windows/build-windows.sh    # 宿主驱动客体构建
+CC_CU_VM_PASS='<密码>' bash packaging/windows/verify-install.sh   # 装→自检→查注册→卸载
+PYTHONNOUSERSITE=1 "$PY" -m pytest tests/test_packaging_windows.py -q   # 40 条结构性守卫
+PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 33 条反证
+```
+
+**验收状态（2026-09-29）：从干净前置状态跑完 15 项全过、`RESULT|ok`** —— 装完
+`claude mcp list` 显示 `cc-computer-use: … - √ Connected`，卸载后注册项被摘掉。
+
+完整说明（含客体环境、九条踩过的坑）见 [`packaging/windows/README.md`](packaging/windows/README.md)。
+**改这几个脚本前必须知道的六条**：
+
+- **纯 .py 的包不在磁盘上，在内嵌的 `PYZ.pyz` 里**：`mss` / `mcp` / `comtypes` 在
+  `_internal\` 下**没有同名目录**（只留 `.dist-info\`），只有带二进制/数据文件的包
+  （`uiautomation` 的 DLL、`winrt` 的 `_winrt*.pyd`）才会被摊出来。所以产物校验必须
+  **两条都用**：`pyi-archive_viewer -r -b` 读归档 + `Test-Path` 查磁盘散件。
+  ⚠️ 只查目录的话对前者**恒判缺失** —— 2026-09-29 实测这么误杀过一整轮构建，而产物其实是好的。
+- **`.ps1` / `.iss` 必须 UTF-8 **带 BOM**，`.cmd` 必须**纯 ASCII**：PS 5.1 读无 BOM 的
+  `.ps1` 按系统 ANSI 解（中文机 = GBK），中文注释与字符串变乱码，**报错位置还会指向被解错的那一行**；
+  Inno 读 `.iss` 同理。中文诊断一律写 **UTF-8 日志文件**（`dist/windows/build.log`），
+  stdout 上只留 ASCII —— 中文经 guestcontrol 的管道回来看必是乱码。
+- ⚠️ **`claude` 要求机器上有 Git for Windows 或 PowerShell 7 —— 这条曾经被我们归因错了。**
+  旧结论说「报错像是缺 Git，其实是非交互上下文，别去装」。**真机隔离实测推翻了它**：
+  那台客体上确实两样都没装（系统自带的 Windows PowerShell **5.1 不算**，Claude Code 要的是
+  PowerShell 7），而这就是它的硬要求。修法是三份脚本共用的 `Find-GitBash` + 起子进程时设
+  **`CLAUDE_CODE_GIT_BASH_PATH`**（Claude Code 自己报错里点名的那个旋钮；用它而不是改 PATH ——
+  改 PATH 要等新进程才生效，计划任务拿到的仍是旧环境）。**别再改回「劝用户别装」。**
+  守卫 `test_setup_does_not_claim_the_shell_error_is_a_context_artifact` 钉住这条。
+- ⚠️ **客体 PS 5.1 解析不了的语法不止 `??` / `?.` / `&&`**：`(try { … } catch { … })`
+  （把 try 当**表达式**用）是 PS 7 写法，5.1 **连解析都过不了**，整份脚本**一个字都不执行**、
+  报错消失在隐藏窗口里。赋值形式 `$x = try { … } catch { … }` 反而认 —— 区别细微代价极大。
+  另：**别把函数参数命名成 `$Args`**（PowerShell 自动变量，参数被静默忽略、命令行变空，
+  表现像"claude 报 Input must be provided"，排查方向完全跑偏）。验收里现在会用
+  `[Parser]::ParseFile()` 在客体上真解析一遍随包脚本（判据 `scripts-parse-on-ps51`）。
+- **给脚本留兜底 `trap`**：未捕获的 PowerShell 异常会让脚本**静默死在半路**、日志停在上一行、
+  一个字的原因都没有（实测：一次 `Start-Process` 的两个重定向指向同一个文件就退出了，退出码 33）。
+  守卫 `test_windows_build_logs_uncaught_exceptions` 与
+  `test_windows_build_does_not_redirect_both_streams_to_one_file` 各钉一条。
+- **客体构建偶发 `SubprocessDiedError`（`exit code 3221225477` = 访问违例）**：PyInstaller 的
+  `collect_submodules` 会另起隔离子进程，实测它会偶发崩掉、让 9 分钟的构建在最后一步失败。
+  **原样重跑即可**，与我们的代码无关。
+- ⏱ **`claude mcp get/list/add` 的超时一律给 120 秒**：它们**不是纯读配置** —— 会真的把 MCP
+  server 拉起来做健康检查（那句 `Status: √ Connected` 就是这么来的），而我们的 server 是
+  250MB 冻结产物，**冷启动实测能超过 30 秒**。实测踩到：输出已完整打印、进程还没退出，
+  30 秒超时把一次**真·通过**的健康检查判成失败（假红）。热态 6~12s、冷态 >30s。
+  **别改小** —— 超时只在真卡住时付出代价，改小换来的是偶发假红。
+  反向的坑：**`claude doctor` 是交互式 TUI，永远不会自己退出**，别在任何自动化里调它。
+
+**`tests/test_packaging_windows.py` 的 `_live_lines` 会剥两种注释**（`#` 行内、`<# … #>` 块）。
+块注释那条是 2026-09-29 补的：只按 `#` 截断的话，函数体开头的 `<# … #>` 说明里**引用的旧结论**
+会被当成"会执行的行"—— 而本仓库的惯例恰恰是**在注释里保留错误结论的解释**（防止下一个人改回去），
+于是守卫误报。新增守卫时记住这一点。
+
 ## mcp SDK 版本兼容
 
 环境装的是 **mcp 2.2.0**（`python -c "import importlib.metadata as m; print(m.version('mcp'))"`；该包**没有** `mcp.__version__`，别用 `getattr(mcp,'__version__')` 去查，会得到假象）。2.x 把 `FastMCP` 改名为 `MCPServer`（`mcp.server.mcpserver`），`Image` 也在那里。`server.py` / `tools/screenshot.py` 做了 v1/v2 兼容导入（try 2.x 再 fallback 1.x；`Image` 都拿不到时退化为 base64 文本），升级或排查导入问题时注意。
