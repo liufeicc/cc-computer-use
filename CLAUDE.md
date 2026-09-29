@@ -26,8 +26,8 @@ PY=$HOME/anaconda3/envs/cc-computer-use/bin/python
 #    现已改走 X11 才真正安全——**改动时务必不要把 AT-SPI 应用枚举加回 selftest**。
 PYTHONNOUSERSITE=1 "$PY" -m computer_use_mcp.server --selftest
 
-# 全量测试（共 341 项；单测无需桌面，端到端需 X11 + zenity + Xephyr，不满足自动 skip）
-# ✅ 两条路径都全绿：默认 335 passed / 6 skipped；下面带 e2e 开关的 341 passed
+# 全量测试（共 486 项；单测无需桌面，端到端需 X11 + zenity + Xephyr，不满足自动 skip）
+# ✅ 两条路径都全绿：默认 477 passed / 9 skipped；下面带 e2e 开关的 483 passed / 3 skipped
 PYTHONNOUSERSITE=1 "$PY" -m pytest -q
 
 # e2e 需显式 opt-in（默认在沙箱内跑、不碰真实桌面）
@@ -338,15 +338,15 @@ docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/d -v /tmp/o:/o ubuntu:22.04 \
 ```bash
 CC_CU_VM_PASS='<密码>' bash packaging/windows/build-windows.sh    # 宿主驱动客体构建
 CC_CU_VM_PASS='<密码>' bash packaging/windows/verify-install.sh   # 装→自检→查注册→卸载
-PYTHONNOUSERSITE=1 "$PY" -m pytest tests/test_packaging_windows.py -q   # 40 条结构性守卫
-PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 33 条反证
+PYTHONNOUSERSITE=1 "$PY" -m pytest tests/test_packaging_windows.py -q   # 44 条结构性守卫
+PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 35 条反证
 ```
 
 **验收状态（2026-09-29）：从干净前置状态跑完 15 项全过、`RESULT|ok`** —— 装完
 `claude mcp list` 显示 `cc-computer-use: … - √ Connected`，卸载后注册项被摘掉。
 
-完整说明（含客体环境、九条踩过的坑）见 [`packaging/windows/README.md`](packaging/windows/README.md)。
-**改这几个脚本前必须知道的六条**：
+完整说明（含客体环境、十条踩过的坑）见 [`packaging/windows/README.md`](packaging/windows/README.md)。
+**改这几个脚本前必须知道的七条**：
 
 - **纯 .py 的包不在磁盘上，在内嵌的 `PYZ.pyz` 里**：`mss` / `mcp` / `comtypes` 在
   `_internal\` 下**没有同名目录**（只留 `.dist-info\`），只有带二进制/数据文件的包
@@ -399,10 +399,10 @@ PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 33 条�
 
 | 文件 | 类别 | 说明 |
 |------|------|------|
-| `test_geometry.py`（9） / `test_refs.py`（8） / `test_serializer.py`（13） / `test_spawn_env.py`（2） / `test_i7_i8_i10.py`（11） / `test_atspi_guards.py`（24） / `test_d_guards.py`（15） / `test_e_guards.py`（22） / `test_f_guards.py`（14） / `test_g_guards.py`（21） / `test_h_guards.py`（8） / **`test_coordinator_hooks.py`（15）** / **`test_inject_layer.py`（18）** / **`test_coordinator_seq.py`（23）** / **`test_landing_evidence.py`（7）** / **`test_ocr_and_text.py`（12）** / **`test_display_lifecycle.py`（20）** / **`test_refs_and_values.py`（8）** / **`test_tools_and_backend.py`（24）** / **`test_ring_and_preview.py`（39）** / **`test_packaging.py`（21）** | pytest 单测 | 不需要桌面，`conftest.py` 会强制 `CC_CU_DISPLAY_MODE=real` 以免弹 Xephyr。`test_spawn_env.py` 是**结构性防漏**：枚举 `src/` 下每一处 subprocess spawn 点，要求 `env=` 源自 `env_for`/`app_env`；`test_i7_i8_i10.py` 是 review 报告那三条的回归集。**加粗的 8 个**由原 `test_optimizations.py`（2238 行）在 2026-09-18 按被测模块拆分而来，跨文件共享的辅助（`_StubBackend` / `_proc` / `_reset_display`）在 `_helpers.py`。**`test_ring_and_preview.py` 守住点击反馈的四条硬契约**：准星必须用「裁剪后原点」反算（屏边裁剪会改原点，写死半宽 = 越靠边指得越离谱）、准星只画在副本上（原始图要复用给 OCR 与点前后对比）、bytes 绝不进 `ActionResult.data`、`click` 工具返回注解必须是 `Any`（`str` 会让 mcp 生成 outputSchema，带图那次返回列表就 ValidationError）。**`conftest.py` 里那个 autouse 夹具 `isolate_at_spi_bus_env` 不能改成依赖 monkeypatch**：`AtspiReader` 会直接写**进程级** `os.environ`（libatspi 只能从那儿读），而 monkeypatch 的 `delenv` 对「本就不存在的键」**不入账**，记下的反而是用例自己写进去的假地址；autouse 夹具**最先实例化**、收尾回调**最后**执行，才排得进 monkeypatch 的 undo 之后 |
+| `test_geometry.py`（9） / `test_refs.py`（8） / `test_serializer.py`（13） / `test_spawn_env.py`（2） / `test_i7_i8_i10.py`（11） / `test_atspi_guards.py`（24） / `test_d_guards.py`（15） / `test_e_guards.py`（22） / `test_f_guards.py`（14） / `test_g_guards.py`（21） / `test_h_guards.py`（8） / **`test_coordinator_hooks.py`（15）** / **`test_inject_layer.py`（21）** / **`test_coordinator_seq.py`（27）** / **`test_landing_evidence.py`（7）** / **`test_ocr_and_text.py`（12）** / **`test_display_lifecycle.py`（20）** / **`test_refs_and_values.py`（8）** / **`test_tools_and_backend.py`（24）** / **`test_ring_and_preview.py`（39）** / **`test_packaging.py`（23）** / `test_screen_layer.py`（14） / `test_session_contract.py`（12） / `test_platform_module_boundary.py`（9） / `test_static_health.py`（5） / `test_windows_driver_guards.py`（32） / `test_windows_nodes_mapping.py`（20） / `test_packaging_windows.py`（44） | pytest 单测 | 不需要桌面，`conftest.py` 会强制 `CC_CU_DISPLAY_MODE=real` 以免弹 Xephyr。`test_spawn_env.py` 是**结构性防漏**：枚举 `src/` 下每一处 subprocess spawn 点，要求 `env=` 源自 `env_for`/`app_env`；`test_i7_i8_i10.py` 是 review 报告那三条的回归集。**加粗的 8 个**由原 `test_optimizations.py`（2238 行）在 2026-09-18 按被测模块拆分而来，跨文件共享的辅助（`_StubBackend` / `_proc` / `_reset_display`）在 `_helpers.py`。**`test_ring_and_preview.py` 守住点击反馈的四条硬契约**：准星必须用「裁剪后原点」反算（屏边裁剪会改原点，写死半宽 = 越靠边指得越离谱）、准星只画在副本上（原始图要复用给 OCR 与点前后对比）、bytes 绝不进 `ActionResult.data`、`click` 工具返回注解必须是 `Any`（`str` 会让 mcp 生成 outputSchema，带图那次返回列表就 ValidationError）。**`conftest.py` 里那个 autouse 夹具 `isolate_at_spi_bus_env` 不能改成依赖 monkeypatch**：`AtspiReader` 会直接写**进程级** `os.environ`（libatspi 只能从那儿读），而 monkeypatch 的 `delenv` 对「本就不存在的键」**不入账**，记下的反而是用例自己写进去的假地址；autouse 夹具**最先实例化**、收尾回调**最后**执行，才排得进 monkeypatch 的 undo 之后 |
 | `test_env_isolation.py`（1） | pytest 单测（**起子进程**） | 守「测试之间不留下进程级副作用」：自己起一个 pytest 子进程、挂探针插件在 `pytest_sessionfinish` 打印 `AT_SPI_BUS_ADDRESS` 的真实取值，断言为 `None`。**为什么必须起子进程**：判据是「跑完之后环境是否干净」，而那只在**那个会话收尾时**才观测得到——在会话内断言，观测到的是本会话自己的状态，何况 `conftest.py` 的守卫夹具已把本会话擦干净了（等于在测那把本来就该生效的扫帚） |
 | `test_e2e_zenity.py`（6） | pytest 端到端 | 需 X11 + zenity + Xephyr，需 `CC_CU_E2E=1` opt-in，默认在沙箱内跑。**「等应用上树」一律用 `_wait_app_on_tree()` 轮询，别改回固定 `sleep`**：实测沙箱内 zenity 上树耗时 1.60~2.54 秒，**正好跨过**历史上的 2.5 秒魔数，于是同一份代码会在「全绿」与「全红」之间随机翻转（实现在 2026-09-17 的 I-17 修的）。**收尾同理，用 `_wait_window_gone(title)` 轮询等窗口真的从 X 上消失，不要 `terminate()` 完就走人**：SIGTERM 只是请求进程退出，X 端窗口要等客户端断开才被回收——下一个用例开头读到的「活动窗口」于是还是上一个用例**正在死**的对话框，而它会在随后几秒里消失。实测就是这样把 `test_ring_visible_has_hole_and_autoclears` 的「画圈不改变活动窗口」打成偶发红（`assert 'E2EPreview' == None`，3 轮里红 2 轮）；根因不在光圈，在收尾提前离场 |
-| `manual_*.py`（7 个） | **手动 story**（不进 pytest） | 用 MCP stdio 客户端驱动**真实 server/冻结产物**，跑完整任务链路，退出码 0 = 全过 |
+| `manual_*.py`（10 个） | **手动 story**（不进 pytest） | 用 MCP stdio 客户端驱动**真实 server/冻结产物**，跑完整任务链路，退出码 0 = 全过 |
 
 手动 story 清单（改相关模块后应各跑一遍）：
 - `manual_sandbox_story.py` —— 沙箱隔离：launch_app 起 zenity → 读树 → 元素级点「是」，并断言**宿主活动窗口/指针前后不变**。⚠️ 运行期间**不要动鼠标键盘**（宿主指针零移动是断言前提）；real 模式下脚本直接拒绝运行。加 `CC_CU_STORY_DIST=1` 改为驱动冻结产物。
@@ -412,6 +412,9 @@ PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 33 条�
 - `manual_dbeaver_a11y_probe.py` —— DBeaver 树探针。
 - `manual_find_prefilter_probe.py` —— 钉住「find 的无窗口应用预滤」那条**单测测不到的跨通道前提**：X11 的 `_NET_WM_PID` 与 AT-SPI 的 `get_process_id` 必须指向同一进程，否则预滤会把正在用的应用整个跳过。沙箱内起 zenity（按钮标签写死，判据与语言无关）→ 不带 app= 的全桌面 find 必须搜到 → 两侧 pid 对得上 → 元素级点掉。沿用 a11y 隔离那套**安全闸**（先确认绑在私有总线且看不到宿主应用，才遍历）；real 模式拒绝运行。
 - `manual_shell_story.py` —— 「沙箱里操作 shell」两条：① `launch_app("gnome-terminal")` 必须落沙箱（断言**宿主 wmctrl 里终端窗口数不增加** + 返回 argv 里有 `--disable-factory`）；② 长文本经剪贴板路径必须**真的被 shell 执行**（OCR 找得到执行结果，而不是信 `type_text` 的"成功"）；③ 反向：zenity 输入框仍走 `ctrl+v`（用全选+复制从剪贴板逐字节核对——输入框内容 OCR 读不可靠）。**需先 `bash build.sh`**（打的是冻结产物）；两条 bug 都只在真机上暴露，单测 stub 掉的方法照样绿。
+- `manual_windows_backend_story.py`（51 条判据）—— Windows 驱动层（UIA 读树 + 节点映射 + 输入注入）真机跑一遍，**跑在客体上**，需交互式会话。
+- `manual_windows_mcp_story.py`（29 条判据）—— 真 MCP server（stdio）驱动 Windows 桌面。加 `CC_CU_STORY_DIST=1` 改为驱动**冻结产物**（`CC_CU_WIN_MCP_BIN` 可指定路径）——源码上全过推不出冻结产物上也能过，两条路必须各跑一遍。
+- `manual_windows_guards_reverse.py` —— 给 `packaging/windows/` 的守卫做**反证**（把坏东西种进源码，断言守卫真的变红；宿主即可跑）。理由见「Windows 分发」一节的守卫计数与 [`packaging/windows/README.md`](packaging/windows/README.md)：**"守卫坏了"与"代码没问题"在结果上长得一模一样**。
 
 端到端测试用 `pkill -9 -x zenity`（**精确匹配进程名**），不能用 `-f`：`-f` 匹配完整命令行，会命中 `pytest tests/test_e2e_zenity.py` 自身把测试进程杀掉（表现为 exit 1 且无输出）。
 

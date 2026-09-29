@@ -34,7 +34,7 @@ CC_CU_VM_PASS='<密码>' bash packaging/windows/verify-install.sh
 
 ---
 
-## 六条踩过的坑（都写进了代码与守卫测试）
+## 十条踩过的坑（都写进了代码与守卫测试）
 
 ### 1. 纯 Python 的包不在磁盘上，在内嵌的 `PYZ.pyz` 里
 
@@ -171,8 +171,8 @@ UIA 初始化）实测会超过 30 秒。
 ## 守卫与反证
 
 ```bash
-PYTHONNOUSERSITE=1 $PY -m pytest tests/test_packaging_windows.py -q   # 40 条结构性守卫
-PYTHONNOUSERSITE=1 $PY tests/manual_windows_guards_reverse.py         # 33 条反证
+PYTHONNOUSERSITE=1 $PY -m pytest tests/test_packaging_windows.py -q   # 44 条结构性守卫
+PYTHONNOUSERSITE=1 $PY tests/manual_windows_guards_reverse.py         # 35 条反证
 ```
 
 反证那步不是可选的：这些守卫的判据都是「没有坏东西」，而"守卫坏了"与"代码没问题"
