@@ -130,32 +130,57 @@ class WindowMixin:
         # （isolated 模式下把 AT_SPI_BUS_ADDRESS 指向沙箱私有 AT-SPI 总线，
         #   见 core/display 的 at_spi_bus 子模块与 manager 的说明）
         env = session.MANAGER.app_env()
+        # ★ 「应用起在哪儿」是**平台差异**，交给 backend 决定（见 ABC 的 spawn_app）：
+        #   Linux 靠 env 里的 DISPLAY；Windows 靠 CreateProcess 的 lpDesktop ——
+        #   后者 `subprocess` 表达不了（它的 STARTUPINFO 没有那个字段）。
+        spawned = None
         try:
-            proc = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, start_new_session=True)
-        except OSError as exc:
-            # 命令不存在 / 不可执行。沙箱里没装某应用是常态，必须把原因明确回给模型，
-            # 否则它无法区分「命令名打错」「应用没装」「引号写坏」，只能盲试。
+            spawned = self.backend.spawn_app(argv, env)
+        except Exception as exc:  # noqa: BLE001 —— 钩子内部出错时退回通用路径
+            log.debug("spawn_app 钩子失败，退回 subprocess.Popen: %s", exc)
+        if spawned is not None and not spawned.get("ok"):
+            # ⚠️ **不静默降级**：钩子说了"起不来"就必须报出去。Windows 上这条尤其要紧
+            #    —— 静默降级意味着"应用起在用户桌面上"，而用户明确选的是隔离。
             raise ComputerUseError(
-                f"launch_app: 启动失败（{exc.strerror or exc}）：{argv[0]!r}\n"
-                f"   请确认该命令已安装且在 PATH 中"
-            ) from exc
+                f"launch_app: 启动失败：{spawned.get('error') or '未知原因'}：{argv[0]!r}")
+        if spawned is not None:
+            proc = None
+            pid = int(spawned.get("pid") or 0)
+        else:
+            try:
+                proc = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError as exc:
+                # 命令不存在 / 不可执行。沙箱里没装某应用是常态，必须把原因明确回给模型，
+                # 否则它无法区分「命令名打错」「应用没装」「引号写坏」，只能盲试。
+                raise ComputerUseError(
+                    f"launch_app: 启动失败（{exc.strerror or exc}）：{argv[0]!r}\n"
+                    f"   请确认该命令已安装且在 PATH 中"
+                ) from exc
+            pid = proc.pid
         # 后台 reap 子进程：server 是父进程，不 wait 的话退出后僵尸态滞留 /proc
-        threading.Thread(target=proc.wait, daemon=True,
-                         name=f"reap-{proc.pid}").start()
+        # （走 spawn_app 钩子时没有 proc 对象 —— 那边是 CreateProcessW，
+        #   子进程不归我们 reap，也不产生僵尸）
+        if proc is not None:
+            threading.Thread(target=proc.wait, daemon=True,
+                             name=f"reap-{pid}").start()
         if settle:
             time.sleep(settle)
         # ⚠️ 这里必须用 .get() 而不是 env["DISPLAY"] 裸下标：`DISPLAY` 是 X11 概念，
         # 非 Linux 的 app_env() 里根本没有这个键，裸下标会 KeyError（未来必踩）。
         # 回退到 target_label() 是为了让「应用被放到哪儿了」这句话在任何平台都说得出来。
-        target = env.get("DISPLAY") or session.MANAGER.target_label()
-        log.info("launch_app: pid=%s target=%s cmd=%s", proc.pid, target, command)
+        # ⚠️ 优先级：**平台钩子说的落地位置** > env 里的 DISPLAY > 平台默认标签。
+        #   钩子排第一是因为它知道的是**事实**（应用真的被放到了哪儿），
+        #   而 env["DISPLAY"] 只是"我们希望它去哪儿"。
+        target = (spawned or {}).get("target") or env.get("DISPLAY") \
+            or session.MANAGER.target_label()
+        log.info("launch_app: pid=%s target=%s cmd=%s", pid, target, command)
         # 回报**实际执行**的 argv（可能被 _desingleton_argv 补过参数）：模型据此知道
         # 自己那条命令被改成了什么，不必去翻日志，也免得下次自己再加一遍。
         # 键名 `display` 本轮**刻意不改**：三个手动 story 直接断言它
         # （manual_shell_story.py 用正则 '"display"\s*:\s*"(:[\d.]+)"'），
         # 改成 `target` 是后续轮次的显式决定，要连同那三个 story 一起改。
-        return {"pid": proc.pid, "command": command, "display": target, "argv": argv}
+        return {"pid": pid, "command": command, "display": target, "argv": argv}
 
     @_needs_display
     def list_windows(self, limit: int = 100) -> list[dict]:

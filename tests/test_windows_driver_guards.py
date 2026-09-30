@@ -991,3 +991,179 @@ def test_window_for_app_picks_the_largest_window(monkeypatch):
     assert WindowsBackend().window_for_app("notepad") == "0x2"
     # 正控：名字对不上时必须返回 None（否则这条判据量不到"挑"这个动作）
     assert WindowsBackend().window_for_app("nosuchapp") is None
+
+# ==================== ⑫ 隔离桌面：模式、枚举、以及**绝不打到用户窗口** ====================
+
+def test_display_mode_defaults_to_isolated_and_only_recognises_real(monkeypatch):
+    """
+    ★ 显示模式**默认必须是隔离**，而且**只有** `real` 这一个字面量能关掉它。
+
+    2026-09-30 定：`CC_CU_DISPLAY_MODE` 与 Linux 侧**同一个变量名、同一套默认值**
+    （用户说的是同一件事，两个变量名会让人以为它们是两件事）。
+
+    ⚠️ 判据取「拼错一个字母会怎样」：`reel` / `REAL ` / 空 / 未设置，**全都必须**
+    落到 `isolated`。一个"拼错就静默失去隔离"的默认值是不能接受的 ——
+    而它不会报错，只会让 agent 悄悄回到用户的桌面上干活。
+    """
+    from computer_use_mcp.backend.windows.driver import desktop
+
+    for wrong in (None, "", "   ", "reel", "1", "isolated", "REAL "):
+        if wrong is None:
+            monkeypatch.delenv("CC_CU_DISPLAY_MODE", raising=False)
+        else:
+            monkeypatch.setenv("CC_CU_DISPLAY_MODE", wrong)
+        got = desktop.display_mode()
+        if wrong is not None and wrong.strip().lower() == "real":
+            assert got == "real"
+        else:
+            assert got == "isolated", (
+                f"CC_CU_DISPLAY_MODE={wrong!r} 必须落到 isolated（拼错不能变成\"没隔离\"），"
+                f"实际 {got!r}")
+    # 正控：确认 "real" 与 "REAL" 真的进得去（否则上面那条恒真）
+    for good in ("real", "REAL", " real "):
+        monkeypatch.setenv("CC_CU_DISPLAY_MODE", good)
+        assert desktop.display_mode() == "real", f"{good!r} 应当被认成 real"
+
+
+def test_isolated_foreground_is_never_the_users_window(monkeypatch):
+    """
+    ★★ 这条是本节最要紧的一条：**隔离模式下"前台窗口"绝不能是用户的窗口**。
+
+    `GetForegroundWindow()` 在隐藏桌面上返回的是**用户桌面的**前台窗口
+    （物理输入只进当前输入桌面，我们那张桌面上没有前台）。拿它当"当前窗口"，
+    后续的读树 / OCR / 落点证据 / 坐标点击就会**打到用户正在用的那扇窗上** ——
+    而我们全程不抢前台，**用户完全感觉不到**。
+
+    判据取**两个方向**：
+      · 隔离时 → 必须返回 0（"没有可认定的前台"），即使系统报了一个前台窗口；
+      · 非隔离时 → 必须原样返回那个前台窗口（否则这条判据恒真）。
+    """
+    from computer_use_mcp.backend.windows.driver import apps, desktop, win32
+
+    monkeypatch.setattr(win32, "foreground_window", lambda: 0xDEAD)
+    monkeypatch.setattr(win32, "window_text", lambda h: "用户的应用")
+    monkeypatch.setattr(win32, "is_iconic", lambda h: False)
+    monkeypatch.setattr(win32, "window_rect", lambda h: (0, 0, 10, 10))
+    monkeypatch.setattr(desktop, "display_mode", lambda: "isolated")
+
+    # ① 桌面已就绪
+    monkeypatch.setattr(desktop, "_STATE",
+                        {"name": "CCCU-test", "handle": 1234, "isolated": True})
+    assert apps._target_foreground() == 0, (
+        "隔离模式下必须拒绝把**用户桌面的**前台窗口当成目标")
+    assert apps.active_window_title() is None
+    assert apps.active_window_rect() is None
+
+    # ② ★ 桌面**还没建出来**（隔离模式已生效、句柄还是 0）—— 这一档同样不许退回用户窗口。
+    #    它是"策略与就绪度分离"这条设计的落脚点：没建出来 = 什么都看不到，
+    #    而不是"那就看用户的吧"。判据必须单独测，因为它在实现里是另一个分支。
+    monkeypatch.setattr(desktop, "_STATE",
+                        {"name": None, "handle": 0, "isolated": False})
+    assert apps._target_foreground() == 0, (
+        "隔离模式但桌面未就绪时，同样不许把用户的前台窗口当成目标")
+    assert apps.active_window_title() is None
+
+    # ③ 反向正控：非隔离时它就该是那个前台窗口（证明上面不是因为"函数坏了"才返回 0）
+    monkeypatch.setattr(desktop, "display_mode", lambda: "real")
+    assert apps._target_foreground() == 0xDEAD
+    assert apps.active_window_title() == "用户的应用"
+
+
+def test_isolated_window_enumeration_uses_the_desktop_api(monkeypatch):
+    """
+    ★ 隔离模式下窗口枚举必须走 `EnumDesktopWindows(我们的桌面)`。
+
+    ⚠️ 为什么这条必须钉住：`EnumWindows` **只看调用线程所在的那张桌面** ——
+    用它枚举隐藏桌面，会稳定地返回"一个窗口都没有"，而且**不报任何错**。
+    那种失败的表现是"应用启动成功了但找不到它"，最难查。
+
+    判据取**调用形状**（哪条 API 被调、带没带我们的桌面句柄），并带反向正控：
+    非隔离时必须走原来那条路（`real` 模式行为一字不变）。
+    """
+    from computer_use_mcp.backend.windows.driver import desktop, win32
+
+    calls: dict[str, list] = {"desktop_api": [], "enumwindows": []}
+    monkeypatch.setattr(desktop, "enum_windows",
+                        lambda hdesk=0, visible_only=True: calls["desktop_api"].append(hdesk) or [])
+    monkeypatch.setattr(win32, "enum_top_level_windows",
+                        lambda **k: calls["enumwindows"].append(1) or [])
+
+    monkeypatch.setattr(desktop, "display_mode", lambda: "isolated")
+    monkeypatch.setattr(desktop, "_STATE",
+                        {"name": "CCCU-t", "handle": 4321, "isolated": True})
+    desktop.enumerate_target()
+    assert calls["desktop_api"] == [4321], f"隔离时应带我们的桌面句柄，实际 {calls}"
+    assert not calls["enumwindows"], "隔离时**不该**走 EnumWindows（它看不到隐藏桌面）"
+
+    # ★ 隔离模式但桌面未就绪 → 必须返回**空**，而不是退回 `EnumWindows`
+    #   （后退回等于把用户桌面的窗口列出来，那正是隔离要挡掉的）
+    calls["desktop_api"].clear()
+    monkeypatch.setattr(desktop, "_STATE", {"name": None, "handle": 0,
+                                            "isolated": False})
+    assert desktop.enumerate_target() == [], "未就绪时必须返回空，不能退回用户桌面枚举"
+    assert calls["desktop_api"] == []
+    assert not calls["enumwindows"], "未就绪时也不该去枚举用户桌面"
+
+    # 反向正控：real 模式保持原来的枚举路径（行为一字不变）
+    monkeypatch.setattr(desktop, "display_mode", lambda: "real")
+    desktop.enumerate_target()
+    assert not calls["desktop_api"], "非隔离时不该走 EnumDesktopWindows"
+    assert calls["enumwindows"] == [1], "非隔离时必须保持原来的枚举路径"
+
+
+def test_spawn_refuses_instead_of_silently_landing_on_the_user_desktop(monkeypatch):
+    """
+    ★ 隔离桌面起不来时，`spawn_app` 必须**如实报失败**，绝不静默退回用户桌面。
+
+    用户显式选了隔离。悄悄把应用开到他桌面上，是"命令成功、完全违背意图"那类失败 ——
+    而它在界面上看不出任何异常。
+
+    判据：桌面建不起来 → `ok=False` 且**没有调用** `desktop.spawn`（一次都不许试）。
+    正控：桌面正常时确实会去 spawn。
+    """
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+    from computer_use_mcp.backend.windows.driver import desktop
+
+    spawned: list = []
+    monkeypatch.setattr(desktop, "display_mode", lambda: "isolated")
+    monkeypatch.setattr(desktop, "ensure_isolated",
+                        lambda: {"ok": False, "error": "（桩）建不出来"})
+    monkeypatch.setattr(desktop, "spawn",
+                        lambda *a, **k: spawned.append(a) or {"ok": True, "pid": 1})
+
+    res = WindowsBackend().spawn_app(["notepad.exe"], {})
+    assert res.get("ok") is False, f"起不来时必须报失败，实际 {res}"
+    assert "隔离桌面" in (res.get("error") or "")
+    assert spawned == [], "桌面不可用时**一次都不许**尝试启动（那会落到用户桌面）"
+
+    monkeypatch.setattr(desktop, "ensure_isolated",
+                        lambda: {"ok": True, "name": "CCCU-t", "handle": 9})
+    monkeypatch.setattr(desktop, "spawn",
+                        lambda *a, **k: {"ok": True, "pid": 42})
+    monkeypatch.setattr(desktop, "target_name", lambda: "CCCU-t")
+    res2 = WindowsBackend().spawn_app(["notepad.exe"], {})
+    assert res2.get("ok") is True and res2.get("target") == "CCCU-t", f"{res2}"
+
+
+def test_real_mode_does_not_take_over_app_launching(monkeypatch):
+    """
+    `real` 模式必须**返回 None**（交给调用方走原来的 `subprocess.Popen`）。
+
+    理由有两层，都要留住：
+      ① 用户显式选了 real（"就用老行为"），那条路不该被这次改动碰到 ——
+         与 `enumerate_target()` 在非隔离时坚持走原路径是同一条纪律；
+      ② 原来的路径带 `stdout/stderr=DEVNULL` 重定向。MCP 走的是 **stdio**，
+         子进程若往继承来的 stdout 写东西，会把 JSON-RPC 流搅坏 ——
+         这条保护不能因为换了个更"现代"的启动方式就丢掉。
+    """
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+    from computer_use_mcp.backend.windows.driver import desktop
+
+    called: list = []
+    monkeypatch.setattr(desktop, "display_mode", lambda: "real")
+    monkeypatch.setattr(desktop, "spawn", lambda *a, **k: called.append(a) or {})
+    monkeypatch.setattr(desktop, "use_default", lambda: None)
+
+    assert WindowsBackend().spawn_app(["notepad.exe"], {}) is None
+    assert called == [], "real 模式不该接管启动（那会丢掉 stdio 重定向保护）"
+

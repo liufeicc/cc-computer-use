@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import time
 
-from . import win32
+from . import desktop, win32
 
 # 外壳窗口：整屏大小、永远排面积第一，但**不是应用**。
 # 与 `dpi_probe._SHELL_CLASSES` 是同一份判断，这里独立一份是因为用途不同
@@ -61,7 +61,11 @@ def window_rows(limit: int = 100) -> list[dict]:
     也绝不假装它有个正常坐标：调用方据此决定要不要先还原（见 `ensure_restored`）。
     """
     rows: list[dict] = []
-    for hwnd in win32.enum_top_level_windows():
+    # ⚠️ 走 `desktop.enumerate_target()` 而不是直接 `win32.enum_top_level_windows()`：
+    #    隔离模式下目标桌面是**隐藏桌面**，而 `EnumWindows` **只看本线程所在的那张桌面**
+    #    —— 用它枚举会稳定地返回"一个窗口都没有"，且**不报任何错**。
+    #    非隔离时 `enumerate_target()` 内部仍走原来那条路（real 模式行为一字不变）。
+    for hwnd in desktop.enumerate_target():
         if not win32.is_usable_window(hwnd):
             continue
         if win32.class_name(hwnd) in _SHELL_CLASSES:
@@ -169,6 +173,26 @@ def wait_window(title_contains: str | None = None, window_id: str | None = None,
 
 # ── 前台 / 几何 ─────────────────────────────────────────────────────────
 
+def _target_foreground() -> int:
+    """
+    「本次操作认定的前台窗口」—— 隔离模式下**不是** `GetForegroundWindow()`。
+
+    ⚠️⚠️ 这是本模块最要紧的一处安全判断，别改成直接调 `foreground_window()`：
+
+    `GetForegroundWindow()` 返回的是**用户桌面的前台窗口**（隐藏桌面上没有前台，
+    物理输入只进当前输入桌面）。隔离模式下若拿它当"当前窗口"，
+    后续的读树 / OCR / 落点证据 / 甚至坐标点击就会**打到用户正在用的那扇窗上** ——
+    而我们全程不抢前台，**用户完全感觉不到**。
+
+    所以隔离模式下这里返回 **0**（= 没有可认定的前台），让调用方如实报"取不到"。
+    真要做"当前在操作哪一扇"，那是**协调层**的事（它记得住最近操作过的窗口），
+    由它显式传下来 —— 驱动层不许自己猜一个。
+    """
+    if desktop.is_isolated():
+        return 0
+    return win32.foreground_window()
+
+
 def active_window_title() -> str | None:
     """
     前台窗口标题。取不到（无前台窗口 / 服务会话）返回 None。
@@ -177,7 +201,7 @@ def active_window_title() -> str | None:
     "没有前台窗口"与"前台窗口没有标题"是两件事。本项目在 Linux 侧为同一个问题
     专门写过 `window_title()` 做归一（空串 → None），这里保持一致。
     """
-    hwnd = win32.foreground_window()
+    hwnd = _target_foreground()
     if not hwnd:
         return None
     text = win32.window_text(hwnd)
@@ -186,7 +210,7 @@ def active_window_title() -> str | None:
 
 def active_window_rect() -> tuple[int, int, int, int] | None:
     """前台窗口矩形。最小化的窗口返回 None —— 那种矩形不可信（见 `window_rows`）。"""
-    hwnd = win32.foreground_window()
+    hwnd = _target_foreground()
     if not hwnd or win32.is_iconic(hwnd):
         return None
     return win32.window_rect(hwnd)

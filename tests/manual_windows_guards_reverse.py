@@ -18,6 +18,7 @@ REPO 上跑一遍，断言它**必须抛异常**。
 
 from __future__ import annotations
 
+import os
 import pathlib
 import shutil
 import sys
@@ -444,8 +445,35 @@ def _runtime_cases():
         WindowsBackend.window_for_app = first_with_area
         undo.append(lambda: setattr(WindowsBackend, "window_for_app", old))
 
+    def break_mode_parse(undo):  # noqa: ANN001
+        from computer_use_mcp.backend.windows.driver import desktop
+        old = desktop.display_mode
+        desktop.display_mode = lambda: (
+            "real" if (os.environ.get("CC_CU_DISPLAY_MODE") or "").strip().lower()
+            != "isolated" else "isolated")   # ← 反了：拼错/未设都落到 real
+        undo.append(lambda: setattr(desktop, "display_mode", old))
+
+    def break_isolated_foreground(undo):  # noqa: ANN001
+        from computer_use_mcp.backend.windows.driver import apps
+        old = apps._target_foreground
+        apps._target_foreground = lambda: __import__(
+            "computer_use_mcp.backend.windows.driver.win32",
+            fromlist=["x"]).foreground_window()   # ← 隔离时也返回用户桌面的前台
+        undo.append(lambda: setattr(apps, "_target_foreground", old))
+
+    def break_enumerate_target(undo):  # noqa: ANN001
+        from computer_use_mcp.backend.windows.driver import desktop
+        old = desktop.enumerate_target
+        desktop.enumerate_target = lambda visible_only=True: __import__(
+            "computer_use_mcp.backend.windows.driver.win32",
+            fromlist=["x"]).enum_top_level_windows(visible_only=visible_only)
+        undo.append(lambda: setattr(desktop, "enumerate_target", old))
+
     return [
         (break_win_default_scope, "capture::test_default_capture_scope_is_a_platform_difference", ()),
+        (break_mode_parse, "windows::test_display_mode_defaults_to_isolated_and_only_recognises_real", None),
+        (break_isolated_foreground, "windows::test_isolated_foreground_is_never_the_users_window", None),
+        (break_enumerate_target, "windows::test_isolated_window_enumeration_uses_the_desktop_api", None),
         (break_remembered_target, "capture::test_recently_touched_window_beats_the_foreground", ()),
         (break_foreground_notice, "capture::test_foreground_fallback_is_loud_not_silent", ()),
         (break_unknown_app_raise, "capture::test_unknown_app_raises_instead_of_silently_using_another_window", ()),
@@ -534,7 +562,23 @@ def main() -> int:
                 #    `pytest.raises` 在"没抛出来"时抛的是 `_pytest.outcomes.Failed`，
                 #    而它继承自 `BaseException` —— 只抓 Exception 会让这一条**直接
                 #    把脚本打崩**（实测踩到），于是后面几条反证根本没跑就被判失败。
-                print(f"  ✅ [R{j}] {case}\n        → 报错（{type(exc).__name__}）：{exc}")
+                #
+                # ★ 但"拦下"只认**判据本身**变红（`AssertionError` 或 pytest 的
+                #   `Failed`）。别的异常类型（`AttributeError` / `TypeError` …）说明
+                #   **破坏方自己写坏了**，不是守卫在起作作用 —— 那种"报错"看起来
+                #   和"被拦下"一模一样，正是本脚本存在的理由所要防的假通过。
+                #   （本轮实测踩到过两次：夹具没传、monkeypatch 打空。）
+                if isinstance(exc, AssertionError) or type(exc).__name__ == "Failed":
+                    first = (str(exc).splitlines() or [""])[0][:88] or "(裸断言，无消息)"
+                    print(f"  ✅ [R{j}] {case}\n        → 被拦下：{first}")
+                else:
+                    bad += 1
+                    import traceback
+                    tb = traceback.format_exc().strip().splitlines()[-4:]
+                    print(f"  ❌ [R{j}] {case} —— **破坏方自己坏了**："
+                          f"{type(exc).__name__}: {str(exc)[:110]}\n"
+                          f"        （这不是守卫在起作用；把它当通过就是假通过）\n"
+                          + "\n".join(f"        {ln}" for ln in tb))
             else:
                 bad += 1
                 print(f"  ❌ [R{j}] {case} —— 种了坏东西，守卫**仍然通过**")

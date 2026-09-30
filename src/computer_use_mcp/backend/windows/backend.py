@@ -63,6 +63,7 @@ server 进程启动时（早于任何工具调用），于是整个进程生命�
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -80,7 +81,7 @@ from ..base import (
     Rect,
     TextBlock,
 )
-from .driver import _uia, actions, apps, capture, nodes, session_info, win32
+from .driver import _uia, actions, apps, capture, desktop, nodes, session_info, win32
 from .driver import ocr as ocr_mod
 
 log = get_logger(__name__)
@@ -136,6 +137,38 @@ class WindowsBackend(Backend):
         #    空间」—— 拖到"第一次碰 UIA 才设"会让坐标空间**中途翻转**，
         #    详见模块 docstring 的「DPI 感知必须在构造后端时就设死」。
         self._dpi: dict[str, Any] = _uia.ensure_dpi_awareness()
+        # ★ 最近一次由 `spawn_app` 启动的进程号 —— 隔离模式下用它把「当前该操作哪扇窗」
+        #   推出来（隐藏桌面上没有前台窗口，见 `apps._target_foreground` 的说明）。
+        self._last_spawned_pid: int = 0
+        # ⚠️ 还要记**启动的是哪个 exe**：Win11 的 Store 应用别名（`notepad.exe` 就是）
+        #   会先起一个 launcher 进程、再拉起真正的应用进程 —— 于是
+        #   `CreateProcess` 给的 pid 与**窗口的** pid **不是同一个**（实测：
+        #   launch_app 报 pid=5664，窗口的 pid 是 9164）。只按 pid 匹配会静默落到
+        #   "面积最大"那条兜底上，而模型的意图明明是"操作我刚启动的那个"。
+        self._last_spawned_app: str = ""
+        # ★ **隔离桌面也必须在这一刻就建好**，不能等第一次 `launch_app`。
+        #
+        #   理由是"窗口枚举该看谁"会中途翻转：桌面没建时 `is_isolated()` 为假，
+        #   `list_windows` 枚举的是**用户桌面**（看到你开的那些窗）；建好之后同一句
+        #   枚举只看**我们的**桌面（空的）。同一次会话里两种答案，而**都不报错** ——
+        #   与 DPI 感知那条"坐标空间中途翻转"是同一类失效。
+        #   隐藏桌面不弹任何可见的东西，所以没有 Linux 侧"别一开 Claude 就弹个 Xephyr"
+        #   那个顾虑，可以放心提前建。
+        self._isolated: dict[str, Any] = {}
+        if desktop.is_isolated():
+            try:
+                self._isolated = desktop.ensure_isolated()
+            except Exception as exc:  # noqa: BLE001
+                # ⚠️ 这里**必须兜住**：构造发生在 `get_backend()`，而它是任何工具调用
+                # 都会走的路。构造失败的代价不该是"整个后端起不来"，而应该是
+                # "这次没有隔离桌面"—— 后者由 `spawn_app` 在真正要启动应用时
+                # **响亮拒绝**（它检查 `ensure_isolated()` 的返回值）。
+                # 顺带这也是"在非 Windows 上构造 `WindowsBackend` 不炸"那条既有
+                # 纪律（`test_windows_backend_is_instantiable_on_this_platform`）的保证。
+                self._isolated = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if not self._isolated.get("ok"):
+                log.warning("隔离桌面建立失败，本次会话将**没有隔离**：%s",
+                            self._isolated.get("error"))
 
     # ---------- 就绪 ----------
 
@@ -334,7 +367,42 @@ class WindowsBackend(Backend):
         return win32.process_basename(win32.pid_of_window(hwnd)) or win32.class_name(hwnd)
 
     def _foreground_hwnd(self) -> int:
-        return win32.foreground_window()
+        """
+        「本次该操作的那扇窗」的句柄。
+
+        ⚠️ 隔离模式下**不是** `GetForegroundWindow()` —— 隐藏桌面上没有前台窗口，
+        而那个调用会稳定地返回**用户桌面上**的窗口。拿它当目标，后续的读树/OCR/
+        落点证据就全打在用户的窗口上，且因为我们不抢前台，**用户完全感觉不到**。
+        （`apps.active_window_*` 已按同一条理由返回 None，这里是同一个判断的另一处。）
+
+        隔离模式下按 `_target_hwnd()` 推导：先认**本进程最近启动的那个应用**的窗口，
+        没有就取目标桌面上面积最大的那扇，并在 `notice` 里说明选了谁 ——
+        绝不静默猜一个。
+        """
+        if not desktop.is_isolated():
+            return win32.foreground_window()
+        hwnd, _why = self._target_hwnd()
+        return hwnd
+
+    def _target_hwnd(self) -> tuple[int, str]:
+        """隔离模式下的「目标窗口」：(hwnd, 说明)。取不到返回 (0, 原因)。"""
+        rows = apps.window_rows(limit=200)
+        if not rows:
+            return 0, ("隔离桌面上还没有任何窗口 —— 先用 launch_app 启动一个应用"
+                       "（agent 自己起的应用才会落在隔离桌面上）")
+        if self._last_spawned_pid or self._last_spawned_app:
+            mine = [r for r in rows
+                    if int(r.get("pid") or 0) == self._last_spawned_pid
+                    or (self._last_spawned_app and
+                        (r.get("app") or "").lower() == self._last_spawned_app)]
+            if mine:
+                r = max(mine, key=lambda x: x.get("area") or 0)
+                return (int(r["id"], 16),
+                        f"最近启动的应用（{self._last_spawned_app or 'pid=' + str(self._last_spawned_pid)}）")
+        r = max(rows, key=lambda x: x.get("area") or 0)
+        return (int(r["id"], 16),
+                f"隔离桌面上面积最大的窗口（{r.get('title') or r.get('app')!r}）"
+                f"—— 有多个窗口时建议显式传 app= 指明目标")
 
     def _build_tree(self, label: str, element: Any, depth: int, max_depth: int,  # noqa: ANN401
                     max_nodes: int, counter: dict, deadline: float) -> UINode:
@@ -569,10 +637,25 @@ class WindowsBackend(Backend):
         return apps.screen_layout()
 
     def active_window_title(self) -> str | None:
-        return apps.active_window_title()
+        """本次该操作的窗口标题。
+
+        ⚠️ 隔离模式下走目标窗口推导（`apps.active_window_title` 返回 None 是**对的**，
+        但它会让落点证据/落点文字全空）—— 这里补上"我们认定的目标"，
+        语义与 Linux 侧的"活动窗口"对齐：都是「这次操作落在哪扇窗」。
+        """
+        if not desktop.is_isolated():
+            return apps.active_window_title()
+        hwnd, _why = self._target_hwnd()
+        return (win32.window_text(hwnd) or None) if hwnd else None
 
     def active_window_rect(self) -> Rect | None:
-        r = apps.active_window_rect()
+        if not desktop.is_isolated():
+            r = apps.active_window_rect()
+            return Rect(x=r[0], y=r[1], w=r[2] - r[0], h=r[3] - r[1]) if r else None
+        hwnd, _why = self._target_hwnd()
+        if not hwnd:
+            return None
+        r = win32.window_rect(hwnd)
         return Rect(x=r[0], y=r[1], w=r[2] - r[0], h=r[3] - r[1]) if r else None
 
     # ---------- 元素级动作 ----------
@@ -858,9 +941,52 @@ class WindowsBackend(Backend):
         meta["window_title"] = win32.window_text(hwnd) if hwnd else None
         return data, meta
 
+    def spawn_app(self, argv: list[str], env: dict[str, str]) -> dict[str, Any] | None:
+        """
+        启动应用。**隔离模式下起在隐藏桌面上**（用户看不见、也碰不到），
+        `real` 模式下与老行为一致（起在用户桌面）。
+
+        实现逻辑：确保目标桌面就绪 → `desktop.spawn`（自己拼 `STARTUPINFOW` 设
+        `lpDesktop`）→ **记下 pid**（隔离模式下它是"该操作哪扇窗"的第一依据，
+        因为没有前台窗口可问）。
+
+        ⚠️ 隔离桌面**起不来**时**不静默降级到用户桌面** —— 那正是用户最不想要的
+        （他明确选了隔离）。如实返回 `ok=False` 并把原因带上（`CreateDesktopW` 的
+        errno 已经说明它为什么不高兴）。
+        """
+        if desktop.display_mode() != "isolated":
+            # ★ `real` 模式**不接管**启动 —— 返回 None 让调用方走原来的
+            #   `subprocess.Popen`。这一条是刻意的，不是省事：
+            #   ① 用户显式选了 real（"就用老行为"），那条路不该被这次改动碰到；
+            #   ② 真机实测 `CreateProcessW` 在**不带 `lpDesktop`** 时会卡住
+            #      （2026-09-30 记录，见 `manual_windows_isolated_story.py` 的诊断节）——
+            #      带桌面名时正常。既然 real 模式不需要它，就没有理由冒这个风险。
+            desktop.use_default()
+            return None
+        else:
+            ready = desktop.ensure_isolated()
+            if not ready.get("ok"):
+                return {"ok": False, "pid": 0, "target": None, "argv": argv,
+                        "error": (f"隔离桌面不可用：{ready.get('error')}。"
+                                  f"要直接在用户桌面上启动，请设 "
+                                  f"CC_CU_DISPLAY_MODE=real 后重启 Claude Code。")}
+        res = desktop.spawn(argv, env)
+        if res.get("ok"):
+            self._last_spawned_pid = int(res.get("pid") or 0)
+            self._last_spawned_app = os.path.basename(argv[0]).lower()
+            if self._last_spawned_app.endswith(".exe"):
+                self._last_spawned_app = self._last_spawned_app[:-4]
+        res["target"] = desktop.target_name() if res.get("ok") else None
+        return res
+
     def active_window_id(self) -> str | None:
-        """当前前台窗口的 id；取不到返回 None（与 `list_windows` 的 id 同形状）。"""
-        hwnd = win32.foreground_window()
+        """
+        本次该操作的窗口 id；取不到返回 None（与 `list_windows` 的 id 同形状）。
+
+        ⚠️ 隔离模式下走「目标窗口」推导而不是 `GetForegroundWindow()`（理由见
+        `_foreground_hwnd`）—— 后者在隔离模式下指的是**用户的**窗口。
+        """
+        hwnd = self._foreground_hwnd()
         return f"0x{hwnd:x}" if hwnd else None
 
     def window_for_app(self, app: str) -> str | None:

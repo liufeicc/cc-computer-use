@@ -329,6 +329,26 @@ class Backend(ABC):
         """
         return None
 
+    def spawn_app(self, argv: list[str], env: dict[str, str]) -> dict[str, Any] | None:
+        """
+        启动一个应用，返回 `{"ok", "pid", "target", "argv", "error"}`；`None` = 本平台
+        没有专属实现（调用方自己 `subprocess.Popen`）。
+
+        ⚠️ 为什么要有这个钩子，而不是让 coordinator 自己 `Popen`：**"应用起在哪儿"
+        是平台差异**。Linux 是"目标 DISPLAY 上的那个窗口管理器管着它"，
+        Windows 是"起在哪张**桌面**上"—— 后者只能经 `CreateProcessW` 的
+        `STARTUPINFOW.lpDesktop` 指定，`subprocess` **做不到**（它的 `STARTUPINFO`
+        根本没有那个字段，设上去是静默无效的）。
+
+        `target` 是**人读的落地位置**（Linux 上一般是 DISPLAY 串，Windows 上是桌面名），
+        调用方原样回报给模型 —— 模型据此知道"这个应用起在哪、我能不能看见它"。
+
+        ⚠️ 返回 `None` 的语义必须钉死为「**本平台没有专属启动路径**」，**不是**
+        「这次启动失败了」：后者要返回 `ok=False` 并带原因。把失败报成 None 会让
+        调用方静默换一条路重试（在 Windows 上那条路恰好是**起在用户桌面上**）。
+        """
+        return None
+
     def active_window_id(self) -> str | None:
         """
         当前活动窗口的 **id**（与 `list_windows` / `window_id` 同一套），取不到返回 None。
