@@ -48,20 +48,26 @@ Windows 能做到「不抢」的路只有两条，而**它们的可行性只测�
 | UIA 元素级 `InvokePattern.Invoke` | ✅ **可用** | ✅ 不打扰（前后台两种都测了） |
 | UIA `ValuePattern.SetValue` | ✅ 写进去了（读回命中） | ⚠️ **Win11 记事本会自己激活到前台** |
 | 定向键盘 `PostMessage(WM_CHAR)` → 子 HWND | ✅ 可用（DEMO 结论复现） | ✅ 不打扰 |
-| **定向鼠标**（PostMessage/SendMessage→子窗、`BM_CLICK`、PostMessage→顶层） | ❌ **四种全失效** | ✅（因为压根没生效） |
+| **定向鼠标**（PostMessage/SendMessage→子窗、`BM_CLICK`、PostMessage→顶层） | ❌ **全失效** | ✅（因为压根没生效） |
 | 定向鼠标 `BM_CLICK`（目标**前台**时） | ✅ 生效 | —（目标本身是前台，判据不适用） |
 
-**鼠标那四种失效是在两个不同来源的对话框上分别测的**（winver 与 PowerShell
-WinForms 消息框），所以不是"某个程序有防护"。推测机制是**对话框按钮要求所属对话框
-处于活动状态**才会响应 —— 若如此，那就意味着"不激活地点击后台对话框按钮"**做不到**，
-而不是我们的消息参数写错了。
+**「对话框特有」这条推测已被推翻**（2026-09-30 补测，第六节 b）：
+早先只在对话框按钮上测过鼠标定向，当时猜「对话框要求自己处于活动状态才响应」。
+补设了第六节 b —— 在**记事本主窗口的编辑区**（`RichEditD2DPT`）上点一刀再看光标行号：
+**光标没动**（字符落在第 0 行，不在点击处），同时前台被记事本自己抢走了。
+所以**主窗口上的定向鼠标同样不成立**，不是对话框的特例。
 
-**未覆盖**：非对话框类窗口（主窗口上的工具栏/按钮）的定向鼠标没测 —— 不能把
-上面这条外推到那类窗口。
+⚠️ 这条与「不打扰」那条结论是**分开**读的：鼠标消息确实没生效（不打扰是"因为什么都没发生"），
+而 UIA `SetValue` / `Invoke` 是**真的生效了**并且（除记事本 SetValue 外）不打扰。
+两者不能互相外推 —— 一个是"能用但不打扰"，一个是"根本不能用"。
 
 ⚠️ **每条"不打扰"的结论都依赖于对照实验先通过**（见 `control_experiment`）：
 真机实测里有一轮**本进程完全没有前台权力**（设谁都设不动），那一轮所有
-「前台没变」都是废话。看到 `❌ 对照实验` 时，同轮的不打扰结论一律要降级看待。
+「前台没变」都是废话。**更隐蔽的一次是 2026-09-30 的复跑**：那一轮对照实验**通过了**，
+但环境里 Edge 在反复自行抢前台，于是`鼠标[…]点中了（对话框消失）`一度**假通过** ——
+重跑（先把 Edge 杀掉）后六种鼠标技法**全部如实报失败**。所以
+**「点中了」这条判据在有后台噪声时也会假阳性**：噪声窗口把对话框顶掉，看起来就像被点掉了。
+稳的做法是：跑之前先确认 `0b) 前台稳定性诊断` 是干净的。
 """
 
 from __future__ import annotations
@@ -284,19 +290,34 @@ def stable_baseline(avoid: int = 0) -> Snapshot | None:
     return None
 
 
+# 本轮「本进程有没有前台权力」——由 `control_experiment` 写入，供 `judge_quiet` 消费。
+# ⚠️ 它是**跨小节共享的判据前提**，不是某一节的局部状态：拿不到前台权力时，
+#    「前台没变」是恒真的废话，那一轮所有 ✅ 都不能采信。
+_HAS_FOREGROUND_POWER: bool | None = None
+
+
 def judge_quiet(label: str, baseline: Snapshot | None) -> None:  # noqa: ANN001
     """
-    收尾时判「不打扰」：**基线不稳就别下结论**。
+    收尾时判「不打扰」：**基线不稳、或本轮没有前台权力，就不下结论**。
 
-    ⚠️ 刻意不把「找不到稳定基线」记成 ❌，也不记成 ✅ —— 那是**未验证**。
+    ⚠️ 刻意不把这两种情况记成 ❌，也不记成 ✅ —— 那是**未验证**。
     本项目最忌讳的失效形态就是拿"没测到"冒充"测到了没问题"。
+
+    ⚠️ 两个方向的处理**不对称**（这是刻意的）：
+      · 判 **✅**（前台没变）时，必须先证明本进程**有能力**改前台 —— 否则那是废话；
+      · 判 **❌**（前台变了）时**不需要**这个前提 —— 变都变了，说明确实有事发生。
     """
+    after = snap()
     if baseline is None:
         info(f"{label}:不打扰用户", "**未验证** —— 本环境找不到稳定的中性前台基线，"
                                     "前后对比无意义（见 stable_baseline 的说明）")
         return
-    after = snap()
     same, why = baseline.same_as(after)
+    if same and _HAS_FOREGROUND_POWER is not True:
+        info(f"{label}:不打扰用户",
+             "**未验证** —— 本轮「本进程有前台权力」那条对照实验没过，"
+             "「前台没变」在此前提下是恒真判据，不能当结论（见 control_experiment）")
+        return
     ok(f"{label}:不打扰用户", same, why or f"与基线一致（{baseline.fg_title!r}）")
 
 
@@ -502,8 +523,12 @@ def control_experiment(anchor: dict) -> bool:
 
     win32.set_foreground_window(desk)
     time.sleep(0.4)
-    return ok("对照实验:本进程有前台权力", can_lose or can_take,
-              "否则「前台没变」是恒真判据，本探针的「不打扰」结论全部失效")
+
+    global _HAS_FOREGROUND_POWER
+    _HAS_FOREGROUND_POWER = bool(can_lose or can_take)
+    return ok("对照实验:本进程有前台权力", _HAS_FOREGROUND_POWER,
+              "否则「前台没变」是恒真判据，本探针的「不打扰」结论全部失效"
+              "（本轮所有 ✅ 都会被降级成「未验证」；❌ 不受影响）")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -920,6 +945,193 @@ def _dark_fraction(mem_dc: int, bmp: int, w: int, h: int, g) -> float:  # noqa: 
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# ⑥b **主窗口**（非对话框）上的定向点击 —— 决定"灰区软件能不能不打扰"
+#
+# ═══ 为什么必须单独测这一节 ═══
+#
+# 第五节在**对话框按钮**上测出「定向鼠标四种技法全失效」，而推测的机制是
+# 「对话框要求自己处于活动状态才响应按钮点击」。若真是这样，那是**对话框特有**的性质，
+# 主窗口上的按钮未必如此。
+#
+# 这件事直接决定产品形态：
+#   · 有元素树的软件 → 走元素级，本来就不打扰（已证）；
+#   · **没有元素树的软件**（SWT/Java、自绘控件、游戏）→ 只能坐标点击。
+#     其中"整个界面是一块渲染面、没有子 HWND"的那类（SWT 就是）连**定向目标都找不到**，
+#     而"主窗口里真有子控件"的那类还有机会。
+#
+# 所以这一节回答两个问题：
+#   ① 桌面上的主窗口里，有多少**根本没有子 HWND**（= 定向投递从构造上就没法谈）？
+#   ② 对**有**子控件的主窗口，同一套消息技法能不能生效？
+# ══════════════════════════════════════════════════════════════════════════
+
+def _enum_children(hwnd: int, cap: int = 40) -> list[dict]:  # noqa: ANN001
+    """枚举一个窗口的直接子窗（`FindWindowExW` 逐个取兄弟），带上限。"""
+    u = ctypes.windll.user32
+    u.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+    u.FindWindowExW.restype = wintypes.HWND
+    out: list[dict] = []
+    cur = wintypes.HWND(0)
+    while len(out) < cap:
+        cur = u.FindWindowExW(wintypes.HWND(hwnd), cur, None, None)
+        if not cur:
+            break
+        h = int(cur)
+        out.append({"hwnd": h, "class": win32.class_name(h),
+                    "text": win32.window_text(h) or "",
+                    "rect": win32.window_rect(h)})
+    return out
+
+
+def child_hwnd_census() -> None:
+    """
+    统计桌面上主窗口的**子 HWND 拥有率**。
+
+    这是本探针里最可泛化的一条观察：定向投递（`PostMessage` 到子窗）的**前提是
+    目标有子 HWND**。整块自绘界面的应用（SWT/Java、Electron 的渲染面）没有子窗，
+    那么"不抢焦点地点击"在那类应用上**从构造上就不成立** —— 无论消息参数写得多对。
+    """
+    print("\n=== 6b-① 子 HWND 普查（定向投递的前提）===")
+    total = with_child = 0
+    rows: list[str] = []
+    for row in apps.window_rows(limit=60):
+        if row.get("class") == "#32770":        # 对话框另算
+            continue
+        total += 1
+        kids = _enum_children(int(row["id"], 16))
+        if kids:
+            with_child += 1
+            if len(rows) < 8:
+                rows.append(f"{row.get('app')}/{row.get('class')}: "
+                            f"{[k['class'] for k in kids[:5]]}")
+    info("主窗口子 HWND 普查", f"共 {total} 个主窗口，其中 {with_child} 个有子 HWND"
+                              f"（{with_child}/{max(total, 1)}）")
+    for r in rows:
+        info("  有子窗的例子", r)
+    if total:
+        ok("桌面上存在有子 HWND 的主窗口（存在可定向的目标）", with_child > 0,
+           f"{with_child}/{total}")
+    # ⚠️ 刻意**不**断言"没有子窗的主窗口一定不能定向" —— 那需要拿一个真的无子窗应用
+    #    （SWT/DBeaver 这类）来测，本机没装。这里只报事实，不做外推。
+
+
+def main_window_mouse(row: dict, read_back) -> None:  # noqa: ANN001
+    """
+    在**主窗口**（不是对话框）上测定向鼠标：点击编辑区把光标挪到中间，再打字。
+
+    ═══ 判据为什么这样设计 ═══
+
+    主窗口上的点击**没有**"对话框消失"那种干脆的证据，所以要自己造一个确定性的：
+      1. 先把正文设成 `0123456789` 并确认；
+      2. 用 `EM_SETSEL(0,0)` 把**光标复位到开头**（这是**准备**，不是被测行为）；
+      3. 定向投递一次点击，落在编辑区**水平中点**；
+      4. 再投一个字符 `X`；
+      5. 读回：落在中间（`01234X56789`）说明**点击真的生效了**；
+         落在开头（`X0123456789`）说明点击**没生效**（打字是上次已证可用的能力）。
+
+    这个设计的好处是**两半都有独立已知的答案**：键盘投递与读回都已被前面的小节证过，
+    所以结果的差异只能归因于那一次点击。若 `EM_SETSEL` 不被该控件支持，就**记为未覆盖**
+    而不是判失败 —— 那说明判据搭不起来，不是"技法不行"。
+    """
+    print(f"\n=== 6b-② 主窗口定向点击 · {row.get('app')}/{row.get('class')} ===")
+    hwnd = int(row["id"], 16)
+    try:
+        from computer_use_mcp.backend.windows.driver import _uia as _u  # noqa: PLC0415
+        uia = _u.import_uia()
+        root = uia.ControlFromHandle(hwnd)
+    except Exception as exc:  # noqa: BLE001
+        info("主窗口定向点击", f"取不到 UIA 根 {type(exc).__name__}: {exc} —— **未覆盖**")
+        return
+
+    # 找到那个支持 ValuePattern 的编辑区（同时拿到它的子 HWND）
+    edit_el = None
+    for n in _walk(root):
+        try:
+            if n.GetPattern(_uia.resolve_pattern("ValuePattern")) is not None:
+                edit_el = n
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if edit_el is None:
+        info("主窗口定向点击", "该主窗口没有支持 ValuePattern 的编辑区 —— **未覆盖**")
+        return
+    edit_hwnd = int(getattr(edit_el, "NativeWindowHandle", 0) or 0)
+    info("主窗口定向点击:编辑区", f"子HWND={hex(edit_hwnd) if edit_hwnd else '0(无)'} "
+                                  f"类名={getattr(edit_el, 'ClassName', '?')}")
+    if not edit_hwnd:
+        info("主窗口定向点击", "编辑区没有自己的 HWND（XAML/自绘）→ **定向投递无从谈起**")
+        return
+
+    EM_SETSEL = 0x00B1
+    LINES = [f"{i:02d}AAAAAAAA" for i in range(20)]     # 20 行，够铺满编辑区
+
+    def set_text(text: str) -> None:
+        edit_el.GetValuePattern().SetValue(text)
+        time.sleep(0.4)
+
+    def caret_to_start() -> None:
+        send_message(edit_hwnd, EM_SETSEL, 0, 0)
+        time.sleep(0.2)
+
+    def line_of_x() -> tuple[int | None, str]:
+        """X 落在第几行（`None` = 没找到）。"""
+        text = read_back().replace("\r\n", "\n")
+        for i, ln in enumerate(text.split("\n")):
+            if "X" in ln:
+                return i, ln
+        return None, text[:60]
+
+    # ═══ 判据怎么搭 ═══
+    #
+    # ⚠️ 第一版把落点定在编辑区**垂直中点**、正文只有一行 —— 结果字符落到了**末尾**。
+    #    那不是"点击没生效"：RichEdit 里**点在正文下方**本来就会把光标放到文末。
+    #    判据因此分不清"点中了但位置是文末"与"根本没点中"。实测代价是一轮白跑。
+    #
+    # 现在改成**多行**（20 行铺满），落点取垂直中点：
+    #   · 点击没生效 → 光标停在开头（EM_SETSEL 复位过）→ X 落在**第 0 行**；
+    #   · 点击生效   → 光标落在**中间某行** → X 落在第 8~12 行一带。
+    #   **「不是第 0 行、也不是最后一行」**就是判据 —— 它对 y 的像素级精度不敏感。
+    set_text("\r\n".join(LINES))
+    caret_to_start()
+    baseline = stable_baseline(avoid=hwnd)
+    info("主窗口定向点击:起点前台", baseline.fg_title if baseline else "<无稳定基线>")
+
+    # 对照：不点击，直接打字 → 必须落在第 0 行（证明 EM_SETSEL 与读回都可靠）
+    caret_to_start()
+    post_message(edit_hwnd, WM_CHAR, ord("C"), 0)
+    time.sleep(0.7)
+    ctrl_line, ctrl_ln = line_of_x()
+    ok("主窗口定向点击[对照]:不点击时落在第 0 行（判据搭得起来）",
+       ctrl_line == 0, f"行号={ctrl_line} 该行={ctrl_ln!r}")
+
+    # 被测：定向点击编辑区中点，再打字
+    set_text("\r\n".join(LINES))
+    caret_to_start()
+    r = win32.window_rect(edit_hwnd)
+    mx, my = (r[0] + r[2]) // 2, (r[1] + r[3]) // 2
+    c = client_point_of(edit_hwnd, mx, my)
+    if c is None:
+        info("主窗口定向点击", "ScreenToClient 失败 —— **未覆盖**")
+        return
+    info("主窗口定向点击:落点", f"屏幕=({mx},{my}) 客户区={c}")
+    lp = pack_xy(*c)
+    post_message(edit_hwnd, WM_MOUSEMOVE, 0, lp)
+    time.sleep(0.08)
+    post_message(edit_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp)
+    time.sleep(0.08)
+    post_message(edit_hwnd, WM_LBUTTONUP, 0, lp)
+    time.sleep(0.5)
+    post_message(edit_hwnd, WM_CHAR, ord("X"), 0)
+    time.sleep(0.8)
+    line, ln = line_of_x()
+
+    moved = line is not None and 0 < line < len(LINES) - 1
+    ok("主窗口定向点击:点击生效（字符落在中间行而不是第 0 行）", moved,
+       f"行号={line} 该行={ln!r} —— " + ("光标确实被点击挪走了" if moved
+                                          else "光标没动 → 主窗口上的定向鼠标也不成立"))
+    judge_quiet("主窗口定向点击", baseline)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # ⑥ 滚轮 / 拖拽：有没有定向手段（决定它们在严格模式下是否必须禁用）
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1077,9 +1289,14 @@ def main() -> int:  # noqa: C901
                 Target("classic", "经典 Win32（记事本）", None, ("Notepad",), ()),
                 classic, "UIAWRITE", read_notepad)
         guarded("键盘定向", keyboard_route, classic, "DIRECTED", read_notepad)
+        # 6b：主窗口（非对话框）上的定向点击 —— 决定"灰区软件能不能不打扰"
+        guarded("主窗口定向点击", main_window_mouse, classic, read_notepad)
         guarded("滚轮/拖拽", wheel_and_drag_probe, classic)
     else:
         info("记事本三项", "没有经典 Win32 目标，**未覆盖**")
+
+    # 6b-① 子 HWND 普查（定向投递的前提，放在最前面跑，受环境噪声影响最小）
+    guarded("子 HWND 普查", child_hwnd_census)
 
     # ⑥ PrintWindow（黑图率 + 最坏时延）
     for t, row in found:
