@@ -661,6 +661,22 @@ class WindowsBackend(Backend):
     # ---------- 元素级动作 ----------
 
     def focus(self, native: Any) -> bool:  # noqa: ANN401
+        """
+        把键盘焦点给该元素。
+
+        ⚠️ **隔离模式下直接返回 False，一个动作都不发**。UIA 的 `SetFocus` 会让目标窗口
+        去抢前台——而在隐藏桌面上，它抢的到底是谁的前台是一件没人能担保的事，而
+        "担保不了"在这件事上等于"可能抢到用户头上"。元素级写值**本来就不需要焦点**
+        （DEMO 实测后台 `SetValue` 可用，`actions.set_value` 也已改为写后回读验证），
+        所以这里放弃聚焦是**零代价**的。
+
+        返回值是 False 而不是抛错：调用方（`coordinator.type_text`）**不看这个返回值**
+        ——它只是"顺手把焦点挪过去"的尽力而为，聚焦失败的后果由随后的 `set_value`
+        回读来体现。为它抛错会把一条本来能走通的路掐死。
+        """
+        if desktop.is_isolated():
+            log.debug("隔离模式下跳过元素聚焦（不抢前台）")
+            return False
         try:
             return actions.focus(native)
         except Exception:  # noqa: BLE001
@@ -680,8 +696,13 @@ class WindowsBackend(Backend):
             return False
 
     def set_value(self, native: Any, text: str) -> bool:  # noqa: ANN401
+        """
+        写元素的值。**隔离模式下不聚焦**（理由见 `focus`），靠写后回读来兜住
+        "某些 provider 非焦点状态下静默不生效"那一类（见 `actions.set_value`）。
+        """
         try:
-            return actions.set_value(native, text)
+            return actions.set_value(native, text,
+                                     allow_focus=not desktop.is_isolated())
         except Exception:  # noqa: BLE001
             return False
 
@@ -714,7 +735,11 @@ class WindowsBackend(Backend):
         恒等于空操作，与 `base.py` 的契约（"先激活/聚焦**所在窗口**"）不符；
         而这个错误**不会报任何错**，只会让"点击被激活动作吃掉"那类现象继续存在
         （Linux 侧对此的说明见 `linux/inject/pointer.py`）。2026-09-28 真机复核后改正。
+
+        ★ 隔离模式下的闸门在**第一行**：这一下会真的动用户的鼠标（见 `require_global_input`），
+        必须赶在任何副作用之前拒掉。
         """
+        desktop.require_global_input("click_at")
         hwnd = self._window_under_point(x, y) if focus_window else 0
         return bool(win32.send_mouse_button(
             x, y, button=button, repeat=repeat, delay_ms=delay_ms,
@@ -729,7 +754,11 @@ class WindowsBackend(Backend):
 
         ⚠️ 抢焦点取**起点**下的窗口：拖拽的"意图对象"由起点决定（终点只是落点），
         `describe_point` 也只取起点的落点证据，两处口径一致。
+
+        ★ 隔离模式下的闸门在**第一行**（同 `click_at`）—— 拖拽尤其不能放过去：
+        它按住不放地移动指针，一旦打到用户的桌面上，破坏面比单击大得多。
         """
+        desktop.require_global_input("drag_at")
         if focus_window:
             hwnd = self._window_under_point(x1, y1)
             if hwnd:
@@ -744,7 +773,12 @@ class WindowsBackend(Backend):
         Linux 上 `xdotool type` 遇中文会临时改写全局键盘映射（用户物理键盘整体失灵），
         所以必须绕到剪贴板，还要判目标是不是终端才能选粘贴键。Windows 的
         `KEYEVENTF_UNICODE` 直接投递 UTF-16 码元，**绕开键盘布局**、不改任何全局状态。
+
+        ★ 隔离模式下**整条拒绝**（闸门在第一行）：`type_text` 天然是"打给当前焦点"，
+        没有"带明确目标"的变体可退 —— 而隔离桌面上没有焦点可言，当前焦点**一定是你**。
+        字会直接敲进你正在用的那个窗口里，且每一步都返回成功。替代品是元素级 `set_value`。
         """
+        desktop.require_global_input("type_text")
         if not text:
             return True
         return bool(win32.send_unicode_text(text).get("ok"))
@@ -755,7 +789,10 @@ class WindowsBackend(Backend):
 
         ⚠️ 组合名**认不出就返回 False**，绝不"尽力而为地按一部分"：
         `"ctrl+nosuchkey"` 若被解析成"只按 ctrl"，调用方会看到成功而实际什么都没发生。
+
+        ★ 隔离模式下整条拒绝（同 `type_text`，理由见那里）。
         """
+        desktop.require_global_input("press_key")
         vks = actions.parse_combo(combo)
         if not vks:
             return False

@@ -16,12 +16,21 @@
 stdlib，两边都 import 它，环从构造上就不存在——与 `backend/base.py` 的
 `BUTTON_NUMBERS`/角色词表被上提是同一种做法。
 
-本模块**只放类型与常量**，不放任何实现、不 import 任何项目内模块。
+本模块**只放类型、常量，以及不 import 任何项目内模块的纯函数**。
 `core/session.py` 会把这里的名字原样再导出，调用方一律 `from .. import session` 取。
+
+⚠️ 「纯函数」那半句是 2026-09-30 加的（Windows「默认不碰用户键鼠」那一轮），
+理由与 `BUTTON_NUMBERS` / 角色词表被上提到 `backend/base.py` **完全同源**：
+`display_mode_from_env()` / `global_input_allowed()` 这两个判据有**两个不同层**的消费方
+——`core/session.py` 的 Windows provider（层 3）与 `backend/windows/driver/desktop.py`
+（层 1）。而后者**不允许** import `core.session`（那会成环：session 挑 provider 时要认识
+desktop 的状态）。住在别处就只能抄一份，抄一份就迟早有一份改漏 —— 而这条判据漏改的
+后果是「隔离开关看起来生效了、实际没有」，正是本项目最不能容忍的失败形态。
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -116,11 +125,115 @@ class SessionCapabilities:
 OP_INJECT = "inject"
 """会动输入设备或屏幕状态。**默认值**——最保守的那一档。"""
 
+OP_INJECT_GLOBAL = "inject_global"
+"""★ **全局**注入：这一下会动**用户的**真实指针 / 键盘 / 前台焦点。
+
+与 `OP_INJECT` 的区别不是"更危险一点"，而是**另一件事**：
+`OP_INJECT` 是「会改目标会话的输入状态」（Linux 沙箱里动 Xephyr 的指针——用户碰不到）；
+`OP_INJECT_GLOBAL` 是「会改**用户此刻正在用的那台电脑**的输入状态」。
+
+Windows 上这条区分是**结构性**的，不是程度问题：MCP server 进程自己跑在用户桌面上
+（跨桌面操作是刻意保留的能力，见 `driver/desktop.py`），于是进程里发出的
+`SendInput` **只可能**落到当前输入桌面 = 用户的桌面。隐藏桌面上没有输入设备，
+我们没有任何通道把一次点击送进去 —— 所以「隔离模式下做坐标点击」不是"效果差一点"，
+而是"字面意义上在动用户的鼠标"。
+
+判据因此是**存在性**而非概率：只要还有任何一条会动真实指针的路，就必须走这一档的闸门。
+"""
+
 OP_CAPTURE = "capture"
 """抓屏 / 读像素（会碰屏，但不改屏状态）。"""
 
 OP_READ = "read"
 """只读遍历，不改任何状态。"""
+
+
+# ── 跨层共享的**纯**策略函数（为什么允许住在这个「只放类型」的模块里）────────────
+#
+# 见模块 docstring 末尾那段。一句话：这两个判据在 `core/session.py`（层 3）与
+# `backend/windows/driver/desktop.py`（层 1）**都要用**，而后者不允许 import 前者
+# （会成环）。共享的只能是**不 import 任何项目内模块的纯函数** —— 就是下面这两个。
+
+DISPLAY_MODE_ENV = "CC_CU_DISPLAY_MODE"
+"""隔离模式旋钮（Linux 与 Windows **共用同一个变量名**，见 desktop 的说明）。"""
+
+GLOBAL_INPUT_ENV = "CC_CU_ALLOW_GLOBAL_INPUT"
+"""显式放开全局注入的唯一开关。值必须是字面量 `"1"`。
+
+⚠️ 刻意**只认 `"1"`**：这是"请动我的鼠标键盘"这种级别的授权，`true`/`yes`/`on`/空串
+一律不放行。拼错一个字母就连不到用户，比"拼错就静默放开"好一万倍。
+"""
+
+
+def display_mode_from_env(env: dict[str, str] | None = None) -> str:
+    """
+    `"isolated"`（默认）或 `"real"`。
+
+    ⚠️ 解析规则**只认 `"real"` 字面量**（大小写与首尾空白不敏感），其余一切
+    ——空、缺失、拼错、`"REAL "`——都当 `isolated`。默认值必须是**隔离**那一档：
+    拼错一个字母就静默失去隔离，是本项目最不能接受的失败形态之一。
+    """
+    src = os.environ if env is None else env
+    return "real" if (src.get(DISPLAY_MODE_ENV) or "").strip().lower() == "real" \
+        else "isolated"
+
+
+def global_input_allowed(env: dict[str, str] | None = None) -> bool:
+    """用户是否**显式**放开了全局注入（只认 `CC_CU_ALLOW_GLOBAL_INPUT=1`）。"""
+    src = os.environ if env is None else env
+    return (src.get(GLOBAL_INPUT_ENV) or "").strip() == "1"
+
+
+def global_input_refusal(op: str, env: dict[str, str] | None = None) -> str | None:
+    """
+    全局注入的**判据**：返回拒绝原因（`None` = 放行）。
+
+    判据本身只有一条：**隔离模式下没有把输入送进目标会话的通道**（Windows 隐藏桌面，
+    见 `OP_INJECT_GLOBAL` 的说明），所以「隔离 + 未显式放开」= 拒绝。
+
+    ⚠️ **文案里必须写清三条出路**，否则模型只会反复重试同一件事（实测这一类报错
+    最贵的不是"没做成"，是"模型不知道改什么"）：
+      ① 改用元素级（零坐标、不碰用户键鼠）；
+      ② 目标没有无障碍树时，隔离模式下**本来就不支持**，该换 `real` 模式；
+      ③ 确实要放开：`CC_CU_ALLOW_GLOBAL_INPUT=1`。
+
+    ⚠️⚠️ **这是 Windows 专属判据，绝不要接到 Linux 的闸门上**：Linux 隔离模式下
+    XTEST 注入进的是 Xephyr 那块**虚拟屏**，用户碰不到它（那正是 Xephyr 存在的意义）。
+    把这个函数接到 Linux 的 `require` 上会把整条坐标点击链路误杀 —— 而它**不会报错**，
+    只会让"隔离模式下点不了"变成一条没人质疑的新事实。
+
+    与 `global_input_note()` 的分工：这个是**拒绝**时的说明，那个是**放行**时的提醒。
+    """
+    if display_mode_from_env(env) != "isolated":
+        return None
+    if global_input_allowed(env):
+        return None
+    return (
+        f"[{op}] 隔离模式下**拒绝**坐标级/键盘注入：这一下会动**你自己的**鼠标、键盘"
+        f"和前台焦点。\n"
+        f"   原因：隔离模式（Windows 隐藏桌面）下没有把输入送进目标会话的通道 —— "
+        f"进程发出的鼠标/键盘事件只会落到**你正在用的那个桌面**上。\n"
+        f"   改用元素级（推荐）：get_ui_tree / find_element 拿 ref，再 click(ref=...) / "
+        f"type_text(ref=...) —— 零坐标，完全不碰你的键鼠。\n"
+        f"   若目标应用没有无障碍树（SWT/Java、自绘控件、游戏）：隔离模式下**做不了**，"
+        f"请设 CC_CU_DISPLAY_MODE=real 后重启 Claude Code（应用会开在你的桌面上，"
+        f"你能看到它在操作）。\n"
+        f"   确实要放开全局注入（会真的动你的键鼠）：设 CC_CU_ALLOW_GLOBAL_INPUT=1。"
+    )
+
+
+def global_input_note(env: dict[str, str] | None = None) -> str | None:
+    """
+    放行时**响亮报告**用的话（`None` = 没什么要说的）。见上一条的分工说明。
+
+    ⚠️ 只在这个"放行**是因为隔离模式下本不该放行**"的场合返回内容 ——
+    real 模式下全局注入本就天经地义（用户自己选的），每次都在结果里喊一遍
+    会变成噪音，噪音的下一站是被忽略。
+    """
+    if display_mode_from_env(env) != "isolated" or not global_input_allowed(env):
+        return None
+    return (f"⚠️ 本次使用**全局注入**（CC_CU_ALLOW_GLOBAL_INPUT=1）：这一下动的是"
+            f"你的真实鼠标/键盘/前台焦点，不是隔离桌面。")
 
 
 class SessionProvider(Protocol):
@@ -180,6 +293,33 @@ class SessionProvider(Protocol):
 
         这条不能省：静默回落会让 LLM 只看到「操作成功」，然后继续在用户真实环境里
         点下去。`op` 只用于日志/文案；`kind` 才是判据的输入。
+        """
+
+    def global_input_note(self) -> str | None:
+        """本次注入**会不会动用户的真实键鼠**；会的话返回一句必须响亮告知的话。
+
+        与 `require(kind=OP_INJECT_GLOBAL)` 是一对：那个管「能不能做」，这个管
+        「做了之后要怎么说」。判据同源 —— 返回非 None 时，注入真的会落到用户的键鼠上，
+        调用方必须把它拼进结果文案（模型据此才知道"我刚才动的不是隔离环境"）。
+
+        ⚠️ 只在**反常**情形下返回内容（隔离模式下被用户显式放开）。real 模式下全局注入
+        天经地义（用户自己选的），每次都在结果里喊一遍会变成噪音 —— 而噪音的下一站
+        是被忽略，那等于这句提醒白写。
+        """
+
+    def startup_caveat(self) -> str | None:
+        """会话级的**稳定**能力边界说明（`None` = 没什么要说的）。
+
+        专供 `server.create_server()` 拼进 MCP `instructions` —— 也就是**模型开工之前**
+        就会读到的那一段。
+
+        ⚠️⚠️ **与 `capabilities().notes` 的区别就一个字：稳。** `notes` 允许随状态变
+        （沙箱在不在、总线绑上没有），而写进 `instructions` 的文字会被模型当成**整场的
+        既定事实**。拿一份会变的状态去填它，得到的就是一句从会话开头到结尾都错着的话 ——
+        而且因为它是"系统提示"，模型连怀疑的念头都不会有。所以本方法**只许**返回
+        由环境变量/平台常量决定的、整场不会变的内容；`notes` 里的运行时状态一律不要。
+
+        默认 None：大多数平台/模式下没有这类稳定边界要说。
         """
 
     def guard(self) -> str | None:

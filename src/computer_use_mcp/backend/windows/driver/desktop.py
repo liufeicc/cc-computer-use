@@ -23,6 +23,21 @@ Windows **没有**第二块显示屏：一个登录会话只有一套输入设�
 它们正好是「没有无障碍树」的那一类 —— 而在隐藏桌面上，元素级是唯一还能用的通道。
 这是一条**能力边界**，不是可以绕过去的实现细节：`capabilities()` 与工具返回都要如实说。
 
+═══ ★ 由此推出的闸门（2026-09-30，`require_global_input`）═══
+
+上面那条"做不了"**必须由代码强制执行**，不能只写在文档里。因为写错方向的代价极不对称：
+
+  · 隔离模式下硬发一次坐标点击 —— `SetForegroundWindow` 成功、`SendInput` 返回 1、
+    我们报 ok，而**用户眼前正在被点**（他的窗口被抢焦点、指针自己动起来）；
+  · 拒绝一次 —— 用户看到一条说明，知道改用元素级或换 `real` 模式。
+
+故 `require_global_input()` 现在挂在每一个会碰 `SendInput` 的方法最前面，**默认拒绝**，
+`CC_CU_ALLOW_GLOBAL_INPUT=1` 可显式放开（放开时结果里会响亮标注"这一下动的是你的键鼠"）。
+
+⚠️ 特别地：`type_text` / `press_key` 在隔离模式下**没有"带明确目标"的变体**可退 ——
+它们天然是"打给当前焦点"，而隔离桌面没有焦点可言，当前焦点**一定是你**。
+所以这两个是整条拒绝、没有例外（元素级 `SetValue` 才是它们的替代品）。
+
 ═══ ⚠️ 第二个代价：用户看不见，也就**没法介入** ═══
 
 Linux 的沙箱是一块**看得见**的虚拟屏（Xephyr 窗口就摆在宿主上），agent 卡住时用户可以
@@ -44,6 +59,13 @@ from ctypes import wintypes
 from typing import Any
 
 from . import win32
+from ....core.session_types import (
+    display_mode_from_env,
+    global_input_allowed,
+    global_input_note,
+    global_input_refusal,
+)
+from ....utils.errors import GlobalInputRefusedError
 
 # 桌面名的前缀；完整名字后面拼本进程 pid（见模块 docstring）
 _NAME_PREFIX = "CCCU"
@@ -90,9 +112,52 @@ def display_mode() -> str:
 
     ⚠️ 解析规则**只认 `"real"`**，其余一切（含空、拼错）都当 `isolated` ——
     默认值必须是**隔离**那一档，拼错一个字母就静默失去隔离是不能接受的。
+
+    ⚠️ 实现**委托给 `core.session_types.display_mode_from_env`**（纯函数），
+    而不是在这里再写一遍那个三元表达式：同一个判据还有第二个消费方
+    （`core/session.py::WindowsDesktopSession` 的能力申报与闸门），而那个消费方
+    **不许** import 本模块（会成环、且 core 不许碰 backend.<平台>）。
+    两处各写一份的实现，迟早有一份改漏 —— 而它漏掉的表现是「模式看起来算对了、
+    实际两处答案不一样」。见那个函数的 docstring。
     """
-    return "real" if (os.environ.get("CC_CU_DISPLAY_MODE") or "").strip().lower() == \
-        "real" else "isolated"
+    return display_mode_from_env()
+
+
+def require_global_input(op: str) -> None:
+    """
+    ★ 全局注入的闸门（**唯一判据**在 `core.session_types.global_input_refusal`）。
+
+    隔离模式下拒绝，`CC_CU_ALLOW_GLOBAL_INPUT=1` 可显式放开。抛
+    `GlobalInputRefusedError`，**绝不静默降级**。
+
+    为什么要有这一道，而且**必须放在会碰 SendInput 的那几个方法的最开头**：
+
+    MCP server 进程自己跑在**用户桌面**上（跨桌面操作是刻意保留的能力，见模块 docstring），
+    所以进程里发出的 `SendInput` **只可能**落到当前输入桌面 = 用户的桌面。
+    一次"坐标点击"因此不是"在隐藏桌面上点了个东西"，而是**真的动了用户的鼠标**；
+    一次 `type_text` 会把字打进**用户当前聚焦的那个窗口**里。
+
+    更要命的是它**每一步都返回成功**：`SetForegroundWindow` 成功、`SendInput` 返回 1、
+    我们的 `ActionResult` 报 ok —— 而用户眼前正在被点、字正在被敲进他的编辑器。
+    这是本项目最不能容忍的失败形态（静默 + 直接影响用户），所以拦在**动作发出之前**。
+
+    ⚠️ 拦的位置必须**早于任何读取**：协调层已有一道同样的闸门（在抓预览图之前），
+    这里这一道是给"绕过协调层直接调 backend"的路径兜底用的 —— 两道判据同源，
+    不会出现"一边放行一边拒绝"。
+    """
+    why = global_input_refusal(op)
+    if why:
+        raise GlobalInputRefusedError(why)
+
+
+def global_input_ok() -> bool:
+    """本平台这次是否会**真的动**用户的键鼠（给 `capabilities()` 与结果文案用）。"""
+    return global_input_allowed() and display_mode_from_env() == "isolated"
+
+
+def global_input_warning() -> str | None:
+    """放行时随结果一起回去的**响亮提醒**（`None` = 不必说）。判据同上一行。"""
+    return global_input_note()
 
 
 def desktop_name() -> str:

@@ -32,14 +32,17 @@ sys.path.insert(0, str(_REPO / "tests"))
 sys.path.insert(0, str(_REPO / "src"))
 
 import test_capture_scope as CS  # noqa: E402
+import test_global_input_gate as GG  # noqa: E402
 import test_packaging_windows as G  # noqa: E402
 import test_windows_driver_guards as WG  # noqa: E402
 
-# 用例名可以写成 `模块::用例`（模块 ∈ {"packaging", "capture"}）；不写模块 = packaging。
+# 用例名可以写成 `模块::用例`（模块 ∈ {"packaging", "capture", "windows", "gate"}）；
+# 不写模块 = packaging。
 # 为什么要有这个：本脚本原先只覆盖 `test_packaging_windows.py` 一个文件，而
-# 「按窗口截图」那批守卫住在 `test_capture_scope.py` —— 不给它们做反证，
-# 就是又一批"坏了也看不出来"的判据（那正是本脚本存在的理由）。
-_MODULES = {"packaging": G, "capture": CS, "windows": WG}
+# 「按窗口截图」那批守卫住在 `test_capture_scope.py`、「默认不碰用户键鼠」那批住在
+# `test_global_input_gate.py` —— 不给它们做反证，就是又一批"坏了也看不出来"的判据
+# （那正是本脚本存在的理由）。
+_MODULES = {"packaging": G, "capture": CS, "windows": WG, "gate": GG}
 
 # 每条：(用例名, 要改的文件, 找什么, 换成什么, 为什么这么种, 用例的位置参数)
 CASES: list[tuple[str, str, str | None, str | None, str, tuple, bool]] = [
@@ -469,6 +472,76 @@ def _runtime_cases():
             fromlist=["x"]).enum_top_level_windows(visible_only=visible_only)
         undo.append(lambda: setattr(desktop, "enumerate_target", old))
 
+    # ── 「默认不碰用户键鼠」那一档（test_global_input_gate.py）──────────────
+    # 这些都是**行为型**破坏：改的是运行期对象，与源码替换那套覆盖的是不同侧面
+    # （源码替换证明"判据在读源码时是对的"，运行期证明"判据在执行路径上真的生效"）。
+
+    def break_driver_gate(undo):  # noqa: ANN001
+        from computer_use_mcp.backend.windows.driver import desktop
+        old = desktop.require_global_input
+        desktop.require_global_input = lambda op: None      # ← 层 1 的闸门整个拆掉
+        undo.append(lambda: setattr(desktop, "require_global_input", old))
+
+    def break_focus_policy(undo):  # noqa: ANN001
+        from computer_use_mcp.backend.windows import backend as wb
+        from computer_use_mcp.backend.windows.driver import actions as wa
+        old = wb.WindowsBackend.focus
+        # ← 隔离模式下也照旧聚焦（抢前台）。⚠️ 必须转调**当前**的 `wa.focus`
+        #    （用例把它换成了探针），照抄原实现会让探针打空、破坏方自己坏掉。
+        wb.WindowsBackend.focus = lambda self, native: wa.focus(native)
+        undo.append(lambda: setattr(wb.WindowsBackend, "focus", old))
+
+    def break_set_value_focus_flag(undo):  # noqa: ANN001
+        from computer_use_mcp.backend.windows import backend as wb
+        from computer_use_mcp.backend.windows.driver import actions as wa
+        old = wb.WindowsBackend.set_value
+        # ← 写值永远允许聚焦（隔离模式下也会去抢前台）
+        wb.WindowsBackend.set_value = lambda self, native, text: wa.set_value(
+            native, text, allow_focus=True)
+        undo.append(lambda: setattr(wb.WindowsBackend, "set_value", old))
+
+    def break_global_input_allowed(undo):  # noqa: ANN001
+        from computer_use_mcp.core import session_types as st
+        old = st.global_input_allowed
+        st.global_input_allowed = lambda env=None: True     # ← 开关恒为"已放开"
+        undo.append(lambda: setattr(st, "global_input_allowed", old))
+
+    def break_caps_input_isolated(undo):  # noqa: ANN001
+        import dataclasses
+
+        from computer_use_mcp.core.session import WindowsDesktopSession
+        old = WindowsDesktopSession.capabilities
+        # ← 无论实际策略如何都申报"用户的键鼠是安全的"
+        WindowsDesktopSession.capabilities = lambda self: dataclasses.replace(
+            old(self), input_isolated=True)
+        undo.append(lambda: setattr(WindowsDesktopSession, "capabilities", old))
+
+    def break_coordinator_gate(undo):  # noqa: ANN001
+        from computer_use_mcp.core.coordinator.base import CoordinatorBase
+        old = CoordinatorBase._require_global_input
+        CoordinatorBase._require_global_input = lambda self, op: None   # ← 层 3 的闸门拆掉
+        undo.append(lambda: setattr(CoordinatorBase, "_require_global_input", old))
+
+    def break_readback(undo):  # noqa: ANN001
+        from computer_use_mcp.backend.windows.driver import actions as wa
+        old = wa._verify_value
+        wa._verify_value = lambda element, text, numeric: True          # ← 回读恒判通过
+        undo.append(lambda: setattr(wa, "_verify_value", old))
+
+    def break_type_text_swallows_refusal(undo):  # noqa: ANN001
+        from computer_use_mcp.core.coordinator import actions as ca
+        from computer_use_mcp.utils.errors import LEVEL_NONE, ActionResult
+        from computer_use_mcp.utils.errors import GlobalInputRefusedError as _GIR
+        old = ca.ActionMixin.type_text
+
+        def swallowed(self, *a, **k):  # noqa: ANN001, ANN002, ANN003, ANN201
+            try:
+                return old(self, *a, **k)
+            except _GIR as exc:          # ← 把拒绝转成"失败结果"返回（真机踩过的那个形态）
+                return ActionResult(ok=False, level=LEVEL_NONE, message=str(exc))
+        ca.ActionMixin.type_text = swallowed
+        undo.append(lambda: setattr(ca.ActionMixin, "type_text", old))
+
     return [
         (break_win_default_scope, "capture::test_default_capture_scope_is_a_platform_difference", ()),
         (break_mode_parse, "windows::test_display_mode_defaults_to_isolated_and_only_recognises_real", None),
@@ -483,7 +556,131 @@ def _runtime_cases():
         # ⚠️ 不这么写的话它会以 `TypeError: missing 1 required positional argument`
         #    收场 —— 那**看起来也是"被拦下"**，于是反证假通过（本轮实测踩到）。
         (break_window_for_app_pick, "windows::test_window_for_app_picks_the_largest_window", None),
+        # ── 「默认不碰用户键鼠」────────────────────────────────────────
+        (break_driver_gate, "gate::test_session_and_driver_never_disagree", None),
+        (break_focus_policy, "gate::test_focus_is_a_policy_noop_in_isolated_mode", None),
+        (break_set_value_focus_flag, "gate::test_set_value_does_not_focus_in_isolated_mode", None),
+        (break_global_input_allowed, "gate::test_refusal_and_note_are_exact_complements", ()),
+        (break_caps_input_isolated, "gate::test_session_provider_capabilities_follows_the_policy", None),
+        (break_coordinator_gate, "gate::test_coordinator_click_refuses_before_touching_the_backend", None),
+        (break_readback, "gate::test_driver_set_value_reports_readback_mismatch", None),
+        (break_type_text_swallows_refusal,
+         "gate::test_gate_refusal_shape_is_uniform_across_entry_points", None),
     ]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 源码替换 · 第二批：改的是 `src/` 下的生产代码（而不是 `packaging/`）
+#
+# 为什么需要单独一批：`test_global_input_gate.py` 里那几条**顺序判据**（"闸门必须早于
+# 注入原语"）读的是 `src/` 的源码，而上面那套替换机制只拷 `packaging/`。
+# 不补这一批，那几条最要紧的判据就没有反证 —— 而"守卫坏了"与"代码没问题"
+# 在结果上长得一模一样，正是本脚本要防的东西。
+#
+# 做法：把 `src/computer_use_mcp` 拷到临时目录、改坏、再把 **`GG._TEST_SRC`**
+# 指过去（那个变量是专为这件事留的，见 `test_global_input_gate.py` 的说明）。
+# ══════════════════════════════════════════════════════════════════════════
+
+# 每条：(用例名, src 下的相对路径, [(找什么, 换成什么), …], 为什么这么种, 用例的位置参数)
+#
+# ⚠️ 允许**多条**编辑：有些破坏天然要两步（先从 A 处摘掉、再插到 B 处），
+#    而"摘掉"单独用只能验出"判据要求它存在"、验不出"判据要求它在**前面**" ——
+#    那种跑法看着也红，但红的理由与真实缺陷无关（顺序判据会退化成存在性判据）。
+_SRC_CASES: list[tuple[str, str, list[tuple[str, str]], str, tuple]] = [
+    (
+        "gate::test_every_global_input_method_gates_before_injecting",
+        "backend/windows/backend.py",
+        [(
+            '        desktop.require_global_input("click_at")\n'
+            '        hwnd = self._window_under_point(x, y) if focus_window else 0\n'
+            '        return bool(win32.send_mouse_button(\n'
+            '            x, y, button=button, repeat=repeat, delay_ms=delay_ms,\n'
+            '            focus_window=focus_window, hwnd=hwnd).get("ok"))',
+            '        hwnd = self._window_under_point(x, y) if focus_window else 0\n'
+            '        res = bool(win32.send_mouse_button(\n'
+            '            x, y, button=button, repeat=repeat, delay_ms=delay_ms,\n'
+            '            focus_window=focus_window, hwnd=hwnd).get("ok"))\n'
+            '        desktop.require_global_input("click_at")\n'
+            '        return res',
+        )],
+        "闸门被挪到注入**之后**（事件先发出去、闸门再拒 = 等于没拦）",
+        ("click_at", "send_mouse_button"),
+    ),
+    (
+        "gate::test_injection_sweep_is_not_blind_and_has_no_unguarded_method",
+        "backend/windows/backend.py",
+        [('        desktop.require_global_input("press_key")\n', '')],
+        "press_key 的闸门被整个摘掉（清扫该抓到它，而逐方法那张清单抓不到）",
+        (),
+    ),
+    (
+        "gate::test_coordinator_gates_before_taking_evidence",
+        "core/coordinator/actions.py",
+        [
+            ('        self._require_global_input("click_xy")\n', ''),
+            ('        payload = (shot.data, shot.meta) if shot is not None else None\n',
+             '        payload = (shot.data, shot.meta) if shot is not None else None\n'
+             '        self._require_global_input("click_xy")\n'),
+        ],
+        "协调层的闸门被挪到取证之后（注定要拒绝的动作，先把用户的屏幕读进了上下文）",
+        ("click_xy", "self._preview_image("),
+    ),
+    (
+        "gate::test_type_text_gates_only_the_keyboard_fallback_not_the_element_path",
+        "core/coordinator/actions.py",
+        [('        attempts: list[dict[str, Any]] = []\n'
+          '        native = None',
+          '        self._require_global_input("type_text")\n'
+          '        attempts: list[dict[str, Any]] = []\n'
+          '        native = None')],
+        "type_text 的闸门卡到了方法开头 —— 把元素级 set_value（隔离模式下唯一能打字的通道）一起误杀",
+        (),
+    ),
+]
+
+
+def _run_src_cases(bad: int) -> int:
+    """跑第二批（源码替换 · src）。返回更新后的失败计数。"""
+    print("\n── 源码替换 · src/（顺序判据）──")
+    for i, (case, relpath, edits, why, args) in enumerate(_SRC_CASES, 1):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            shutil.copytree(_REPO / "src", tmp / "src")
+            target = tmp / "src" / "computer_use_mcp" / relpath
+            text = target.read_text(encoding="utf-8")
+            for old, new in edits:
+                assert old in text, (
+                    f"[S{i}] 反证样本**过期**：在 src/computer_use_mcp/{relpath} 里找不到\n"
+                    f"  {old!r}\n"
+                    f"生产代码已经改了 —— 请同步更新本脚本（否则这条反证会静默退化成空转）"
+                )
+                text = text.replace(old, new, 1)
+            target.write_text(text, encoding="utf-8")
+
+            prev = GG._TEST_SRC
+            GG._TEST_SRC = tmp / "src" / "computer_use_mcp"
+            _mod, _name = _split(case)
+            try:
+                assert _mod == "gate", f"[S{i}] 本批只用于 gate 模块，实际是 {_mod}"
+                getattr(GG, _name)(*args)
+            except AssertionError as exc:
+                first = (str(exc).splitlines() or [""])[0][:88] or "(裸断言，无消息)"
+                print(f"  ✅ [S{i}] {why}\n        → 被拦下：{first}")
+            except BaseException as exc:  # noqa: BLE001
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                bad += 1
+                import traceback
+                tb = traceback.format_exc().strip().splitlines()[-4:]
+                print(f"  ❌ [S{i}] {why} —— **破坏方自己坏了**："
+                      f"{type(exc).__name__}: {str(exc)[:110]}\n"
+                      + "\n".join(f"        {ln}" for ln in tb))
+            else:
+                bad += 1
+                print(f"  ❌ [S{i}] {why}\n        → **守卫没拦住**：{case} 在被改坏的源码上仍然通过")
+            finally:
+                GG._TEST_SRC = prev
+    return bad
 
 
 def _split(case: str) -> tuple[str, str]:
@@ -537,6 +734,8 @@ def main() -> int:
                         _MODULES[_k].REPO = _v
 
     # ── 运行期那批（行为型守卫）────────────────────────────────────────
+    bad = _run_src_cases(bad)
+    print("\n── 运行期（行为型）──")
     rt = _runtime_cases()
     for j, (breaker, case, args) in enumerate(rt, 1):
         _mod, _name = _split(case)
@@ -586,13 +785,14 @@ def main() -> int:
             for fn in reversed(undo):
                 fn()
 
-    total = len(CASES) + len(rt)
+    total = len(CASES) + len(_SRC_CASES) + len(rt)
     print()
     if bad:
         print(f"❌ {bad}/{total} 条反证失败 —— 这些守卫起不到作用")
         return 1
     print(f"✅ 全部 {total} 条反证通过（每条守卫都真的抓得到它该抓的东西）"
-          f"（源码替换 {len(CASES)} 条 + 运行期 {len(rt)} 条）")
+          f"（packaging 源码替换 {len(CASES)} 条 + src 源码替换 {len(_SRC_CASES)} 条"
+          f" + 运行期 {len(rt)} 条）")
     return 0
 
 

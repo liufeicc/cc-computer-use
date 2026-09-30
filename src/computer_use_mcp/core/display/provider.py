@@ -135,6 +135,32 @@ class SessionProviderMixin:
             return None
         return "⚠️ 用户正在沙箱内操作，本次注入可能与其冲突"
 
+    def global_input_note(self) -> str | None:
+        """
+        恒为 None —— Linux 的"全局注入"**走不到用户身上**。
+
+        隔离模式下 XTEST 注入进的是 **Xephyr 那块虚拟屏**（用户看不见、碰不到），
+        那正是 Xephyr 存在的意义；real 模式下用户自己选了「直接操作真实桌面」，
+        行为与手动启动一致。两种情形都没有"要响亮告知"的东西。
+
+        ⚠️ 这与 Windows 是**结构性差异**，不是程度差异：那边 MCP server 进程自己就
+        跑在用户桌面上，`SendInput` 只可能落到用户那儿 —— 所以那边要靠
+        `require(kind=OP_INJECT_GLOBAL)` 按住，并在这里报告"这一下动了你的键鼠"。
+        """
+        return None
+
+    def startup_caveat(self) -> str | None:
+        """
+        恒为 None —— Linux 没有**整场不变**的能力边界可报。
+
+        ⚠️ 特别地，**不要**把 `capabilities().notes` 直接返回出去：那边的文案随沙箱状态
+        变（"隔离沙箱未就绪……"在沙箱起来之后就不成立了），而消费方
+        （`server.create_server`）会把它拼进 MCP `instructions` —— 那是**模型开工前**
+        就读到、并且整场当既定事实用的文字。拿一份会变的现状去填它，得到的就是一句
+        从会话开头到结尾都错着、且没人会怀疑的话。见 Protocol 的说明。
+        """
+        return None
+
     # ---------- 能力申报 ----------
 
     def capabilities(self) -> SessionCapabilities:

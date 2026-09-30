@@ -84,6 +84,21 @@ class SandboxUnavailableError(ComputerUseError):
     """
 
 
+class GlobalInputRefusedError(ComputerUseError):
+    """
+    ★ 隔离模式下**拒绝**全局注入：这一下会动用户的真实指针 / 键盘 / 前台焦点。
+
+    与 `SandboxUnavailableError` 是**两件事**，别合并（合并会让两边的处置建议互相污染）：
+      · 那个说「隔离环境（沙箱/桌面）这回没起来，所以不能做」——环境问题，重试或修环境；
+      · 这个说「隔离环境好好的，但**这个动作本身**在隔离下根本没有通道」——**方式**问题，
+        要换做法（改元素级）或改模式（`real`）。
+
+    Windows 隐藏桌面上没有输入设备，而 MCP server 进程又跑在用户桌面上，于是进程里发出的
+    `SendInput` 只会落到用户的桌面。所以「隔离模式下做坐标点击」不是效果差，是字面意义上
+    在动用户的鼠标——这条闸门守的就是它。详见 `core/session_types.py::OP_INJECT_GLOBAL`。
+    """
+
+
 # 三级降级层级标识
 #
 # ⚠️ `ActionResult.level` 的语义是「**实际生效**的那一级」，不是「建议你改用哪一级」（M-18）。

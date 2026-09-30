@@ -68,6 +68,40 @@ class CoordinatorBase:
         """
         return session.MANAGER.guard()
 
+    def _require_global_input(self, op: str) -> None:
+        """
+        ★ 全局注入的闸门：**会动用户真实键鼠的那一类动作**，不通过就抛错拒绝。
+
+        与 `_require_sandbox` 是**两道不同的闸门**，都要挂，别合并：
+          · `_require_sandbox`（经 `@_exclusive_screen`）：隔离环境这回在不在 —— 环境问题；
+          · 本方法：这个**动作本身**在隔离下有没有通道 —— 方式问题。
+        合并的后果是两边共用一份文案，而处置建议完全不同（一个说"重试/修环境"，
+        一个说"改用元素级"）——模型照着错的建议做，白耗一轮还找不着北。
+
+        判据住在 `session.MANAGER.require(kind=OP_INJECT_GLOBAL)`（层 3）：只有那个
+        平台实现知道"我这儿有没有把输入送进隔离会话的通道"。Linux 的 XTEST 注入进的是
+        Xephyr，用户碰不到，故那边这一档是 no-op。
+
+        ⚠️ **调用点必须早于任何副作用**，尤其要早于抓预览图：`click_xy` / `scroll_xy` /
+        `drag_xy` 都是先抓一张落点周围的小图再注入，而那张图取自**用户的屏幕** ——
+        既然这一下注定要被拒绝，就不该先把用户屏幕上的内容读进模型上下文。
+        """
+        session.MANAGER.require(op, kind=session.OP_INJECT_GLOBAL)
+
+    def _global_input_note(self) -> str | None:
+        """
+        放行时那句**响亮提醒**（`None` = 没什么要说的）。
+
+        存在的理由：`CC_CU_ALLOW_GLOBAL_INPUT=1` 是用户显式授权"动我的键鼠"，但模型
+        看不到环境变量 —— 它只看到"点击成功"。结果里不带这句话，模型就会以为这一下
+        落在隔离环境里，继续按那个假设决策（比如"我点的是沙箱，不用担心碰到用户的东西"）。
+        """
+        try:
+            return session.MANAGER.global_input_note()
+        except Exception as exc:  # noqa: BLE001 —— 附加文案绝不拖垮主操作
+            log.debug("global_input_note 失败（忽略）: %s", exc)
+            return None
+
     # ---------- 目标窗口（「这次操作的是哪一扇窗」）----------
 
     def _remember_target_window(self, window_id: str | None) -> None:

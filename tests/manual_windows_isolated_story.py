@@ -12,7 +12,12 @@
      **只有两条一起看**才证明它"启动了、但不在你的桌面上"。
   2. 用户的桌面**没被改动**：窗口数量不变、前台不变、指针不动。
   3. 起了之后**照样能操作**：读树 → 元素级写值 → 读回命中 → 截图。
-  4. `real` 模式下退回老行为（应用起在用户桌面）—— 反向正控，
+  4. ★ **坐标级/键盘注入被拒绝，且用户的指针与前台真的一动不动**（4c 节）——
+     这一条回答的是用户原话的后半句「**操作软件时会跟用户抢夺鼠标和焦点**」。
+     判据取**异常类型** `GlobalInputRefusedError` 而不是"抛了异常"：隐藏桌面上
+     SendInput 本身也会失败，两者都表现为"抛了异常"，只有认类型才分得开。
+  5. 能力申报与会话级边界说明按实际策略给出（4d），且开关打开时判据**真的翻转**（4e）。
+  6. `real` 模式下退回老行为（应用起在用户桌面）—— 反向正控，
      否则"隔离生效"与"枚举写死了"看起来一模一样。
 
 ⚠️ 本故事断言的核心判据里有一条与 **DPI 坐标系**有关：取指针基线必须在
@@ -20,7 +25,7 @@
 
 ═══ 验收状态（2026-09-30）═══
 
-· **isolated 模式**：13 条判据**全过**（`EXITCODE=0`）——
+· **isolated 模式**：**全过**（`EXITCODE=0`）——
   应用起在隔离桌面上、用户桌面窗口数不变、指针与前台不动、
   读树 / 按窗口截图 / 元素级 Invoke 全部可用。
 · **real 模式**（反向正控，`run_isolated_story_real.bat`）：
@@ -28,6 +33,12 @@
   之后重跑多轮**偶发卡住**（卡点每次不同：启动、读树都遇到过），
   与产品代码无关 —— 同一客体上三条启动路径会一起卡 20s+ 又突然都 <0.2s，
   是环境现象。**这条反向正控的结论按"验过一次"采信，不按"每轮都过"**。
+
+⚠️⚠️ **第 4) 节的"读树"在本客体上偶发卡死**（2026-09-30 实测：连着 5 轮里卡了 3 轮，
+卡在 `get_ui_tree(scope='active_window')` 那一行、一卡十分钟以上）。
+**这不是本轮改动引入的 —— 做过 A/B**：`git stash push -- src` 回到改动前的代码，
+同一个客体上**照样卡在同一行**。判据与结论因此按"验过一次"采信；
+但**看到卡在这里时不要先去查代码**（那会白耗一整轮，正如"启动偶发卡"那条）。
 
 ⚠️ 目标应用刻意用 **winver**（纯 Win32），不用 Win11 的记事本 ——
 后者是 Store 应用别名，实测在本客体上偶发卡在激活环节。
@@ -301,6 +312,114 @@ def main(argv: list[str] | None = None) -> int:
         note("real 模式下前台", f"{title0!r} → "
              f"{win32.window_text(fg1) if fg1 else ''!r}（可能被新窗口抢走，预期如此）")
 
+    # ── 4c) ★ 坐标级/键盘注入被**拒绝**，而且指针真的没动 ──
+    #
+    # ⚠️ 这一节（以及 4d/4e）**刻意排在下一节的「读树」之前**：那一步在本客体上
+    #    **偶发卡死**（实测连着 5 轮卡 3 轮，一卡十分钟以上；已用 `git stash -- src`
+    #    做过 A/B，与产品代码无关）。排在前面的好处是：卡住时**本节结论已经打出来了**
+    #    —— 判据要落在最不容易被环境吃掉的位置上。
+    #
+    # 这一节回答的是用户的另一半原话：「**操作软件时会跟用户抢夺鼠标和焦点**」。
+    # 4) 那一节证明了"起得来、元素级能用"，但**没有**证明"坐标级不会打到用户身上" ——
+    # 而在 Windows 上那是结构性风险：MCP server 进程自己跑在用户桌面上，
+    # 它发出的 SendInput 只可能落到当前输入桌面 = 用户的桌面。
+    #
+    # ⚠️ 判据刻意取**异常类型** `GlobalInputRefusedError` 而不是"抛了异常"：
+    #    在隐藏桌面上 SendInput 本身也会失败（error 5），于是"闸门拦住了"与
+    #    "闸门没拦、只是注入失败"都表现为"抛了异常"，只有认类型才分得开。
+    print("\n=== 4c) ★ 隔离模式下坐标级/键盘注入被拒绝 ===", flush=True)
+    from computer_use_mcp.utils.errors import GlobalInputRefusedError
+
+    cur_before_gate = win32.get_cursor_pos() or (0, 0)
+    fg_before_gate = win32.foreground_window()
+
+    # 每一个都会动用户键鼠的入口都要被拦住（**逐个**验，不抽样）
+    _gated_calls = [
+        ("click_xy 坐标点击", lambda: coord.click_xy(100, 100, preview=False)),
+        ("double_click 连击", lambda: coord.click_xy(100, 100, clicks=2, preview=False)),
+        ("scroll_xy 滚动", lambda: coord.scroll_xy("down", 3, x=100, y=100)),
+        ("drag_xy 拖拽", lambda: coord.drag_xy(100, 100, 300, 300)),
+        ("press_key 快捷键", lambda: coord.press_key("ctrl+s")),
+        ("type_text 键盘注入（无 ref，走兜底）", lambda: coord.type_text("ccc-probe")),
+        ("backend.click_at（绕过协调层的那条）", lambda: backend.click_at(100, 100)),
+        ("backend.type_text（同上）", lambda: backend.type_text("ccc-probe")),
+    ]
+    refused: list[str] = []
+    leaked: list[str] = []
+    detail: list[str] = []
+    for label, call in _gated_calls:
+        try:
+            call()
+        except GlobalInputRefusedError as exc:
+            refused.append(label)
+            detail.append(f"{label}: {str(exc).splitlines()[0][:60]}")
+        except Exception as exc:  # noqa: BLE001 —— 别的异常 = 闸门没拦住（或坏在别处）
+            leaked.append(f"{label} → {type(exc).__name__}: {str(exc)[:80]}")
+        else:
+            leaked.append(f"{label} → **居然成功了**")
+    ok("★ 八个会动用户键鼠的入口**全部**被闸门拒绝", not leaked,
+       f"拦下 {len(refused)}/{len(_gated_calls)}；漏网={leaked}")
+
+    _msg = ""
+    try:
+        coord.click_xy(100, 100, preview=False)
+    except GlobalInputRefusedError as exc:
+        _msg = str(exc)
+    ok("★ 拒绝文案给出**出路**（元素级 / real 模式 / 显式放开三条）",
+       ("元素级" in _msg) and ("CC_CU_ALLOW_GLOBAL_INPUT=1" in _msg)
+       and ("CC_CU_DISPLAY_MODE=real" in _msg),
+       _msg.splitlines()[0][:80] if _msg else "（没拿到文案）")
+
+    # ★★ 这一节真正的判据：**用户的指针与前台一点没动**。
+    #    前面那些调用若有一条真的发出去，指针必然已飞到 (100,100)。
+    cur_after_gate = win32.get_cursor_pos() or (0, 0)
+    fg_after_gate = win32.foreground_window()
+    ok("★★ 连试八次之后，**用户的指针仍然一动不动**",
+       tuple(cur_before_gate) == tuple(cur_after_gate),
+       f"{tuple(cur_before_gate)} → {tuple(cur_after_gate)}")
+    ok("★★ 用户的**前台窗口也没变**", fg_before_gate == fg_after_gate,
+       f"0x{fg_before_gate:x} → 0x{fg_after_gate:x}")
+
+    # ── 4d) 能力申报：按实际策略如实说 ──
+    print("\n=== 4d) 能力申报与会话级边界说明 ===", flush=True)
+    from computer_use_mcp.core import session as session_mod
+    caps = session_mod.MANAGER.capabilities()
+    ok("★ capabilities 申报 input_isolated=True（隔离模式下没有任何路径会碰用户的键鼠）",
+       bool(caps.input_isolated), f"input_isolated={caps.input_isolated} caps={caps}")
+    ok("★ 同一次申报里列出「做不到的事」（coordinate_input），不假装什么都能干",
+       "coordinate_input" in caps.unimplemented, f"unimplemented={caps.unimplemented}")
+    caveat = session_mod.MANAGER.startup_caveat() or ""
+    ok("★ 会话级边界说明非空且给出路（它会被拼进 MCP instructions，模型开工前就读到）",
+       ("元素级" in caveat) and ("ref" in caveat), caveat[:100])
+
+    # ── 4e) 反向正控：开关打开时，判据**确实会翻转** ──
+    #
+    # ⚠️ 刻意**不去真的注入一次**：那一下会落在客体用户的真实桌面上（点到什么不可控）。
+    #    所以反向正控只验到"判据翻转"这一层（provider 放行 + 提醒文案出现），
+    #    不验"事件真的发出去了" —— 后者由 `manual_windows_directed_probe.py` 那批
+    #    已在**受控坐标**上量过。
+    print("\n=== 4e) 反向正控：CC_CU_ALLOW_GLOBAL_INPUT=1 时判据翻转 ===", flush=True)
+    os.environ["CC_CU_ALLOW_GLOBAL_INPUT"] = "1"
+    try:
+        flipped = False
+        try:
+            session_mod.MANAGER.require("probe", kind=session_mod.OP_INJECT_GLOBAL)
+            flipped = True
+        except GlobalInputRefusedError:
+            flipped = False
+        ok("★ 打开开关后 provider **不再拒绝**（证明上面那批「拦住」不是恒定行为）",
+           flipped, f"require 放行={flipped}")
+        note_text = session_mod.MANAGER.global_input_note() or ""
+        ok("★ 且会给出**响亮的提醒**（结果文案里要带这一句）",
+           ("全局注入" in note_text) and ("ALLOW_GLOBAL_INPUT" in note_text)
+           and ("键" in note_text), note_text[:100])
+        caps_on = session_mod.MANAGER.capabilities()
+        ok("★ 此时 capabilities 立刻改口申报 input_isolated=False（不缓存、不撒谎）",
+           caps_on.input_isolated is False,
+           f"input_isolated={caps_on.input_isolated} unimplemented={caps_on.unimplemented}")
+    finally:
+        os.environ.pop("CC_CU_ALLOW_GLOBAL_INPUT", None)
+
     # ── 4) 起了之后照样能操作 ──
     print("\n=== 4) 隔离桌面上的应用照样能操作 ===", flush=True)
     trace("读树（active_window）")
@@ -372,6 +491,26 @@ def main(argv: list[str] | None = None) -> int:
            f"用户桌面上的 winver 窗={[r['id'] for r in (got_user or [])][:5]}")
         ok("real 模式下目标桌面==用户桌面（枚举口径没写死）",
            not desktop.is_isolated(), f"isolated={desktop.is_isolated()}")
+
+        # ★ real 模式下全局注入**不该**被拒绝（否则 4c 那批"拦住"就成了一条恒真的判据，
+        #   分不清是"闸门按策略工作"还是"闸门一律拒绝"）。
+        from computer_use_mcp.core import session as session_mod
+        from computer_use_mcp.utils.errors import GlobalInputRefusedError as _GIR
+        allowed = False
+        try:
+            session_mod.MANAGER.require("probe", kind=session_mod.OP_INJECT_GLOBAL)
+            allowed = True
+        except _GIR:
+            allowed = False
+        ok("★ real 模式下 provider **放行**全局注入（反向正控：闸门按策略分档，不是恒拒）",
+           allowed, f"require 放行={allowed}")
+        caps_real = session_mod.MANAGER.capabilities()
+        ok("real 模式下 capabilities 如实申报 target=real 且 input_isolated=False",
+           caps_real.target == "real" and caps_real.input_isolated is False,
+           f"target={caps_real.target} input_isolated={caps_real.input_isolated}")
+        ok("real 模式下没有会话级边界说明（用户自己选的老行为，不该天天提醒）",
+           session_mod.MANAGER.startup_caveat() is None,
+           repr(session_mod.MANAGER.startup_caveat()))
     else:
         note("本次跑的是 isolated 模式",
              "real 那一侧请用 run_isolated_story_real.bat 再跑一遍")

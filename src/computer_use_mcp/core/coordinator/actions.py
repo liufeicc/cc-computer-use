@@ -25,6 +25,7 @@ from ...utils.errors import (
     ActionResult,
     ComputerUseError,
     ElementNotFoundError,
+    GlobalInputRefusedError,
     InvalidRefError,
 )
 from .hooks import _exclusive_screen, _needs_display
@@ -72,9 +73,13 @@ class ActionMixin:
         --delay），与这里的落点证据、OCR、变化对比等开销彻底解耦；本方法自身仍然照常
         做证据链（双击比单击更怕点偏，反馈一个都不能少）。
         """
+        # ★ 全局注入闸门必须在**最前面**（早于下面每一次取证据）。
+        #   这一下会动用户的真实鼠标；而取证据那几步会先把**用户屏幕**上落点周围的一小块
+        #   读进模型上下文（预览图 + OCR）。注定要拒绝的动作，不该先读他的屏幕。
+        self._require_global_input("click_xy")
         warn = self._sandbox_guard()
         x, y = int(x), int(y)
-        # 点击前取证据：此刻指针本来就要去这儿，无副作用；点完再取就晚了。
+        gnote = self._global_input_note()
         # 先读活动窗口再取落点证据——顺序不能反（describe_point 会挪指针）。沙箱 i3 配置
         # 已**显式** focus_follows_mouse no，挪指针本身不切焦点；此处刻意不依赖那条配置
         # （CC_CU_SANDBOX_WM=none 时沙箱内无 WM，指针位置确实决定键盘去向），故顺序写死。
@@ -111,6 +116,8 @@ class ActionMixin:
             msg += f"｜{change}"
         if warn:
             msg += f"；{warn}"
+        if gnote:
+            msg += f"；{gnote}"
         # 回看记录（含图与结论）：模型事后想核对「刚才点在哪、程序算偏了多少」时取回，
         # 不必重新截图重新估算，也不必盲目再点一次
         self._remember_click(x, y, LEVEL_COORD, shot,
@@ -169,10 +176,17 @@ class ActionMixin:
 
         # 2. 坐标点击（兜底，先校准）
         warn = self._sandbox_guard()  # 坐标级要动指针/焦点，注入前礼让沙箱内的用户
+        gnote = self._global_input_note()
         try:
             rect = self.backend.element_screen_rect(native)
             if rect is not None and not rect.is_empty():
                 cx, cy = rect.center
+                # ★ 全局注入闸门：**必须早于下面每一次取证**（同 click_xy 的理由）。
+                #   这一档是"元素级失败后的兜底"，在 Windows 隔离模式下它必然要被拒绝 ——
+                #   那么就更不该先把**用户屏幕**上那块小图读进模型上下文。
+                #   ⚠️ 闸门**只能**卡在这里，不能卡在方法开头：元素级是第一档、也是隔离
+                #   模式下唯一还能用的通道，卡在开头会把整条 `click(ref=...)` 砍掉。
+                self._require_global_input("click(坐标兜底)")
                 # 元素级失败的这条路最容易点偏（坐标是校准出来的），故也回报落点证据。
                 # 不做 OCR：目标元素的名字已经知道，缺的只是「这一下打在哪扇窗」——
                 # 若落点窗口与元素所属窗口不是同一个，就是打偏了。省掉那 0.3s。
@@ -198,6 +212,8 @@ class ActionMixin:
                         msg += f"｜{reloc_note}"
                     if warn:
                         msg += f"；{warn}"
+                    if gnote:
+                        msg += f"；{gnote}"
                     self._remember_click(cx, cy, LEVEL_COORD, shot, note=change)
                     return ActionResult(ok=True, level=LEVEL_COORD,
                                         message=msg,
@@ -206,6 +222,14 @@ class ActionMixin:
                                         preview=(shot.data, shot.meta) if shot else None)
             else:
                 attempts.append({"level": LEVEL_COORD, "ok": False, "note": "无可用矩形"})
+        except GlobalInputRefusedError:
+            # ⚠️ 必须**原样抛出**，不能让下面那个通用兜底 `except Exception` 接住 ——
+            #    接住之后它会变成一句「元素级与坐标级均失败」，而那句话里**没有出路**
+            #    （换元素级？那是刚刚失败的那一档；换 real 模式？模型根本不知道有这回事）。
+            #    于是模型只会反复重试同一条注定失败的路，白耗轮数。
+            #    真机实测踩到过近亲版本：`type_text` 里把它转成 ActionResult，探针读成
+            #    "居然成功了" —— 同一道闸门在别处是抛异常的，形态必须统一。
+            raise
         except Exception as exc:  # noqa: BLE001
             attempts.append({"level": LEVEL_COORD, "ok": False, "note": str(exc)})
 
@@ -253,8 +277,13 @@ class ActionMixin:
                 f"scroll 的 amount={amount} 超过上限 {self._SCROLL_MAX_AMOUNT} 格；"
                 f"滚动是持屏锁执行的坐标动作，一次滚这么多会长时间占屏"
             )
+        # ★ 闸门在 `_scroll_point` **之前**：滚轮也是 SendInput，一样会落到用户的指针上。
+        #   （作用点本身现在取的是"目标窗口中心"而非用户的活动窗口，但即便如此，
+        #     事件依然由用户的鼠标发出 —— 拦的是这个，不是作用点怎么算。）
+        self._require_global_input("scroll_xy")
         x, y, src = self._scroll_point(x, y)
         warn = self._sandbox_guard()
+        gnote = self._global_input_note()
         # 预览图（注入前抓）：它的**原始图**后面要做点后对比，故与 click_xy 一样只抓一次
         shot = self._preview_image(x, y, preview)
         try:
@@ -278,6 +307,8 @@ class ActionMixin:
             msg += "｜未检出界面变化（可能已到内容尽头，或该处本就无内容可滚）"
         if warn:
             msg += f"；{warn}"
+        if gnote:
+            msg += f"；{gnote}"
         return ActionResult(
             ok=ok, level=LEVEL_COORD, message=msg,
             attempts=[{"level": LEVEL_COORD, "ok": ok,
@@ -328,7 +359,11 @@ class ActionMixin:
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         if (x1, y1) == (x2, y2):
             raise ComputerUseError("drag 的起点与终点相同，构不成拖拽（按住又原地松开）")
+        # ★ 闸门在最前面（同 click_xy）：拖拽按住不放地移动指针，一旦打到用户的桌面上，
+        #   破坏面比单击大得多（可能拖走他的文件/窗口）。
+        self._require_global_input("drag_xy")
         warn = self._sandbox_guard()
+        gnote = self._global_input_note()
         before_active = self._landing().get("active_window")
         shot = self._preview_image(x1, y1, preview)
         # 起点的落点文字由裁剪预览图 OCR 得出（同一份像素复用）；没有预览图时退回小块 OCR
@@ -354,6 +389,8 @@ class ActionMixin:
             msg += f"｜{change}"
         if warn:
             msg += f"；{warn}"
+        if gnote:
+            msg += f"；{gnote}"
         return ActionResult(
             ok=ok, level=LEVEL_COORD, message=msg,
             attempts=[{"level": LEVEL_COORD, "ok": ok,
@@ -405,6 +442,17 @@ class ActionMixin:
                 attempts.append({"level": LEVEL_ELEMENT, "ok": False, "note": str(exc)})
 
         # 2. 键盘注入兜底
+        #
+        # ★ 闸门：隔离模式下键盘注入**整条拒绝** —— 它天然是"打给当前焦点"的动作，
+        #   没有"带明确目标"的变体可退；而隔离桌面上没有焦点可言，当前焦点**一定是你**，
+        #   字会直接敲进你正在用的那个窗口里（且每一步都返回成功）。
+        #
+        # ⚠️ **让它抛出去**，不要在这里捕获后返回 ActionResult —— 真机实测踩到：
+        #   返回 ActionResult 时探针（以及任何按"抛没抛"判断的调用方）会把它读成
+        #   "居然成功了"，而同一个闸门在 `click_xy` / `press_key` 那几个入口是抛异常的。
+        #   同一道闸门两种形态，就意味着"它到底拦没拦"要靠读文案才知道 —— 那正是
+        #   本项目最忌讳的、要靠人去辨认的失效形态。统一成抛。
+        self._require_global_input("type_text")
         warn = self._sandbox_guard()  # 键盘注入会发真实按键事件，注入前礼让
         try:
             if clear_first:
@@ -432,6 +480,9 @@ class ActionMixin:
                 msg += f"｜{reloc_note}"
             if warn:
                 msg += f"；{warn}"
+            gnote = self._global_input_note()
+            if gnote:
+                msg += f"；{gnote}"
             return ActionResult(ok=ok, level=LEVEL_KEY if ok else LEVEL_NONE,
                                 message=msg,
                                 attempts=attempts, data={"ref": ref, **landing})
@@ -449,7 +500,12 @@ class ActionMixin:
         回报**按键发出后的活动窗口**：快捷键是否生效依赖焦点在谁身上，而焦点随时可能
         被别的应用抢走（实测有过把按键送进用户其它应用的事故）。标题是判断「有没有
         打偏」最便宜的信号，模型据此不必再截图确认。
+
+        ★ 隔离模式下的闸门在**第一行**：与 `type_text` 同一条理由 —— 快捷键打给
+        "当前焦点"，而隔离桌面上没有焦点，当前焦点一定是你（`alt+F4` 关掉的可能正是
+        你的窗口）。这里没有"元素级"替代品，所以只能整条拒绝。
         """
+        self._require_global_input("press_key")
         warn = self._sandbox_guard()
         before_active = self._landing().get("active_window")
         try:
@@ -462,6 +518,9 @@ class ActionMixin:
                 msg += f"｜{self._format_landing({}, landing, before_active)}"
             if warn:
                 msg += f"；{warn}"
+            gnote = self._global_input_note()
+            if gnote:
+                msg += f"；{gnote}"
             return ActionResult(ok=ok, level=LEVEL_KEY if ok else LEVEL_NONE,
                                 message=msg,
                                 data={"combo": combo, **landing})

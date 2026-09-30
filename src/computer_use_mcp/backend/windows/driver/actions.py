@@ -183,27 +183,71 @@ def invoke(element, action: str | None = None) -> bool:  # noqa: ANN001
     return False
 
 
-def set_value(element, text: str) -> bool:  # noqa: ANN001
+def set_value(element, text: str, allow_focus: bool = True) -> bool:  # noqa: ANN001
     """
-    写元素的值（输入框）。
+    写元素的值（输入框），并**读回来核对**。
 
-    ⚠️ 先 `SetFocus` 再写：某些 provider（尤其经典 Win32 编辑框）在非焦点状态下
-    会接受 `SetValue` 但**不发通知**，于是紧跟着读回来的值还是旧的 —— 表现成
-    "写了但没生效"。聚焦一次的成本约 1ms，换掉一整类难查的静默失败。
+    ═══ 为什么是"写后回读"，而不是"先 `SetFocus` 再写"（2026-09-30 改）═══
+
+    原实现先 `SetFocus` 再写，理由是「某些 provider（尤其经典 Win32 编辑框）在非焦点
+    状态下会接受 `SetValue` 但**不发通知**，于是紧跟着读回来的值还是旧的」。那个理由
+    本身是对的（现象确实存在），但**代价变了**：`SetFocus` 会让目标窗口去抢前台，
+    而在隔离模式下"抢前台"抢的到底是谁是一件没人能担保的事 —— 担保不了的后果是
+    可能动到用户正在用的窗口。
+
+    所以改成：**不靠"把焦点挪过去"来保证生效，而是靠"写完读回来看看"来发现没生效**。
+    DEMO 实测后台 `SetValue`（不聚焦）对绝大多数控件都正常，回读只是给那少数
+    "接受但不生效"的控件留一条**如实报错**的路（返回 False → 协调层知道这一步没成）。
+
+    ⚠️ **回读失败不抛异常、也不吞**：读不到（pattern 没有 / 访问抛错）一律当"无法验证"，
+    返回 True —— 无法验证 ≠ 失败，把不确定说成失败会让协调层去做更危险的事（降级到
+    键盘注入）。只有**确实读到且对不上**才返回 False。
+
+    `allow_focus=False`（隔离模式）时一个焦点动作都不发；`True`（real 模式）时保留
+    原来的聚焦行为 —— 那是用户自己选的"就用老行为"。
     """
     if element is None:
         return False
-    try:
-        focus(element)
-    except Exception:  # noqa: BLE001 —— 聚焦失败不该阻断写值（有些控件不可聚焦但可写）
-        pass
+    if allow_focus:
+        try:
+            focus(element)
+        except Exception:  # noqa: BLE001 —— 聚焦失败不该阻断写值（有些控件不可聚焦但可写）
+            pass
     if nodes.pattern_available(element, "ValuePattern"):
         element.GetValuePattern().SetValue(text)
-        return True
+        return _verify_value(element, text, numeric=False)
     if nodes.pattern_available(element, "RangeValuePattern"):
         element.GetRangeValuePattern().SetValue(float(text))
-        return True
+        return _verify_value(element, text, numeric=True)
     return False
+
+
+def _verify_value(element, text: str, numeric: bool) -> bool:  # noqa: ANN001
+    """
+    写后回读核对：**读不到 → True（无法验证）；读到了且对不上 → False**。
+
+    判据刻意做得**宽**（归一化后比较），因为这里返回 False 的后果不轻 —— 协调层会认为
+    "元素级写值没成"，在 real 模式下改走键盘注入、在隔离模式下直接报失败。而"控件
+    把 `1.50` 规范化成 `1.5`"这种差异**不是失败**，用它去触发一次键盘注入纯属自伤。
+
+    归一化规则：去首尾空白；两边都能解析成数字时按数值比较（容忍 `1.50` vs `1.5`）。
+    """
+    try:
+        if numeric:
+            got = element.GetRangeValuePattern().Value
+        else:
+            got = element.GetValuePattern().Value
+    except Exception:  # noqa: BLE001 —— 读不到 = 无法验证，不是失败
+        return True
+    try:
+        want_s = str(text).strip()
+        got_s = str(got).strip()
+        if want_s == got_s:
+            return True
+        return abs(float(want_s) - float(got_s)) < 1e-6
+    except (TypeError, ValueError):
+        # 至少有一边不是数字：那按字符串比（上面已经比过了，走到这里就是不相等）
+        return False
 
 
 def focus(element) -> bool:  # noqa: ANN001

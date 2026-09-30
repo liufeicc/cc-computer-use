@@ -152,6 +152,33 @@ class _UnavailableBackend(Backend):
 
 
 
+def _capability_caveat() -> str:
+    """
+    本会话**稳定**的能力边界（拼进 MCP `instructions`，见 `SessionProvider.startup_caveat`）。
+
+    为什么要有这一段：能力边界（"隔离模式下坐标级点击不可用"）若只写在工具返回里，
+    模型要先**撞上一次拒绝**才知道 —— 那一轮是纯浪费，而且它极可能先去尝试坐标点击
+    （标准工作流里"坐标兜底"是写着的一档）。放在 instructions 里，它在**决定怎么干活之前**
+    就看到了，这与 act_sequence 那段引导是同一条理由（工具描述要等模型决定用它才读得到）。
+
+    ⚠️ 取的是 `startup_caveat()` 而**不是** `capabilities().notes`：后者的文案随运行时
+    状态变（沙箱在不在），而这里拼出来的字会被模型当整场的既定事实 —— 用一份会变的
+    现状去填它，等于给它一句从头到尾都错、且它不会怀疑的话。判据写在那条 Protocol
+    方法的 docstring 里，改这里之前先读它。
+
+    ⚠️ 整段包在 try 里且失败只记日志：创建 server 是**进程启动的必经之路**，能力文案
+    拿不到不该让 MCP 起不来。
+    """
+    try:
+        text = session.MANAGER.startup_caveat()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("startup_caveat 失败（忽略）: %s", exc)
+        return ""
+    if not text:
+        return ""
+    return f"**本会话的隔离与能力边界**：{text}"
+
+
 def create_server() -> FastMCP:
     """构建并返回已注册全部工具的 FastMCP 实例。"""
     mcp = FastMCP(
@@ -176,7 +203,7 @@ def create_server() -> FastMCP:
             "**灰区应用**（无元素树，如 SWT/Java、自绘控件、游戏、远程桌面）：优先用 "
             "get_screen_text（OCR 出带坐标的文本，读文字即可定位）；确实需要像素级判断时才用 "
             "screenshot——它费 token 且要你自己估算坐标。"
-        ),
+        ) + _capability_caveat(),
     )
     backend = _make_backend()
     coord = Coordinator(backend=backend, ref_table=RefTable())

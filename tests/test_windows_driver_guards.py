@@ -666,6 +666,22 @@ class _Win32Spy:
         return [a for n, a in self.calls if n == name]
 
 
+def _real_mode(monkeypatch) -> None:  # noqa: ANN001
+    """显式声明「本次是 real 模式」—— 给那些直接调注入方法的用例用。
+
+    ⚠️ 为什么必须**显式**（2026-09-30 实测踩到）：`conftest.py` 只在**非 e2e** 时
+    `setdefault("CC_CU_DISPLAY_MODE", "real")`，而 e2e 分支刻意不干预（要保留
+    「默认在沙箱内跑」的约定）。于是这几个直接调 `WindowsBackend.click_at/drag_at`
+    的用例在 `CC_CU_E2E=1` 下拿到的是 `isolated`，撞上「隔离模式拒绝全局注入」的闸门而红
+    —— 而默认跑法全绿。
+
+    那不是产品缺陷，是**用例偷偷依赖了环境**（与 zenity 那个「中文默认标签」的假红
+    同一类：在开发机上永远重现不了）。要测 real 模式的语义，就把 real 模式写进用例里。
+    """
+    monkeypatch.setenv("CC_CU_DISPLAY_MODE", "real")
+    monkeypatch.delenv("CC_CU_ALLOW_GLOBAL_INPUT", raising=False)
+
+
 def test_click_at_focuses_the_window_under_the_point_not_the_current_foreground(monkeypatch):
     """
     `click_at(focus_window=True)` 传给输入层的 hwnd 必须是**落点下的顶层窗口**。
@@ -677,6 +693,7 @@ def test_click_at_focuses_the_window_under_the_point_not_the_current_foreground(
     """
     from computer_use_mcp.backend.windows.backend import WindowsBackend
 
+    _real_mode(monkeypatch)
     spy = _Win32Spy(monkeypatch, fg_hwnd=111, at_point_hwnd=222)
     assert WindowsBackend().click_at(120, 340) is True
 
@@ -695,6 +712,7 @@ def test_click_at_without_focus_does_not_touch_windows_at_all(monkeypatch):
     """
     from computer_use_mcp.backend.windows.backend import WindowsBackend
 
+    _real_mode(monkeypatch)
     spy = _Win32Spy(monkeypatch, fg_hwnd=111, at_point_hwnd=222)
     assert WindowsBackend().click_at(10, 20, focus_window=False) is True
 
@@ -710,6 +728,7 @@ def test_drag_at_focuses_the_window_under_the_start_point(monkeypatch):
     """
     from computer_use_mcp.backend.windows.backend import WindowsBackend
 
+    _real_mode(monkeypatch)
     spy = _Win32Spy(monkeypatch, fg_hwnd=111, at_point_hwnd=333)
     assert WindowsBackend().drag_at(50, 60, 500, 600) is True
 
