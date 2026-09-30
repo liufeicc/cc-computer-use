@@ -128,11 +128,22 @@ def find_window(title_contains: str | None = None, window_id: str | None = None)
     return None
 
 
-def _parse_hwnd(value: str) -> int | None:
+def parse_hwnd(value: str) -> int | None:
+    """
+    `"0x1a2b3c"` 或十进制串 → hwnd；认不出返回 None（**不猜**）。
+
+    对外公开是因为**按窗口截图（`driver/capture.py`）与按窗口取几何也要用它**：
+    在 capture 里再写一份十六进制解析，两处迟早漂移，而漂移的表现是
+    「`list_windows` 给的 id 在某些窗口上不能用」——极难反查。
+    """
     try:
         return int(value, 16) if value.lower().startswith("0x") else int(value, 10)
     except (ValueError, AttributeError):
         return None
+
+
+# 旧名保留：模块内与既有调用点沿用（改名不是本次的目的，公开新名才是）
+_parse_hwnd = parse_hwnd
 
 
 def wait_window(title_contains: str | None = None, window_id: str | None = None,

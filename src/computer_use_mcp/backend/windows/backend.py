@@ -80,7 +80,7 @@ from ..base import (
     Rect,
     TextBlock,
 )
-from .driver import _uia, actions, apps, nodes, session_info, win32
+from .driver import _uia, actions, apps, capture, nodes, session_info, win32
 from .driver import ocr as ocr_mod
 
 log = get_logger(__name__)
@@ -116,6 +116,12 @@ class WindowsBackend(Backend):
     #   故 `TextBlock.conf` 只能是常数占位、`min_conf` 不生效。
     #   如实声明它 —— 让参数静默变成 no-op 比不支持它更糟。见 base.py 的说明。
     SUPPORTS_TEXT_CONFIDENCE = False
+
+    # ★ 不给范围时**按窗口**截，不抓全屏。
+    #   用户桌面上同时开着浏览器/聊天工具/IDE —— 抓全屏会把它们一起送进模型上下文
+    #   （隐私 + 准确性双输），而目标应用被别的窗口盖住时更是直接截错东西。
+    #   Linux 那边整块 Xephyr 屏就是工作台，所以保持 "screen"（见 base.py 的说明）。
+    DEFAULT_CAPTURE_SCOPE = "window"
 
     def __init__(self) -> None:
         # 刻意**不在 __init__ 里** import uiautomation / 建 COM 对象：
@@ -789,6 +795,123 @@ class WindowsBackend(Backend):
     # ⚠️ 本模块的 docstring 里原先写着「抓屏需要一套独立的平台 API（BitBlt/PrintWindow）」，
     #    那句话**是错的**（已改）。真正的分工是 `backend/screen.py` 出像素活、
     #    `backend/linux/grab.py` 出「抓哪块屏」—— 见 screen.py 的模块 docstring。
+
+    def capture_window(self, window_id: str) -> tuple[Any, tuple[int, int]] | None:
+        """
+        **按窗口渲染**（`PrintWindow` + `PW_RENDERFULLCONTENT`）—— 「只截某一个软件」那条路。
+
+        ⚠️ 与 `screenshot()` 的根本区别，别混：
+          · `screenshot(region=…)` 走 `mss` 的**屏幕 DC**，抓到的是「屏幕上那一块」——
+            **被别的窗口盖住时，截到的是盖住它的那扇窗**；
+          · 本方法让窗口**自己给自己画一张像**，不经过屏幕 DC、**不受遮挡影响**、
+            不需要窗口在前台。
+
+        实现在 `driver/capture.py`（含黑图哨兵与窗口状态证据）。这里只负责
+        「window_id → hwnd」这一步。
+
+        ⚠️ **id 解析刻意不走 `apps.find_window`**：它只在 `window_rows()` 里找，而
+        后者过滤掉了**无标题窗口**与外壳窗 —— 而弹窗菜单、浮层、tooltip 这类
+        「正想单独截的界面」恰恰常常没有标题。这里直接认 hwnd，再用
+        `is_window` + 有效矩形做校验，把可截范围放宽到「任何一扇真实存在的窗」。
+        """
+        hwnd = apps.parse_hwnd(window_id)
+        if hwnd is None or not win32.is_window(hwnd):
+            raise ComputerUseError(
+                f"capture_window: 无效的 window_id={window_id!r}"
+                f"（可用 list_windows 拿到 id，形如 0x1a2b3c）"
+            )
+        img, cinfo = capture.print_window(hwnd)
+        # ⚠️ `state` 必须在**分支之前**取出来：它只跟着 `cinfo` 走，与抓没抓到无关 ——
+        #    而"抓不到"那条分支（要拿状态解释原因）与"抓到了"那条（要拿矩形算原点）
+        #    都要用它。真机上第一版把它写在 raise 分支里，于是**成功路径反而
+        #    UnboundLocalError**（2026-09-30 真机抓到）。
+        state = cinfo.get("state") or {}
+        if img is None:
+            # 抓不到就**如实报错**，绝不返回黑图 —— 让模型以为"界面就是这样"
+            # 是本项目最不能容忍的失败形态，而它在这里的自然语言是「这界面是空白的」。
+            raise ComputerUseError(
+                f"按窗口截图失败（hwnd=0x{hwnd:x}）："
+                f"{cinfo.get('reason') or '未渲染出内容'}"
+                f"｜窗口状态={state}｜PrintWindow api_ok={cinfo.get('api_ok')}"
+                f" 耗时={cinfo.get('ms')}ms"
+            )
+        rect = state.get("rect") or [0, 0, 0, 0]
+        return img, (int(rect[0]), int(rect[1]))
+
+    def screenshot_window(
+        self, window_id: str, max_side: int | None = None,
+        fmt: str = "jpeg", quality: int = 85,
+    ) -> tuple[bytes, dict[str, Any]] | None:
+        """
+        按窗口渲染并编码。**比基类多带两样模型要用的东西**，故在这里覆写而不是靠默认实现：
+
+          · `window_title` —— 「我截的是谁」；
+          · `nonblack` / `print_ms` / `window_state` —— 「这张图拿得可不可信」
+            （全黑 = 抓不到；耗时用来判断偶发卡住是不是 `PrintWindow`）。
+        """
+        out = super().screenshot_window(window_id, max_side=max_side, fmt=fmt,
+                                        quality=quality)
+        if out is None:
+            return None
+        data, meta = out
+        hwnd = apps.parse_hwnd(window_id) or 0
+        meta["window_title"] = win32.window_text(hwnd) if hwnd else None
+        return data, meta
+
+    def active_window_id(self) -> str | None:
+        """当前前台窗口的 id；取不到返回 None（与 `list_windows` 的 id 同形状）。"""
+        hwnd = win32.foreground_window()
+        return f"0x{hwnd:x}" if hwnd else None
+
+    def window_for_app(self, app: str) -> str | None:
+        """
+        按应用名找一个**顶层窗口** id（形状与 `list_windows` 的 `id` 一致）。
+
+        ⚠️ 有多个窗口时取**面积最大**的那个：与应用同进程的常有一堆 10x10 的辅助窗
+        （GTK 侧为此吃过一次亏，Windows 的 UWP 外壳窗同理），
+        随手取第一个会让"按应用截图"截到一扇看不见的小窗，而**不报任何错**。
+
+        ⚠️ 与 `apps.find_window` 不同之处：这里**不要求窗口有标题**（它走的是
+        `window_rows`，会过滤掉无标题窗），而"想单独截的那扇"常常正好没有标题。
+        """
+        needle = (app or "").strip().lower()
+        if not needle:
+            return None
+        best: tuple[int, int] = (0, 0)      # (面积, hwnd)
+        for hwnd in win32.enum_top_level_windows():
+            try:
+                # app 口径与 `apps.app_names()` / 节点上的 `app` 字段必须**同一来源**，
+                # 否则会出现"list_windows 里明明有这个应用，find 它就是找不到"——
+                # 那一类问题没有报错、只是没结果，最难查。
+                base = (win32.process_basename(hwnd) or "").lower()
+                title = (win32.window_text(hwnd) or "").lower()
+                if needle not in base and needle not in title:
+                    continue
+                r = win32.window_rect(hwnd)
+                if not r:
+                    continue
+                area = max(0, r[2] - r[0]) * max(0, r[3] - r[1])
+                if area > best[0]:
+                    best = (area, hwnd)
+            except Exception:  # noqa: BLE001 —— 单个窗口读失败不该让整次查找失败
+                continue
+        return f"0x{best[1]:x}" if best[1] else None
+
+    def window_rect_of(self, window_id: str) -> Rect | None:
+        """
+        任意窗口的屏幕矩形（不只是活动窗口）。
+
+        为什么 Windows 侧非要它不可：**隐藏桌面上的应用永远不是「活动窗口」**
+        （前台属于用户桌面上的某个窗口）。按 id 找是唯一能拿到它几何的办法 ——
+        而按窗口 OCR、落点证据、以及把窗口请到屏幕外再截，都要用这个矩形。
+        """
+        hwnd = apps.parse_hwnd(window_id)
+        if hwnd is None or not win32.is_window(hwnd):
+            return None
+        r = win32.window_rect(hwnd)
+        if not r:
+            return None
+        return Rect(x=r[0], y=r[1], w=r[2] - r[0], h=r[3] - r[1])
 
     def screenshot(self, region: tuple[int, int, int, int] | None = None,
                    max_side: int | None = None, fmt: str = "jpeg",

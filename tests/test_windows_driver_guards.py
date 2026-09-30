@@ -868,3 +868,126 @@ def test_find_deadline_is_armed_before_root_resolution(monkeypatch):
 
     assert res.items == [], "预算在找根阶段就用完了，不该有任何命中"
     assert "墙钟上限" in res.notice, f"超预算没报出来：{res.notice!r}"
+
+# ==================== ⑪ 按窗口渲染：哨兵、最小化、窗口选择 ====================
+
+def test_windows_backend_exposes_by_window_capture():
+    """
+    ★ 「单独截某个软件」那条路必须在 Windows 上真的实现（而不是走 ABC 的默认 None）。
+
+    判据取 `__dict__` 里的函数对象**不是基类那个** —— 即"确实覆写了"。
+    这与 `test_windows_backend_has_no_unimplemented_parts_left` 是同一条纪律的延续：
+    默认实现返回 `None`，会**静默**退化成"本平台没有这条通道"。
+    """
+    from computer_use_mcp.backend.base import Backend
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+
+    for name in ("capture_window", "screenshot_window", "window_rect_of",
+                 "window_for_app", "active_window_id"):
+        assert getattr(WindowsBackend, name) is not getattr(Backend, name), (
+            f"WindowsBackend 没有覆写 {name} —— 它正走 ABC 的默认实现（返回 None），"
+            f"那会把「本平台没这条通道」与「实现了但这次没拿到」混成一件事。")
+    # 正控：基线默认按屏（若两边一样，上面那条就量不到"平台差异"这件事）
+    assert Backend.DEFAULT_CAPTURE_SCOPE == "screen"
+    assert WindowsBackend.DEFAULT_CAPTURE_SCOPE == "window"
+
+
+def test_minimized_window_is_refused_before_any_rendering(monkeypatch):
+    """
+    ★ 最小化的窗口必须在**动手画之前**就拒掉。
+
+    2026-09-30 真机实测：最小化的窗口 `PrintWindow` **不失败、也不给黑图** ——
+    它老老实实画一张 **237x39 的标题栏细条**（非黑占比 1.0，像素哨兵完全拦不住）。
+    后果比黑图更坏：模型拿到一张"有内容的图"，会以为那就是窗口的界面。
+
+    判据取「返回值是 None + 原因里提到最小化 + **一次 GDI 调用都没有**」——
+    最后那条是"在画之前判"的可执行版本：只查返回值的话，一个"先画再丢弃"的实现
+    照样能过，而它仍然会去调那个在某些 GPU 路径上会**阻塞**的 `PrintWindow`。
+    """
+    from computer_use_mcp.backend.windows.driver import capture as cap
+
+    monkeypatch.setattr(cap, "window_state",
+                        lambda hwnd: {"hwnd": hwnd, "minimized": True, "visible": True,
+                                      "ws_visible": True, "rect": [0, 0, 237, 39]})
+    monkeypatch.setattr(cap.win32, "is_window", lambda h: True)
+
+    img, info = cap.print_window(0x1234)
+    assert img is None
+    assert "最小化" in (info.get("reason") or ""), f"原因要说人话：{info!r}"
+
+    # ★ 判据的第二半（也是"在**画之前**判"的可执行版本）：源码里那句 `IsIconic` 检查
+    #   必须排在第一次碰 GDI 之前。只断返回值的话，一个"先画一张再丢掉"的实现照样
+    #   能过 —— 而它仍然会去调那个在部分 Chromium/GPU 路径上会**阻塞**、
+    #   且在我们的进程里同步执行、杀不掉的 `PrintWindow`。
+    #   为什么不在 CI 里桩掉 GDI：Linux 上 `ctypes.windll` 根本不存在（AttributeError），
+    #   桩不上去。取源码顺序是同一仓库里既有做法（见「预算先武装」那条守卫）。
+    src = (pathlib.Path(_WINPKG) / "driver" / "capture.py").read_text(encoding="utf-8")
+    body = src[src.index("def print_window("):src.index("def encode_window(")]
+    pos_min = body.index('state.get("minimized")')
+    pos_gdi = body.index("ctypes.windll")
+    assert pos_min < pos_gdi, (
+        "最小化的检查必须排在第一次碰 GDI 之前 —— 否则会先调 PrintWindow 再去丢掉结果")
+
+
+def test_black_frame_is_refused_but_a_dark_theme_is_accepted():
+    """
+    ★ 黑图哨兵：全黑 = 抓不到（拒），**深色主题 = 正常**（收）。
+
+    第三条是关键的正控 —— 没有它的话，一个"永远返回失败"的实现也能过前两条，
+    而它会把所有深色主题的界面判成抓不到（实测过这类误判的代价：模型转去走
+    更贵的坐标路径，还得不出结论）。
+
+    另有两条一起断：判失败时**不许带图**（"宁可报抓不到也不返回黑图"的可执行版本），
+    以及判失败时的原因要能落到**窗口状态**上（可行动），而不是一句"抓不到"。
+    """
+    from computer_use_mcp.backend.windows.driver import capture as cap
+
+    def _nonblack_of(pixels: list[int]) -> float:
+        return 1.0 - sum(1 for v in pixels if v <= cap._NEAR_BLACK) / len(pixels)
+
+    # 全零帧（PrintWindow 失败的典型产物）
+    assert _nonblack_of([0] * 16000) == 0.0
+    assert _nonblack_of([0] * 16000) <= (1.0 - cap._BLACK_FRACTION_FAIL)
+    # 正常帧
+    assert _nonblack_of([200] * 16000) == 1.0
+    # ★ 深色主题：大量近黑 + 少量文字像素 —— **必须判通过**
+    dark_theme = [0] * 15900 + [180] * 100
+    assert _nonblack_of(dark_theme) > (1.0 - cap._BLACK_FRACTION_FAIL), (
+        "深色主题被冤枉成失败 —— 纯像素阈值压得太紧了")
+    # 正控：阈值本身确实在"几乎全黑"那一档（不是随手写的 0.5 之类）
+    assert cap._BLACK_FRACTION_FAIL >= 0.99
+
+
+def test_black_reason_prefers_window_state_over_a_generic_message():
+    """「为什么抓不到」要落到窗口状态上（可行动），而不是一句笼统的"未渲染出内容"。"""
+    from computer_use_mcp.backend.windows.driver import capture as cap
+
+    assert "最小化" in cap.black_reason({"minimized": True, "rect": [0, 0, 10, 10]})
+    assert "不可见" in cap.black_reason({"minimized": False, "visible": False,
+                                        "rect": [0, 0, 10, 10]})
+    assert "矩形" in cap.black_reason({"minimized": False, "visible": True,
+                                      "ws_visible": True, "rect": None})
+    # 正控：状态都正常时**不该**编一个原因出来（编了就会把"全黑界面"说成"窗口有问题"）
+    assert cap.black_reason({"minimized": False, "visible": True, "ws_visible": True,
+                             "rect": [0, 0, 100, 100]}) == ""
+
+
+def test_window_for_app_picks_the_largest_window(monkeypatch):
+    """
+    按应用找窗时要取**面积最大**的那个。
+
+    与应用同进程的常有一堆小辅助窗（UWP 外壳、GTK 的 10x10 提示窗）。
+    随手取第一个会让"按应用截图"截到一扇看不见的小窗，而**不报任何错**。
+    """
+    from computer_use_mcp.backend.windows.backend import WindowsBackend
+    from computer_use_mcp.backend.windows.driver import win32
+
+    rows = {0x1: (0, 0, 10, 10), 0x2: (0, 0, 800, 600), 0x3: (0, 0, 100, 100)}
+    monkeypatch.setattr(win32, "enum_top_level_windows", lambda **k: list(rows))
+    monkeypatch.setattr(win32, "window_rect", lambda h: rows.get(h))
+    monkeypatch.setattr(win32, "process_basename", lambda h: "notepad")
+    monkeypatch.setattr(win32, "window_text", lambda h: "Untitled")
+
+    assert WindowsBackend().window_for_app("notepad") == "0x2"
+    # 正控：名字对不上时必须返回 None（否则这条判据量不到"挑"这个动作）
+    assert WindowsBackend().window_for_app("nosuchapp") is None

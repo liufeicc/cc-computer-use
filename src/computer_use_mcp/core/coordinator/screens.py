@@ -20,11 +20,81 @@ from typing import Any
 
 from ...utils import temps
 from ...utils.errors import ComputerUseError
-from .hooks import _exclusive_screen, _needs_display
+from .hooks import _exclusive_screen, _needs_display, log
 
 
 class ScreenMixin:
     """屏幕布局、截图、OCR 文本层。"""
+
+    # ================= 抓图通道：按窗口优先，裁屏兜底 =================
+
+    def _window_capture_supported(self) -> bool:
+        """本平台有没有「按窗口渲染」这条通道（基类默认实现返回 None = 没有）。
+
+        ⚠️ 判据取**类方法是不是被覆写过**，而不是 `hasattr` / `try: ... except`：
+        本仓库明文否定带默认值的哨兵写法（I-10）——它会让"新平台忘了实现"
+        静默退化成另一种行为。
+        """
+        from ...backend.base import Backend
+        return (type(self.backend).capture_window is not Backend.capture_window)
+
+    def _grab(self, region: tuple[int, int, int, int] | None, scope: str,
+              window_id: str | None, app: str | None,
+              max_side: int, fmt: str) -> tuple[bytes, dict[str, Any]]:
+        """
+        抓一张图，返回 `(bytes, meta)`。**截图与 OCR 共用这一条**（口径一致）。
+
+        三层优先级：
+          1. 显式 `region` → 就按那块区域裁屏（用户明确要的，照办）；
+          2. 平台支持按窗口渲染 → **让那扇窗自己画一张**（不受遮挡影响、不含别人的窗口）；
+          3. 否则退化为「按窗口矩形裁屏」，并在 meta 里**如实标注** `capture="region_crop"`
+             与"可能被遮挡"——模型必须能分辨自己在看哪一种，否则会把遮挡者的内容
+             当成目标窗口的内容。
+        """
+        if region is not None:
+            data, meta = self.backend.screenshot(region, max_side=max_side, fmt=fmt)
+            meta.setdefault("capture", "region_crop")
+            return data, meta
+
+        mode, wid, note = self._capture_target(scope, window_id, app)
+        if mode == "screen":
+            data, meta = self.backend.screenshot(None, max_side=max_side, fmt=fmt)
+            meta.setdefault("capture", "screen")
+            if note:
+                meta["target_note"] = note
+            return data, meta
+
+        if self._window_capture_supported():
+            wid = wid or self.backend.active_window_id()
+            if wid:
+                data, meta = self.backend.screenshot_window(
+                    wid, max_side=max_side, fmt=fmt)
+                self._remember_target_window(wid)
+                if note:
+                    meta["target_note"] = note
+                return data, meta
+
+        # 退化：按窗口矩形裁屏。**必须标明**，因为这时看到的是"屏幕上那块"，
+        # 被遮挡时内容属于盖住它的窗口。
+        rect = None
+        if wid:
+            try:
+                rect = self.backend.window_rect_of(wid)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("window_rect_of(%s) 失败: %s", wid, exc)
+        rect = rect or self.backend.active_window_rect()
+        if rect is None or rect.is_empty():
+            data, meta = self.backend.screenshot(None, max_side=max_side, fmt=fmt)
+            meta["capture"] = "screen"
+            meta["target_note"] = (note + "｜" if note else "") + "取不到窗口矩形，已退回整屏"
+            return data, meta
+        data, meta = self.backend.screenshot(rect.to_tuple(), max_side=max_side, fmt=fmt)
+        meta["capture"] = "region_crop"
+        meta["window_id"] = wid
+        meta["target_note"] = ((note + "｜") if note else "") + (
+            "本平台不支持按窗口渲染，这张是**屏幕上那块区域**的裁剪 —— "
+            "目标窗口若被别的窗口挡住，图里就是**遮挡者**的内容。")
+        return data, meta
 
     @_needs_display
     def screen_layout(self) -> dict[str, Any]:
@@ -34,35 +104,47 @@ class ScreenMixin:
     @_exclusive_screen
     def screenshot_b64(
         self, region: tuple[int, int, int, int] | None = None, max_side: int = 1280,
+        scope: str = "auto", window_id: str | None = None, app: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """
         截图并返回 (base64, meta)。灰区兜底。
 
         为省 token，长边超过 max_side 时按比例降采样。
         """
-        png, meta = self.screenshot_image(region, max_side)
+        png, meta = self.screenshot_image(region, max_side, scope=scope,
+                                          window_id=window_id, app=app)
         return base64.b64encode(png).decode("ascii"), meta
 
     @_needs_display
     @_exclusive_screen
     def screenshot_image(
         self, region: tuple[int, int, int, int] | None = None, max_side: int = 1280,
-        fmt: str = "jpeg",
+        fmt: str = "jpeg", scope: str = "auto",
+        window_id: str | None = None, app: str | None = None,
     ) -> tuple[bytes, dict[str, Any]]:
         """
         截图并返回 (图像 bytes, meta)。灰区兜底。
+
+        `scope`（不给范围时截哪儿）：
+          · `"auto"`（默认）—— 跟随**本平台的工作台形态**（`backend.DEFAULT_CAPTURE_SCOPE`）：
+            Linux 是整块沙箱屏（那儿只有我们的应用），Windows 是**目标窗口**
+            （用户桌面上还有别的东西，抓全屏会把它们一起送进模型上下文）。
+          · `"window"` / `"screen"` —— 显式指定，覆盖上面的默认。
+        目标窗口的来源见 `_capture_target`：显式 `window_id` / `app` >
+        本会话最近操作过的窗口 > 活动窗口（**且会注明**）。
 
         缩放与编码**都在 backend 内一次性完成**（抓屏 → 缩放 → 编一次）。
         历史坑：这里曾是「backend 全尺寸编码 → 这里 Image.open 解码 → resize → 再编码」，
         同一张图压两遍、全尺寸那一次纯属浪费（实测 266ms）。现已下沉到 backend。
         """
-        return self.backend.screenshot(region, max_side=max_side, fmt=fmt)
+        return self._grab(region, scope, window_id, app, max_side, fmt)
 
     @_needs_display
     @_exclusive_screen
     def screenshot_to_file(
         self, region: tuple[int, int, int, int] | None = None, max_side: int = 1280,
-        path: str | None = None,
+        path: str | None = None, scope: str = "auto",
+        window_id: str | None = None, app: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """
         截图并落盘，返回 (文件路径, meta)。inline=False 时使用，省 token/turn 时间。
@@ -77,7 +159,8 @@ class ScreenMixin:
         需要覆盖时由调用方自己先删除目标文件——不给 overwrite 开关，避免「一句 true 就
         把破坏性操作变得顺手」。
         """
-        data, meta = self.screenshot_image(region, max_side)
+        data, meta = self.screenshot_image(region, max_side, scope=scope,
+                                           window_id=window_id, app=app)
         auto = not path
         if auto:
             # 自动路径：文件名带本进程 pid（归属标记），写完后按 LRU 裁剪。
@@ -115,6 +198,7 @@ class ScreenMixin:
     def get_screen_text(
         self, region: tuple[int, int, int, int] | None = None, scope: str = "window",
         min_conf: float = 40.0, max_items: int = 150,
+        window_id: str | None = None, app: str | None = None,
     ) -> str:
         """
         OCR 读取屏幕文本，返回「[ref] 文字 @ (x,y) 」的紧凑列表——灰区应用的**元素树替代品**。
@@ -125,25 +209,62 @@ class ScreenMixin:
         直接读到带坐标的文本，既能点(ref 或 x,y)又不用看图。
 
         scope 决定默认识别范围（都是为了避免全屏 OCR 的 8~10s 开销）：
-          - 'window'（默认）：当前**活动窗口**那块矩形。对话框/菜单场景最快（2~3s）。
+          - 'window'（默认）：**目标窗口**。对话框/菜单场景最快（2~3s）。
           - 'screen'：整屏。文字密集时 8~10s，仅在确实要看全局时用。
         传了 region 则一律以 region 为准。
+
+        ⚠️ 「目标窗口」不等于「活动窗口」：它按 `window_id` > `app` >
+        本会话最近操作过的窗口 > 活动窗口 的顺序推导（见 `_capture_target`）。
+        最后那一档**会在返回里注明**——它可能正是**用户在用的窗口**。
+
+        ⚠️ 平台支持「按窗口渲染」时（Windows），OCR 喂的是**那扇窗自己画的图**：
+        **目标被别的窗口盖住也照样读得对**（老实现是"截屏幕上那块矩形"，
+        被遮挡时会读到遮挡者上的字，而且完全不报错）。
 
         ⚠️ 坐标是**快照**：界面变化后（切窗、弹新对话框）请重新调用，不要复用旧 ref。
         """
         reg = tuple(region) if region and len(region) == 4 else None
         scope_used = "region"
-        if reg is None:
-            if scope == "screen":
-                scope_used = "screen"
+        notes: list[str] = []
+        blocks: list[Any]
+        if reg is not None:
+            blocks = self.backend.read_text(reg, min_conf=min_conf)
+        else:
+            mode, wid, note = self._capture_target(scope, window_id, app)
+            if note:
+                notes.append(note)
+            img_got = None
+            if mode == "window" and self._window_capture_supported():
+                wid = wid or self.backend.active_window_id()
+                if wid:
+                    try:
+                        img_got = self.backend.capture_window(wid)
+                    except Exception as exc:  # noqa: BLE001
+                        # 抓不到就退回裁屏 —— OCR 值得把这条退路留着（它不同于截图：
+                        # 这里要的是**文字**，而裁屏拿到遮挡者的字至少还能看出不对）。
+                        notes.append(f"按窗口渲染失败，已改为裁屏幕上那块区域：{exc}")
+                    else:
+                        self._remember_target_window(wid)
+            if img_got is not None:
+                img, origin = img_got
+                scope_used = f"window:{wid}"
+                blocks = self.backend.read_text_from_image(img, origin, min_conf=min_conf)
             else:
-                r = self.backend.active_window_rect()
-                if r is not None and not r.is_empty():
-                    reg, scope_used = r.to_tuple(), "window"
+                if mode == "window":
+                    rect = None
+                    if wid:
+                        try:
+                            rect = self.backend.window_rect_of(wid)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("window_rect_of(%s) 失败: %s", wid, exc)
+                    rect = rect or self.backend.active_window_rect()
+                    if rect is not None and not rect.is_empty():
+                        reg, scope_used = rect.to_tuple(), "window"
+                    else:
+                        scope_used = "screen"   # 取不到窗口（如空桌面）→ 如实退回全屏
                 else:
-                    scope_used = "screen"   # 取不到活动窗口（如空桌面）→ 退回全屏
-
-        blocks = self.backend.read_text(reg, min_conf=min_conf)
+                    scope_used = "screen"
+                blocks = self.backend.read_text(reg, min_conf=min_conf)
         # ⚠️ `min_conf` 在有些平台**不生效**（Windows 自带 OCR 没有置信度）。
         #    不能让它静默变成 no-op —— 模型会以为自己筛掉了低质量结果。
         #    支持时这段是空串，不占输出。
@@ -151,7 +272,8 @@ class ScreenMixin:
         if not blocks:
             return ("(未识别到文本。可能：该区域确实没有文字、OCR 引擎缺语言包，"
                     "或语言包缺中文——见 CLAUDE.md 的 OCR 依赖说明)"
-                    + (f"\n{conf_note}" if conf_note else ""))
+                    + (f"\n{conf_note}" if conf_note else "")
+                    + (("\n" + "｜".join(notes)) if notes else ""))
 
         truncated = len(blocks) > max_items
         shown = blocks[:max_items]
@@ -162,7 +284,8 @@ class ScreenMixin:
             out.append(f"[{ref}] {b.text}  @ ({r.x},{r.y}) {r.w}x{r.h}")
         header = (f"识别范围={scope_used} region={list(reg) if reg else '全屏'}，"
                   f"共 {len(blocks)} 块文本" + (f"，已截断显示前 {max_items} 块" if truncated else "")
-                  + (f"\n{conf_note}" if conf_note else ""))
+                  + (f"\n{conf_note}" if conf_note else "")
+                  + (("\n" + "｜".join(notes)) if notes else ""))
         body = "\n".join(out)
         return (f"{header}\n{body}\n\n"
                 f"（坐标已是**屏幕绝对坐标**，可直接 click(x=..,y=..)；"

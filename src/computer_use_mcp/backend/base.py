@@ -252,6 +252,106 @@ class Backend(ABC):
         return (f"⚠️ 本平台 OCR 不提供置信度，min_conf={min_conf:g} **未生效**"
                 f"（返回的文本块没有经过任何质量筛选，请自行判断）。")
 
+    # 「不给范围时该截哪儿」—— **平台差异，不是一个可以随便定的默认值**。
+    #
+    #   · Linux = `"screen"`：整块 Xephyr 沙箱屏**就是**我们的工作台，
+    #     上面除了目标应用什么都没有。抓全屏即正确，且行为与历史一字不变。
+    #   · Windows = `"window"`：用户桌面上同时开着浏览器/聊天工具/IDE。
+    #     抓全屏会把**用户桌上的其它窗口一起送进模型上下文**（隐私 + 准确性双输），
+    #     而目标应用被别的窗口盖住时更是直接截错东西。
+    #
+    # ⚠️ 写成类属性而不是在 coordinator 里 `if platform`：平台分支只允许出现在
+    # `core/session.py` 与 `backend/base.py::get_backend()` 两处，由
+    # `tests/test_platform_module_boundary.py` 用 AST 扫描兜住。
+    # 这与 `SELECT_ALL_COMBO` / `SUPPORTS_TEXT_CONFIDENCE` 是同一套做法。
+    DEFAULT_CAPTURE_SCOPE: str = "screen"
+
+    def capture_window(self, window_id: str) -> tuple[Any, tuple[int, int]] | None:  # noqa: ANN401
+        """
+        **按窗口**抓一张图，返回 `(PIL.Image, origin)`；本平台不支持时返回 `None`。
+
+        `origin` 的语义与 `screen.grab_desktop` 逐字一致：图像像素 (0,0) 对应的
+        **屏幕绝对坐标**。这样「屏幕坐标 = origin + 图上坐标 × scale」那条换算规则
+        对「按窗口」与「裁屏」两个通道**通用**，调用方不必分辨自己在看哪一种。
+
+        ⚠️ 为什么是**可选钩子**（默认 None）而不是抽象方法：`server.py` 的
+        `_UnavailableBackend` 与 `tests/` 的多个桩类都按定长签名实现了全部抽象方法，
+        加一个抽象方法会让它们**当场无法实例化**。既有先例：`click_preview` /
+        `change_fraction_since` / `read_text_from_image` / `sync_at_spi_bus`。
+
+        ⚠️ 返回 `None` 的语义必须钉死为「**本平台没有这条通道**」，**不是**「这一次
+        抓失败了」。抓失败要**抛错**（见 `screenshot_window` 的实现）——
+        把失败报成 None 会让调用方静默退回裁屏，而那可能把用户其它窗口一起截进来。
+        Linux 不需要它：整块沙箱屏就是工作台（见 `DEFAULT_CAPTURE_SCOPE`）。
+        """
+        return None
+
+    def screenshot_window(
+        self, window_id: str, max_side: int | None = None,
+        fmt: str = "jpeg", quality: int = 85,
+    ) -> tuple[bytes, dict[str, Any]] | None:
+        """
+        按窗口渲染并编码（`capture_window` 的编码版）。本平台不支持时返回 `None`。
+
+        两条实现路径（**不要在子类里各写一份**）：抓图交给 `capture_window`，
+        编码统一走平台中立的 `backend/screen.py::encode_image`——否则两个平台的
+        meta 形状迟早漂移，而 meta 里的 `origin`/`scale` 正是模型换算屏幕坐标的
+        唯一依据（缺一个模型就只能猜）。
+
+        抓不到（窗口最小化、DirectX 直绘全黑…）时**抛 `ComputerUseError`**，
+        绝不返回一张黑图：让模型以为"界面就是这样"是本项目最不能容忍的失败形态。
+        """
+        got = self.capture_window(window_id)
+        if got is None:
+            return None                      # 本平台没有按窗口渲染这条通道
+        img, origin = got
+        from .screen import encode_image     # 函数内 import：避免与 screen → base 成环
+
+        data, meta = encode_image(img, origin, region=None,
+                                  max_side=max_side, fmt=fmt, quality=quality)
+        # ★ `capture` 字段让模型分辨自己拿到的是哪一种图：「按窗口渲染」能看见**被遮挡**
+        #   的内容，而「裁屏」看到的是**遮挡者**。同一处像素，两者解释完全不同。
+        meta["capture"] = "print_window"
+        meta["window_id"] = window_id
+        return data, meta
+
+    def window_rect_of(self, window_id: str) -> Rect | None:
+        """
+        **任意窗口**（不只是活动窗口）的屏幕绝对矩形；取不到返回 `None`。
+
+        与 `active_window_rect()` 的分工：后者回答「现在谁在前台」，本方法回答
+        「**这一扇**在哪」—— 按窗口截图、按窗口感知、以及"把窗口请到屏幕外再截"
+        这类操作都需要后者。Windows 上还多一层必要：**隐藏桌面上的应用永远不是
+        「活动窗口」**，只有按 id 找才找得到。
+
+        Linux 侧返回 `None`：那边用 `active_window_rect()` 就够了（沙箱屏上只有
+        我们的应用），而"按 id 找窗"要经 xdotool/wmctrl，属后续轮次。
+        """
+        return None
+
+    def active_window_id(self) -> str | None:
+        """
+        当前活动窗口的 **id**（与 `list_windows` / `window_id` 同一套），取不到返回 None。
+
+        为什么要它而不是直接 `active_window_rect()`：矩形只够"裁一块屏幕"，
+        而**按窗口渲染**必须拿到那扇窗的句柄 —— 被遮挡时只有后者能截对内容。
+        Windows 上 `_capture_target` 的兜底分支靠它把"前台窗口"变成可渲染的目标。
+        """
+        return None
+
+    def window_for_app(self, app: str) -> str | None:
+        """
+        应用名（关键词）→ 它的一个顶层窗口 id；找不到返回 `None`。
+
+        与 `list_windows()` 的分工：后者是「把桌面上的窗口列给模型看」，本方法是
+        「**照名字取一扇窗来用**」。两者口径必须一致（同一个 `id` 体系，
+        否则模型从 `list_windows` 抄来的 id 在这里用不了）。
+
+        默认返回 `None` 表示本平台没有按应用名定位窗口的能力 —— 调用方据此
+        **如实报错**（"找不到该应用的窗口"），而不是悄悄换了另一扇窗。
+        """
+        return None
+
     @abstractmethod
     def is_available(self) -> bool:
         """当前平台/会话是否可用（AT-SPI 能加载、无障碍开关已开等）。"""

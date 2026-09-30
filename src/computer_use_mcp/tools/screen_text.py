@@ -19,8 +19,10 @@ def register(mcp: Any, coord: Coordinator) -> None:
             "它比 screenshot 省得多：你读文字就能定位，不需要看图、也不需要从图像里估算像素"
             "位置再换算回屏幕坐标（那正是灰区操作慢和点偏的主因）。拿到结果后可直接 "
             "click(x=..,y=..)，或 click(ref=N) 由服务端代点（避免抄错坐标）。"
-            "scope='window'（默认）只识别当前活动窗口那块区域，2~3 秒；scope='screen' 整屏，"
-            "文字密集时要 8~10 秒，非必要别用。也可传 region=[x,y,w,h] 自己指定区域。"
+            "scope='window'（默认）只识别**本次操作的窗口**（Windows 上直接对那扇窗自己"
+            "渲染的图做识别，**目标被别的窗口挡住也读得对**），2~3 秒；scope='screen' 整屏，"
+            "文字密集时要 8~10 秒，非必要别用。也可传 region=[x,y,w,h] 自己指定区域，"
+            "或用 app=\"计算器\" / window_id=\"0x1a2b3c\" 指定要看哪个软件。"
             "注意：坐标是**快照**，界面变化（切窗/弹新对话框）后请重新调用，不要复用旧 ref。"
             "⚠️ 已知限制：**文字紧邻深色图标时那一行会识别失败**（实测「确认删除该文件吗？」"
             "挨着问号图标时被认成乱码）。若发现某行文字明显不对，把 region 收窄到只含该文字"
@@ -35,6 +37,8 @@ def register(mcp: Any, coord: Coordinator) -> None:
         scope: Literal["window", "screen"] = "window",
         min_conf: float = 40.0,
         max_items: int = 150,
+        window_id: str | None = None,
+        app: str | None = None,
     ) -> str:
         try:
             if region is not None and len(region) != 4:
@@ -46,7 +50,8 @@ def register(mcp: Any, coord: Coordinator) -> None:
                 )
             reg = tuple(region) if region else None
             return coord.get_screen_text(region=reg, scope=scope,
-                                         min_conf=min_conf, max_items=max_items)
+                                         min_conf=min_conf, max_items=max_items,
+                                         window_id=window_id, app=app)
         except ComputerUseError as exc:
             return f"❌ 读取屏幕文本失败：{exc}"
         except Exception as exc:  # noqa: BLE001

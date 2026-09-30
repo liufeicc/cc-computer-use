@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from ..core.coordinator import Coordinator
 from ..utils.errors import ComputerUseError, to_friendly_text, to_tool_error
@@ -29,6 +29,10 @@ def register(mcp: Any, coord: Coordinator) -> None:
         description=(
             "截图（灰区兜底，**默认不要主动用**）。仅当目标无元素树（自绘控件/游戏/视频/远程桌面）"
             "或 get_ui_tree/find_element 无法定位时才使用——它费 token。"
+            "**默认只截当前操作的窗口**（scope=\"auto\"）：Linux 上是整块沙箱屏，"
+            "Windows 上是目标窗口——这样**只拿到那一个软件的界面**，"
+            "既不会把你桌面上的其它窗口送进上下文，也不受目标被遮挡影响。"
+            "要整屏请显式传 scope=\"screen\"；要指定某个软件传 app=\"记事本\" 或 window_id=\"0x1a2b3c\"。"
             "可传 region=[x,y,w,h] 裁剪感兴趣区域；max_side 控制降采样长边（默认1280，省 token）。"
             "inline=false 时不返回图像、只落盘并返回文件路径（更省 token/更快），适合只需存档或"
             "后续自行读取的场景。此时可用 save_path 指定落盘位置——**已存在的文件不会被覆盖**"
@@ -42,6 +46,9 @@ def register(mcp: Any, coord: Coordinator) -> None:
         max_side: int = 1280,
         inline: bool = True,
         save_path: str | None = None,
+        scope: Literal["auto", "window", "screen"] = "auto",
+        window_id: str | None = None,
+        app: str | None = None,
     ) -> Any:
         try:
             if region is not None and len(region) != 4:
@@ -52,10 +59,13 @@ def register(mcp: Any, coord: Coordinator) -> None:
                 )
             reg = tuple(region) if region else None
             if not inline:
-                path, meta = coord.screenshot_to_file(reg, max_side=max_side, path=save_path)
+                path, meta = coord.screenshot_to_file(reg, max_side=max_side,
+                                                      path=save_path, scope=scope,
+                                                      window_id=window_id, app=app)
                 return f"截图已落盘(未内联): path={path} meta={meta}"
             if MCPImage is not None:
-                data, meta = coord.screenshot_image(reg, max_side=max_side)
+                data, meta = coord.screenshot_image(reg, max_side=max_side, scope=scope,
+                                                    window_id=window_id, app=app)
                 log.info("screenshot 生成: %s", meta)
                 # 格式跟随 backend 实际输出（默认 jpeg：实测编码比 PNG 快 19 倍、小 9 倍）
                 img = MCPImage(data=data, format=meta.get("format", "jpeg"))
@@ -66,7 +76,8 @@ def register(mcp: Any, coord: Coordinator) -> None:
                             "（屏幕绝对坐标 = origin + 图上坐标 × scale；"
                             "origin 是图像左上角对应的屏幕坐标，全屏时未必是 (0,0)）"]
             # 退化路径：返回 base64 + meta 文本
-            b64, meta = coord.screenshot_b64(reg, max_side=max_side)
+            b64, meta = coord.screenshot_b64(reg, max_side=max_side, scope=scope,
+                                             window_id=window_id, app=app)
             return f"截图(base64) meta={meta}\n{b64}"
         except ComputerUseError as exc:
             return f"❌ 截图失败：{exc}"

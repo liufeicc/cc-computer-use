@@ -26,8 +26,8 @@ PY=$HOME/anaconda3/envs/cc-computer-use/bin/python
 #    现已改走 X11 才真正安全——**改动时务必不要把 AT-SPI 应用枚举加回 selftest**。
 PYTHONNOUSERSITE=1 "$PY" -m computer_use_mcp.server --selftest
 
-# 全量测试（共 486 项；单测无需桌面，端到端需 X11 + zenity + Xephyr，不满足自动 skip）
-# ✅ 两条路径都全绿：默认 477 passed / 9 skipped；下面带 e2e 开关的 483 passed / 3 skipped
+# 全量测试（共 504 项；单测无需桌面，端到端需 X11 + zenity + Xephyr，不满足自动 skip）
+# ✅ 两条路径都全绿：默认 495 passed / 9 skipped；下面带 e2e 开关的 501 passed / 3 skipped
 PYTHONNOUSERSITE=1 "$PY" -m pytest -q
 
 # e2e 需显式 opt-in（默认在沙箱内跑、不碰真实桌面）
@@ -335,11 +335,33 @@ docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/d -v /tmp/o:/o ubuntu:22.04 \
 `%LOCALAPPDATA%\Programs\cc-computer-use`，装完自动注册进 Claude Code。
 与 Linux 那套是**两条独立链路**（PyInstaller 不能交叉编译，必须在 Windows 上构建）。
 
+### 截图范围：Windows 默认**按窗口**，不给范围也**绝不抓全屏**
+
+`Backend.DEFAULT_CAPTURE_SCOPE`：Linux = `"screen"`（整块 Xephyr 屏就是工作台），
+Windows = `"window"`。两条理由缺一不可：用户桌面上同时开着浏览器/聊天工具/IDE
+（抓全屏会把它们一起送进模型上下文），而且目标被别的窗口盖住时**裁屏会截到遮挡者**。
+
+- **按窗口渲染** = `PrintWindow(hwnd, PW_RENDERFULLCONTENT)`（`driver/capture.py`）：
+  窗口给自己画像，**不受遮挡影响、不需要前台**。真机实测非黑 0.94~1.00。
+- 「目标窗口」不是「活动窗口」，按 `window_id` > `app` > **本会话最近操作过的窗口**
+  > 活动窗口 四档推导（`CoordinatorBase._capture_target`）。
+  ⚠️ **最后一档必须在返回里挑明**：agent 不抢前台之后，「活动窗口」恒等于
+  **用户正在用的那扇窗** —— 静默用它就是把用户的浏览器画面读进模型上下文，
+  而模型只会以为"这就是当前界面"。守它是 `tests/test_capture_scope.py`。
+- ⚠️ **最小化的窗口必须在动手画之前判掉**（查 `IsIconic`）：实测它 `PrintWindow`
+  **不失败也不给黑图**，而是画一张 **237x39 的标题栏细条**（非黑占比 1.0，像素哨兵
+  拦不住）。模型会把那张细条当成窗口的全部内容。
+  「全黑 = 抓不到」的哨兵仍在（阈值 `_BLACK_FRACTION_FAIL = 0.999`，**几乎全黑**），
+  但**深色主题必须判通过** —— 纯"不够亮"的判据会把它们全冤枉掉。
+- **抓不到就抛错**，绝不返回黑图；退化为裁屏时 meta 里必须带
+  `capture="region_crop"` 与"可能被遮挡"的说明。`capture` 字段是模型分辨
+  「按窗口渲染」与「裁屏」的唯一依据。
+
 ```bash
 CC_CU_VM_PASS='<密码>' bash packaging/windows/build-windows.sh    # 宿主驱动客体构建
 CC_CU_VM_PASS='<密码>' bash packaging/windows/verify-install.sh   # 装→自检→查注册→卸载
 PYTHONNOUSERSITE=1 "$PY" -m pytest tests/test_packaging_windows.py -q   # 44 条结构性守卫
-PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 35 条反证
+PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 42 条反证
 ```
 
 **验收状态（2026-09-29）：从干净前置状态跑完 15 项全过、`RESULT|ok`** —— 装完
@@ -399,10 +421,10 @@ PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 35 条�
 
 | 文件 | 类别 | 说明 |
 |------|------|------|
-| `test_geometry.py`（9） / `test_refs.py`（8） / `test_serializer.py`（13） / `test_spawn_env.py`（2） / `test_i7_i8_i10.py`（11） / `test_atspi_guards.py`（24） / `test_d_guards.py`（15） / `test_e_guards.py`（22） / `test_f_guards.py`（14） / `test_g_guards.py`（21） / `test_h_guards.py`（8） / **`test_coordinator_hooks.py`（15）** / **`test_inject_layer.py`（21）** / **`test_coordinator_seq.py`（27）** / **`test_landing_evidence.py`（7）** / **`test_ocr_and_text.py`（12）** / **`test_display_lifecycle.py`（20）** / **`test_refs_and_values.py`（8）** / **`test_tools_and_backend.py`（24）** / **`test_ring_and_preview.py`（39）** / **`test_packaging.py`（23）** / `test_screen_layer.py`（14） / `test_session_contract.py`（12） / `test_platform_module_boundary.py`（9） / `test_static_health.py`（5） / `test_windows_driver_guards.py`（32） / `test_windows_nodes_mapping.py`（20） / `test_packaging_windows.py`（44） | pytest 单测 | 不需要桌面，`conftest.py` 会强制 `CC_CU_DISPLAY_MODE=real` 以免弹 Xephyr。`test_spawn_env.py` 是**结构性防漏**：枚举 `src/` 下每一处 subprocess spawn 点，要求 `env=` 源自 `env_for`/`app_env`；`test_i7_i8_i10.py` 是 review 报告那三条的回归集。**加粗的 8 个**由原 `test_optimizations.py`（2238 行）在 2026-09-18 按被测模块拆分而来，跨文件共享的辅助（`_StubBackend` / `_proc` / `_reset_display`）在 `_helpers.py`。**`test_ring_and_preview.py` 守住点击反馈的四条硬契约**：准星必须用「裁剪后原点」反算（屏边裁剪会改原点，写死半宽 = 越靠边指得越离谱）、准星只画在副本上（原始图要复用给 OCR 与点前后对比）、bytes 绝不进 `ActionResult.data`、`click` 工具返回注解必须是 `Any`（`str` 会让 mcp 生成 outputSchema，带图那次返回列表就 ValidationError）。**`conftest.py` 里那个 autouse 夹具 `isolate_at_spi_bus_env` 不能改成依赖 monkeypatch**：`AtspiReader` 会直接写**进程级** `os.environ`（libatspi 只能从那儿读），而 monkeypatch 的 `delenv` 对「本就不存在的键」**不入账**，记下的反而是用例自己写进去的假地址；autouse 夹具**最先实例化**、收尾回调**最后**执行，才排得进 monkeypatch 的 undo 之后 |
+| `test_geometry.py`（9） / `test_refs.py`（8） / `test_serializer.py`（13） / `test_spawn_env.py`（2） / `test_i7_i8_i10.py`（11） / `test_atspi_guards.py`（24） / `test_d_guards.py`（15） / `test_e_guards.py`（22） / `test_f_guards.py`（14） / `test_g_guards.py`（21） / `test_h_guards.py`（8） / **`test_coordinator_hooks.py`（15）** / **`test_inject_layer.py`（21）** / **`test_coordinator_seq.py`（27）** / **`test_landing_evidence.py`（7）** / **`test_ocr_and_text.py`（12）** / **`test_display_lifecycle.py`（20）** / **`test_refs_and_values.py`（8）** / **`test_tools_and_backend.py`（24）** / **`test_ring_and_preview.py`（39）** / **`test_packaging.py`（23）** / `test_screen_layer.py`（14） / `test_session_contract.py`（12） / `test_platform_module_boundary.py`（9） / `test_static_health.py`（5） / `test_windows_driver_guards.py`（32） / `test_windows_nodes_mapping.py`（20） / `test_packaging_windows.py`（44） / `test_capture_scope.py`（13） | pytest 单测 | 不需要桌面，`conftest.py` 会强制 `CC_CU_DISPLAY_MODE=real` 以免弹 Xephyr。`test_spawn_env.py` 是**结构性防漏**：枚举 `src/` 下每一处 subprocess spawn 点，要求 `env=` 源自 `env_for`/`app_env`；`test_i7_i8_i10.py` 是 review 报告那三条的回归集。**加粗的 8 个**由原 `test_optimizations.py`（2238 行）在 2026-09-18 按被测模块拆分而来，跨文件共享的辅助（`_StubBackend` / `_proc` / `_reset_display`）在 `_helpers.py`。**`test_ring_and_preview.py` 守住点击反馈的四条硬契约**：准星必须用「裁剪后原点」反算（屏边裁剪会改原点，写死半宽 = 越靠边指得越离谱）、准星只画在副本上（原始图要复用给 OCR 与点前后对比）、bytes 绝不进 `ActionResult.data`、`click` 工具返回注解必须是 `Any`（`str` 会让 mcp 生成 outputSchema，带图那次返回列表就 ValidationError）。**`conftest.py` 里那个 autouse 夹具 `isolate_at_spi_bus_env` 不能改成依赖 monkeypatch**：`AtspiReader` 会直接写**进程级** `os.environ`（libatspi 只能从那儿读），而 monkeypatch 的 `delenv` 对「本就不存在的键」**不入账**，记下的反而是用例自己写进去的假地址；autouse 夹具**最先实例化**、收尾回调**最后**执行，才排得进 monkeypatch 的 undo 之后 |
 | `test_env_isolation.py`（1） | pytest 单测（**起子进程**） | 守「测试之间不留下进程级副作用」：自己起一个 pytest 子进程、挂探针插件在 `pytest_sessionfinish` 打印 `AT_SPI_BUS_ADDRESS` 的真实取值，断言为 `None`。**为什么必须起子进程**：判据是「跑完之后环境是否干净」，而那只在**那个会话收尾时**才观测得到——在会话内断言，观测到的是本会话自己的状态，何况 `conftest.py` 的守卫夹具已把本会话擦干净了（等于在测那把本来就该生效的扫帚） |
 | `test_e2e_zenity.py`（6） | pytest 端到端 | 需 X11 + zenity + Xephyr，需 `CC_CU_E2E=1` opt-in，默认在沙箱内跑。**「等应用上树」一律用 `_wait_app_on_tree()` 轮询，别改回固定 `sleep`**：实测沙箱内 zenity 上树耗时 1.60~2.54 秒，**正好跨过**历史上的 2.5 秒魔数，于是同一份代码会在「全绿」与「全红」之间随机翻转（实现在 2026-09-17 的 I-17 修的）。**收尾同理，用 `_wait_window_gone(title)` 轮询等窗口真的从 X 上消失，不要 `terminate()` 完就走人**：SIGTERM 只是请求进程退出，X 端窗口要等客户端断开才被回收——下一个用例开头读到的「活动窗口」于是还是上一个用例**正在死**的对话框，而它会在随后几秒里消失。实测就是这样把 `test_ring_visible_has_hole_and_autoclears` 的「画圈不改变活动窗口」打成偶发红（`assert 'E2EPreview' == None`，3 轮里红 2 轮）；根因不在光圈，在收尾提前离场 |
-| `manual_*.py`（10 个） | **手动 story**（不进 pytest） | 用 MCP stdio 客户端驱动**真实 server/冻结产物**，跑完整任务链路，退出码 0 = 全过 |
+| `manual_*.py`（13 个） | **手动 story**（不进 pytest） | 用 MCP stdio 客户端驱动**真实 server/冻结产物**，跑完整任务链路，退出码 0 = 全过 |
 
 手动 story 清单（改相关模块后应各跑一遍）：
 - `manual_sandbox_story.py` —— 沙箱隔离：launch_app 起 zenity → 读树 → 元素级点「是」，并断言**宿主活动窗口/指针前后不变**。⚠️ 运行期间**不要动鼠标键盘**（宿主指针零移动是断言前提）；real 模式下脚本直接拒绝运行。加 `CC_CU_STORY_DIST=1` 改为驱动冻结产物。
@@ -414,6 +436,15 @@ PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 35 条�
 - `manual_shell_story.py` —— 「沙箱里操作 shell」两条：① `launch_app("gnome-terminal")` 必须落沙箱（断言**宿主 wmctrl 里终端窗口数不增加** + 返回 argv 里有 `--disable-factory`）；② 长文本经剪贴板路径必须**真的被 shell 执行**（OCR 找得到执行结果，而不是信 `type_text` 的"成功"）；③ 反向：zenity 输入框仍走 `ctrl+v`（用全选+复制从剪贴板逐字节核对——输入框内容 OCR 读不可靠）。**需先 `bash build.sh`**（打的是冻结产物）；两条 bug 都只在真机上暴露，单测 stub 掉的方法照样绿。
 - `manual_windows_backend_story.py`（51 条判据）—— Windows 驱动层（UIA 读树 + 节点映射 + 输入注入）真机跑一遍，**跑在客体上**，需交互式会话。
 - `manual_windows_mcp_story.py`（29 条判据）—— 真 MCP server（stdio）驱动 Windows 桌面。加 `CC_CU_STORY_DIST=1` 改为驱动**冻结产物**（`CC_CU_WIN_MCP_BIN` 可指定路径）——源码上全过推不出冻结产物上也能过，两条路必须各跑一遍。
+- `manual_windows_capture_story.py`（17 条判据）—— **按窗口截图**真机 story：起两扇记事本，
+  一扇盖住另一扇，断言拿到的图**尺寸等于目标窗口**（不是整屏）、**含目标写的字**、
+  **不含遮挡窗写的字**；最小化时如实报错且不返回图；全程指针与前台不变。
+- `manual_windows_hidden_desktop_probe.py`（18 条判据）—— **隐藏桌面能不能当 Windows 的虚拟屏**：
+  从**用户桌面**这一侧发起，跨桌面枚举窗口 / UIA 挂树 / 元素级 Invoke / SetValue /
+  定向键盘 / PrintWindow，并断言用户桌面前台、指针、窗口集合全程不变。
+- `manual_windows_directed_probe.py`（32 条判据）—— **定向注入**：UIA 元素级、定向键盘、
+  定向鼠标（四种技法）、PrintWindow 黑图率。结论：元素级与定向键盘不打扰且可用；
+  **定向鼠标全失效**（对话框与主窗口上分别测过）。
 - `manual_windows_guards_reverse.py` —— 给 `packaging/windows/` 的守卫做**反证**（把坏东西种进源码，断言守卫真的变红；宿主即可跑）。理由见「Windows 分发」一节的守卫计数与 [`packaging/windows/README.md`](packaging/windows/README.md)：**"守卫坏了"与"代码没问题"在结果上长得一模一样**。
 
 端到端测试用 `pkill -9 -x zenity`（**精确匹配进程名**），不能用 `-f`：`-f` 匹配完整命令行，会命中 `pytest tests/test_e2e_zenity.py` 自身把测试进程杀掉（表现为 exit 1 且无输出）。
