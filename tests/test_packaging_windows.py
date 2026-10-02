@@ -131,6 +131,76 @@ def test_guest_scripts_are_utf8_with_bom(path):
     raw.decode("utf-8")
 
 
+def _batch_files() -> list[tuple[str, ...]]:
+    """**客体上会被 cmd.exe 执行**的批处理清单：`packaging/` 的 .cmd + `tests/` 的 .bat。
+
+    ⚠️ `tests/*.bat` 必须一起收进来（2026-09-30 补）：它们是**驱动 story 的唯一入口**
+    （经计划任务 `/IT` 在客体上跑），走的正是 cmd.exe —— 与 `packaging/` 的 .cmd 同一类。
+    本规则原先只写在上面那段注释里、没有任何测试盯着，而本仓库当时已经有 **6 个**
+    `tests/*.bat` 在裸奔：谁哪天在里面写一行中文注释，就会得到"cmd 执行了一堆乱码"，
+    而**报错完全指不到原因**。
+    """
+    out: list[tuple[str, ...]] = []
+    win = os.path.join(REPO, *_WIN)
+    if os.path.isdir(win):
+        for name in sorted(os.listdir(win)):
+            if name.endswith(".cmd"):
+                out.append(_WIN + (name,))
+    # ⚠️ 目录不存在时**跳过而不是抛**：反证脚本会把一份只有 `packaging/` 的副本挂在
+    #    `REPO` 上（它只拷那一棵树），这里抛异常会让那几条反证以 `FileNotFoundError`
+    #    收场 —— 而那个错**看起来和"被拦下"一样**，正是本仓库反复吃过的假通过。
+    #    真正防"布局漂移"的是下面那个数量正控，不是这里的抛错。
+    tests_dir = os.path.join(REPO, "tests")
+    if os.path.isdir(tests_dir):
+        for name in sorted(os.listdir(tests_dir)):
+            if name.endswith(".bat"):
+                out.append(("tests", name))
+    return out
+
+
+def test_guest_batch_files_are_pure_ascii():
+    """
+    ★ 客体上跑的 `.bat` / `.cmd` 必须**纯 ASCII**。
+
+    ═══ 为什么（这是"信息丢失"而不是洁癖）═══
+
+    cmd.exe 读批处理用的是**系统 ANSI 代码页**（中文机 = GBK），既不吃 BOM 也不吃 UTF-8。
+    一份带中文的 `.bat` 在中文 Windows 上**可能**恰好能跑（GBK 存的中文读回来还是 GBK），
+    但只要文件是 UTF-8 存的（本仓库的默认！），cmd 就会把它按 GBK 解 ——
+    后果是 `REM` 注释里的某个 UTF-8 字节序列翻译出一个**能吞掉后面那个 ASCII 字符**的
+    字节，于是下一行命令被拼坏，cmd 去执行一段谁也不认识的东西。
+
+    ⚠️ 措辞刻意是"**可以**恰好能跑"：这条的性质与上面那条 BOM 规则一样，
+    是**在目标机上才暴露、在开发机上时灵时不灵**的那一类 —— 所以不能靠"我这儿跑得好好的"来判。
+
+    处置法则很简单：`.bat`/`.cmd` 里**一律只写 ASCII**，中文说明放进同名 `.py` 的
+    docstring（那才是给人读的地方，且没有编码陷阱）。
+
+    正控：清单必须**真的收到了东西**，否则「全部通过」只是"扫了个空"。
+    """
+    files = _batch_files()
+    assert len(files) >= 7, (
+        f"只找到 {len(files)} 个批处理 —— `tests/*.bat` 或 `packaging/windows/*.cmd` "
+        f"的位置变了，本规则正在空转：{files}"
+    )
+
+    offenders: list[str] = []
+    for parts in files:
+        raw = _read_bytes(*parts)
+        try:
+            raw.decode("ascii")
+        except UnicodeDecodeError as exc:
+            # 定位到第几行、哪个字节 —— 报错要能直接拿去改，而不是让人从头翻文件
+            line = raw[:exc.start].count(b"\n") + 1
+            offenders.append(f"{'/'.join(parts)}（第 {line} 行有非 ASCII 字节）")
+
+    assert not offenders, (
+        "这些批处理里有非 ASCII 字节 —— cmd.exe 会按系统 ANSI 代码页解它，"
+        "后果是**命令行被拼坏、执行一堆乱码**，而报错完全指不到原因；"
+        "中文说明请移进同名 .py 的 docstring：\n  " + "\n  ".join(offenders)
+    )
+
+
 @pytest.mark.parametrize("path", sorted(
     p for p in _NEEDS_BOM if p[-1].endswith(".ps1")
 ), ids=lambda p: p[-1])

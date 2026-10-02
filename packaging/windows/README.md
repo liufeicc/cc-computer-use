@@ -171,8 +171,8 @@ UIA 初始化）实测会超过 30 秒。
 ## 守卫与反证
 
 ```bash
-PYTHONNOUSERSITE=1 $PY -m pytest tests/test_packaging_windows.py -q   # 44 条结构性守卫
-PYTHONNOUSERSITE=1 $PY tests/manual_windows_guards_reverse.py         # 57 条反证
+PYTHONNOUSERSITE=1 $PY -m pytest tests/test_packaging_windows.py -q   # 45 条结构性守卫
+PYTHONNOUSERSITE=1 $PY tests/manual_windows_guards_reverse.py         # 58 条反证
 ```
 
 反证那步不是可选的：这些守卫的判据都是「没有坏东西」，而"守卫坏了"与"代码没问题"
@@ -180,7 +180,7 @@ PYTHONNOUSERSITE=1 $PY tests/manual_windows_guards_reverse.py         # 57 条�
 反证脚本本身也会过期（生产代码一改，「替换目标串」就对不上了），所以它**对不上时硬失败**，
 而不是静默跳过。
 
-⚠️ 反证现在有**三种手法**（57 条 = packaging 源码替换 35 + **`src/` 源码替换 4** +
+⚠️ 反证现在有**三种手法**（58 条 = packaging 源码替换 36 + **`src/` 源码替换 4** +
 运行期破坏 18）。中间那 4 条是 2026-09-30 为「默认不碰用户键鼠」那批**顺序判据**新加的：
 那批判据读的是 `src/` 下的生产代码（"闸门必须早于注入原语"），而原来的替换机制只拷
 `packaging/`，够不着。挂载点是 `test_global_input_gate.GG._TEST_SRC` —— 那几条判据

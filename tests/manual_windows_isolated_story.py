@@ -27,18 +27,31 @@
 
 · **isolated 模式**：**全过**（`EXITCODE=0`）——
   应用起在隔离桌面上、用户桌面窗口数不变、指针与前台不动、
-  读树 / 按窗口截图 / 元素级 Invoke 全部可用。
+  读树 / 按窗口截图 / 元素级 Invoke 全部可用；4c/4d/4e 三节（默认不碰用户键鼠）也全过。
 · **real 模式**（反向正控，`run_isolated_story_real.bat`）：
   曾在一次干净的客体状态下 **12/12 全过**（应用确实出现在用户桌面上）。
   之后重跑多轮**偶发卡住**（卡点每次不同：启动、读树都遇到过），
   与产品代码无关 —— 同一客体上三条启动路径会一起卡 20s+ 又突然都 <0.2s，
   是环境现象。**这条反向正控的结论按"验过一次"采信，不按"每轮都过"**。
 
-⚠️⚠️ **第 4) 节的"读树"在本客体上偶发卡死**（2026-09-30 实测：连着 5 轮里卡了 3 轮，
-卡在 `get_ui_tree(scope='active_window')` 那一行、一卡十分钟以上）。
-**这不是本轮改动引入的 —— 做过 A/B**：`git stash push -- src` 回到改动前的代码，
-同一个客体上**照样卡在同一行**。判据与结论因此按"验过一次"采信；
-但**看到卡在这里时不要先去查代码**（那会白耗一整轮，正如"启动偶发卡"那条）。
+═══ ⚠️ 本客体偶发卡死：已查明**不是我们的代码**，别再从头查一遍 ═══
+
+`get_ui_tree` 那一步在本客体上偶发卡死，**一卡十分钟以上**。查过两步：
+
+1. **定位到具体调用**（`faulthandler` 抓栈）：卡在 `uiautomation` 的**惰性单例初始化**
+   —— `uiautomation.instance()` → `comtypes` → `CoCreateInstance(CUIAutomation)`，
+   `ControlFromHandle` 里那**第一次**碰 UIA 的地方。
+2. **判定是环境**（`manual_windows_uia_init_probe.py` 的 A/B 对照，各起一个全新进程）：
+   同一台客体、同一时间，**story 那条完全相同的调用序列**
+   （建隐藏桌面 → 在上面起 winver → 首次 `ControlFromHandle`）**只要 1.32 秒**。
+
+旁证在**同一轮 story 里**就有：`taskkill` 卡过 90s 以上、早期版本 `CreateProcessW` 卡过
+20s 以上 —— 同一台机器在探针里做同样的事只要 0.2s。**这是客体当时的状态，不是代码。**
+
+⚠️ 所以**再遇到卡住时不要先去翻代码**（那正是本轮白耗掉的那一整轮）。本故事现在带
+**看门狗**：150s 没有新输出就打印全部线程栈、写一条 FAIL、并带退出码 5 结束 ——
+也就是说，卡住这件事会**自己说出卡在哪一次调用**，宿主也拿得到明确结论而不是等满 900s。
+先看那条栈：**卡点仍在我们自己的行上**才需要往下查。
 
 ⚠️ 目标应用刻意用 **winver**（纯 Win32），不用 Win11 的记事本 ——
 后者是 Store 应用别名，实测在本客体上偶发卡在激活环节。
@@ -50,6 +63,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
 import pathlib
@@ -69,13 +83,34 @@ if _REPO is not None:
 _SPAWN_TIMEOUT = 25.0
 _RESULTS: dict[str, dict] = {}
 
+# 卡死多久之后打印全部线程栈（见 main() 里的 `faulthandler.dump_traceback_later`）。
+# 取 90s：正常一步是毫秒级，而"慢但正常"的那几档（首次挂 UIA 树 4.3s、Edge 冷读 2.4s）
+# 都远在它之下 —— 到点还没动，基本就是真卡住了。
+_HANG_DUMP_S = 90.0
+
+# 卡死多久之后**带着失败退出**（见 `_start_watchdog`）。
+# ⚠️ 必须大于故事里所有合法的长等待，否则会把"正常但慢"误判成卡死：
+#    最长的是 4b 那三个 20s 的启动对照与各处 `wait_for(..., 30.0)` —— 150s 有 5 倍余量。
+_HANG_ABORT_S = 150.0
+
 # 进度直写文件、每行 flush。**不能只靠 print**：上一轮真机跑的时候脚本卡在某一步，
 # 而日志停在节标题上、一个字都没有 —— 分不清是卡在启动应用、还是窗口枚举。
 # 诊断"没有任何输出就卡住"的问题，必须有一条不经过任何缓冲的通道。
 _TRACE: pathlib.Path | None = None
 
+# ★ 心跳：看门狗据此判断"还在推进"还是"卡住了"（见 `_start_watchdog`）。
+#   任何一条输出（trace / ok / note）都算一次心跳 —— 判据是"**有没有新信息**"，
+#   而不是"进程死没死"，因为后者在卡住时同样是"活着"。
+_HEART: dict[str, float] = {"at": 0.0, "what": "启动"}
+
+
+def _beat(what: str) -> None:
+    _HEART["at"] = time.monotonic()
+    _HEART["what"] = what
+
 
 def trace(msg: str) -> None:
+    _beat(f"trace: {msg}")
     print(f"     [trace] {msg}", flush=True)
     if _TRACE is not None:
         try:
@@ -87,6 +122,7 @@ def trace(msg: str) -> None:
 
 
 def ok(label: str, cond: bool, detail: str = "") -> bool:
+    _beat(f"ok: {label}")
     _RESULTS[label] = {"ok": bool(cond), "detail": detail}
     print(f"  {'OK  ' if cond else 'FAIL'} | {label}" + (f" | {detail}" if detail else ""),
           flush=True)
@@ -94,7 +130,61 @@ def ok(label: str, cond: bool, detail: str = "") -> bool:
 
 
 def note(label: str, detail: str = "") -> None:
+    _beat(f"note: {label}")
     print(f"  ·  {label}" + (f": {detail}" if detail else ""), flush=True)
+
+
+def _start_watchdog(limit: float) -> None:
+    """
+    ★ 卡死看门狗：超过 `limit` 秒没有新输出，就**打印全部线程栈并退出**。
+
+    ═══ 为什么必须有它 ═══
+
+    2026-09-30 实测：本故事会**偶发卡死**，一卡十分钟以上。而没有看门狗时，这一轮的代价是
+    「宿主白等满 900s 超时 + 日志停在半截、一个字的原因都没有」—— 排查一次要花一整晚，
+    而且**卡点每次都不同**（启动过、读树过），光看"停在哪一行"根本推不出结论。
+
+    有了它，同样的卡死会变成：**3 分钟后一条 FAIL + 一份完整的线程栈**，
+    直接指出卡在哪一次调用（实测定到 `uiautomation` 的惰性单例
+    `CoCreateInstance(CUIAutomation)`）。省下的不是几秒钟，是一整轮排查。
+
+    ⚠️ `limit` 必须**大于所有合法的长等待**，否则它会把"正常但慢"误判成卡死：
+    本故事里最长的是 4b 那三个 20s 的启动对照，以及各处 `wait_for(..., 30.0)`。
+    取 150s 给了 5 倍余量。
+
+    ⚠️ 退出用 `os._exit` 而不是 `sys.exit`：卡住的线程可能正持着 GIL，
+    正常退出路径（atexit / 线程 join）会**卡在退出本身**，让看门狗的初衷落空。
+    `os._exit` 是立刻终结进程 —— 日志已经写进文件了，不需要优雅退出。
+
+    ⚠️ 栈打印走 `faulthandler`，它**直接写 fd、不经过任何缓冲**：
+    哪怕随后进程被强杀，这几行也已经落盘（这正是能拿到证据的原因）。
+    """
+    def _loop() -> None:
+        while True:
+            time.sleep(5.0)
+            idle = time.monotonic() - _HEART["at"]
+            if idle < limit:
+                continue
+            msg = (f"\n{'!' * 70}\n"
+                   f"[watchdog] 卡死：已 {idle:.0f}s 没有任何新输出"
+                   f"（上一条：{_HEART['what']}）。下面是全部线程栈。\n"
+                   f"{'!' * 70}")
+            print(msg, flush=True)
+            if _TRACE is not None:
+                try:
+                    with open(_TRACE, "a", encoding="utf-8") as fh:
+                        fh.write(msg + "\n")
+                        fh.flush()
+                except OSError:
+                    pass
+            faulthandler.dump_traceback()      # 全部线程，直写 fd
+            _RESULTS["看门狗：卡死（见线程栈）"] = {
+                "ok": False, "detail": f"{idle:.0f}s 无输出；上一条={_HEART['what']}"}
+            # ⚠️ 退出码 5 = 有失败项（与 story 自身的约定一致），
+            #    让宿主那侧的 `run_windows_probe.sh` 走"❌ 探针有失败项"分支而不是"超时"。
+            os._exit(5)
+
+    threading.Thread(target=_loop, name="cc-cu-watchdog", daemon=True).start()
 
 
 def wait_for(pred, timeout: float, interval: float = 0.4):  # noqa: ANN001, ANN202
@@ -138,6 +228,17 @@ def main(argv: list[str] | None = None) -> int:
             _TRACE.write_text("", encoding="utf-8")
         except OSError:
             _TRACE = None
+
+    # ★★ 卡死自证两件套（为什么必须有，见 `_start_watchdog` 的 docstring）：
+    #    ① `dump_traceback_later` —— 90s 没推进就打印全部线程栈（**但不杀进程**），
+    #       拿到"卡在哪一次调用"这条事实；
+    #    ② 看门狗 —— 150s 没推进就打印栈并**带着退出码 5 结束**，
+    #       让宿主拿到明确结论而不是白等满 900s。
+    #    ⚠️ 两者都要：① 保证"哪怕进程随后被强杀也留下证据"，② 保证"这一轮不会白等"。
+    faulthandler.dump_traceback_later(_HANG_DUMP_S, repeat=True, exit=False)
+    _beat("武装看门狗")
+    _start_watchdog(_HANG_ABORT_S)
+    trace(f"已武装卡死自证：{_HANG_DUMP_S:.0f}s 打栈 / {_HANG_ABORT_S:.0f}s 带码退出")
 
     print("=== 0) 就绪 ===", flush=True)
     trace("起步")
@@ -422,7 +523,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── 4) 起了之后照样能操作 ──
     print("\n=== 4) 隔离桌面上的应用照样能操作 ===", flush=True)
-    trace("读树（active_window）")
+    # ⚠️ 读树这一步在本客体上**偶发卡死**（实测一卡十分钟以上）。卡住时只知道"卡在
+    #    读树里"是**不够**的 —— 它内部有好几步跨进程 UIA 调用。所以把子步骤也 trace 出来，
+    #    配合 faulthandler 的栈快照，才能指到具体是哪一次调用。
+    trace("读树 1/3：目标窗口 id")
+    _hwnd_hint = backend.active_window_id()
+    trace(f"读树 1/3 返回 {_hwnd_hint!r}")
+    trace("读树 2/3：list_windows")
+    _rows = backend.list_windows(limit=50)
+    trace(f"读树 2/3 返回 {len(_rows)} 行")
+    trace("读树 3/3：get_ui_tree(active_window)")
     tree = coord.get_ui_tree(scope="active_window", max_nodes=200)
     trace(f"读树返回 {len(str(tree))} 字符")
     text = tree if isinstance(tree, str) else str(tree)
@@ -517,6 +627,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── 6) 收尾 ──
     print("\n=== 6) 收尾 ===", flush=True)
+    # 撤掉卡死自证：故事跑完了还让它继续每 90s 打一份栈，只会把日志淹掉。
+    faulthandler.cancel_dump_traceback_later()
     kill("winver.exe")
     desktop.release()
 

@@ -69,6 +69,15 @@ CASES: list[tuple[str, str, str | None, str | None, str, tuple, bool]] = [
         False,
     ),
     (
+        "test_guest_batch_files_are_pure_ascii",
+        "packaging/windows/verify-interactive.cmd",
+        "rem WARNING: THIS FILE MUST STAY PURE ASCII.",
+        "rem 警告：本文件必须纯 ASCII。",
+        "批处理里写进了中文（cmd.exe 按 ANSI 解它，可能吞掉后面的字节甚至换行）",
+        (),
+        False,
+    ),
+    (
         "test_installer_uninstallrun_has_run_once_id",
         "packaging/windows/installer.iss",
         '; RunOnceId: "CcCuUnregister"', '; (no RunOnceId)',
@@ -698,6 +707,14 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as td:
             tmp = pathlib.Path(td)
             shutil.copytree(_REPO / "packaging", tmp / "packaging")
+            # ⚠️ 也要把 `tests/*.bat` 拷进去：`test_guest_batch_files_are_pure_ascii`
+            #    的清单**同时扫 `tests/`**，而本脚本原先只拷 `packaging/`。
+            #    实测踩到：只拷那一棵树时，那条守卫会先撞上它自己的数量正控
+            #    （"只找到 1 个批处理"）—— **红是红了，但红的理由与真实缺陷无关**。
+            #    那正是本脚本存在的理由所要防的假通过，只不过这次假通过发生在**反证自己**身上。
+            (tmp / "tests").mkdir(exist_ok=True)
+            for bat in (_REPO / "tests").glob("*.bat"):
+                shutil.copy2(bat, tmp / "tests" / bat.name)
             target = tmp / relpath
             raw = target.read_bytes()
 
