@@ -34,27 +34,47 @@
   与产品代码无关 —— 同一客体上三条启动路径会一起卡 20s+ 又突然都 <0.2s，
   是环境现象。**这条反向正控的结论按"验过一次"采信，不按"每轮都过"**。
 
-═══ ⚠️ 本客体偶发卡死：已查明**不是我们的代码**，别再从头查一遍 ═══
+═══ ⚠️ 本客体偶发卡死：已定位到**哪一次调用**，但**尚未查明为什么** ═══
 
-`get_ui_tree` 那一步在本客体上偶发卡死，**一卡十分钟以上**。查过两步：
+`get_ui_tree` 那一步在本客体上偶发卡死，**一卡十分钟以上**。2026-10-02 那一轮把它钉到了
+具体的调用（`faulthandler` 的栈 + 本故事的看门狗）：
 
-1. **定位到具体调用**（`faulthandler` 抓栈）：卡在 `uiautomation` 的**惰性单例初始化**
-   —— `uiautomation.instance()` → `comtypes` → `CoCreateInstance(CUIAutomation)`，
-   `ControlFromHandle` 里那**第一次**碰 UIA 的地方。
-2. **判定是环境**（`manual_windows_uia_init_probe.py` 的 A/B 对照，各起一个全新进程）：
-   同一台客体、同一时间，**story 那条完全相同的调用序列**
-   （建隐藏桌面 → 在上面起 winver → 首次 `ControlFromHandle`）**只要 1.32 秒**。
+    卡在 `uiautomation` 的**惰性单例初始化** —— `uiautomation.instance()`
+    → `comtypes` → `CoCreateInstance(CUIAutomation)`，
+    也就是 `ControlFromHandle(hwnd)` 里**本进程第一次碰 UIA** 的那一下。
 
-旁证在**同一轮 story 里**就有：`taskkill` 卡过 90s 以上、早期版本 `CreateProcessW` 卡过
-20s 以上 —— 同一台机器在探针里做同样的事只要 0.2s。**这是客体当时的状态，不是代码。**
+**已排除**（都是同一台机器、同一时段、逐条对照出来的）：
 
-⚠️ 所以**再遇到卡住时不要先去翻代码**（那正是本轮白耗掉的那一整轮）。本故事现在带
+  · **不是脚本放在共享文件夹的问题**：把 `src/`+`tests/` 拷到客体本地盘（`C:` 根下）
+    再跑，照样卡在同一行。
+  · **不是"后面的活把它搞坏的"**：`--tree-early`（把首次碰 UIA 提到 4b/2/3 之前）
+    仍然卡 —— 所以原因在这三节**之前**就已经存在。
+  · **不是单纯"进程活了很久"**：探针 `--idle-before 90` 是 2.47s。
+  · **不是 story 式的起/杀进程**：探针 `--work-before 90` 到了 18s（明显变慢）**但没卡死**。
+  · **不是单独设 DPI V2**：`--set-dpi` 的干净房间是 2.76s。
+
+**一条尚未证实的线索**（n=1，**别当结论用**）：`--prime-uia`（读树前先 `GetRootControl()`
+一次，**换一个 UIA 调用去建那个单例**）那一轮**整条故事跑通了**。
+要让它从线索变成结论，至少得做 **plain / prime 各 2~3 轮的交替重复**——
+一轮不算证据，否则"预热有效"只是运气穿了件结论的外衣。
+
+⚠️ 所以**再遇到卡住时不要先去翻代码**（那正是本轮白耗掉的那些轮次）。本故事带
 **看门狗**：150s 没有新输出就打印全部线程栈、写一条 FAIL、并带退出码 5 结束 ——
-也就是说，卡住这件事会**自己说出卡在哪一次调用**，宿主也拿得到明确结论而不是等满 900s。
+卡住这件事会**自己说出卡在哪一次调用**，宿主也拿得到明确结论而不是等满 900s。
 先看那条栈：**卡点仍在我们自己的行上**才需要往下查。
+
+⚠️ 另一条独立观察（同一台机器）：**这台客体会周期性地整体变慢** —— 裸 import 一个模块
+测到过 50s、`Z:`（VirtualBox 共享文件夹）的读比 `C:` 慢约 3 倍、单次 append 到 `Z:` 约 37ms。
+上面的"卡死"很可能只是这个分布的长尾，但**没有证据**，别写成结论。
 
 ⚠️ 目标应用刻意用 **winver**（纯 Win32），不用 Win11 的记事本 ——
 后者是 Store 应用别名，实测在本客体上偶发卡在激活环节。
+
+═══ 两个**排查用**开关（正常验收别带）═══
+
+  · `--tree-early`：把「读树」提到 4b/2/3 之前 —— 用来判断"是不是后面那几节搞坏的"。
+  · `--prime-uia`：读树前先 `GetRootControl()` 一次 —— 用来把"首次碰 UIA"与
+    "碰的是哪一扇窗"劈成两种不同的可能。
 
 跑法（客体上，交互式会话内）：
     python tests\\manual_windows_isolated_story.py --out results\\isolated_story.json
@@ -219,6 +239,22 @@ def user_desktop_windows(**kw):  # noqa: ANN003
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="")
+    # ★ 实验开关：把「读树」（本客体上会卡死的那一步）提到 4b 那串 spawn 对照**之前**。
+    #   它只做一件事——让**首次**碰 UIA 发生在 4b 的进程折腾之前。于是同一台机器、
+    #   同一天、同一份代码跑两遍（带/不带这个开关）就能判定：
+    #     带开关不卡、不带卡  → 是 4b 那串"起进程/杀进程"把 UIA 初始化搞坏的；
+    #     两遍都卡            → 原因在更早的地方（会话检查/桌面基线/launch_app）。
+    #   ⚠️ 判据要落在**首次**碰 UIA 上：先读一次会把单例预热，后面那次自然就好了
+    #   （这正是本实验要利用的性质，不是缺陷）。
+    ap.add_argument("--tree-early", action="store_true",
+                    help="在 4b 之前先读一次树（判定卡死是否由 4b 的进程折腾引起）")
+    # ★ 实验开关：在真正读树**之前**先用另一个 UIA 调用把单例建起来。
+    #   它把"卡在 CoCreateInstance"这一个现象**劈成两种可能**：
+    #     · 这里就卡 → 是「本进程首次碰 UIA」这件事本身（与碰的是哪扇窗无关）；
+    #     · 这里不卡、随后读树卡 → 卡的是 `ControlFromHandle(那一扇窗)`，
+    #       即**那个窗口的 provider** 有问题（那是完全不同的另一条线索）。
+    ap.add_argument("--prime-uia", action="store_true",
+                    help="读树前先用 GetRootControl() 预热 UIA 单例（劈开两种卡法）")
     args = ap.parse_args(argv)
 
     global _TRACE
@@ -302,7 +338,6 @@ def main(argv: list[str] | None = None) -> int:
            f"（real 模式下\"目标桌面\"就是用户桌面，必须看得到）")
 
     # ── 4b) 诊断：`CreateProcessW` 不带桌面名时会不会卡？──
-    #
     # ⚠️ 这一节是**诚实记录一个尚未查明的现象**，不是验收判据：
     #   2026-09-30 实测：**同一个客体上，三条启动路径会一起卡**（`Popen` 带/不带
     #   重定向、`desktop.spawn` 带/不带桌面名，全部超过 20s 不返回），而换一轮跑
@@ -412,6 +447,22 @@ def main(argv: list[str] | None = None) -> int:
         # real 模式下新应用**会**跳到你面前（那正是用户选 real 的代价，如实记下）
         note("real 模式下前台", f"{title0!r} → "
              f"{win32.window_text(fg1) if fg1 else ''!r}（可能被新窗口抢走，预期如此）")
+
+    # ★ `--tree-early`：在这里把树读一次 —— 让**首次**碰 UIA 发生在这一段之前。
+    #   4b 那串"起进程/杀进程"的对照跑在 section 2 之前（文件里在它上面），
+    #   而这个位置在它**之后**、又在 4c~4e 之前，正好把两段进程折腾都隔在一边。
+    #   拿它和默认跑法比：带开关不卡 = 卡死由之前那串进程折腾引起。
+    if args.tree_early:
+        print("\n=== 3.5) ★ 提前读树（首次碰 UIA 就发生在这里）===", flush=True)
+        trace("提前读树：目标窗口 id")
+        backend.active_window_id()
+        trace("提前读树：list_windows")
+        backend.list_windows(limit=50)
+        trace("提前读树：get_ui_tree(active_window) ← 本进程首次碰 UIA")
+        _early = coord.get_ui_tree(scope="active_window", max_nodes=200)
+        trace(f"提前读树完成：{len(str(_early))} 字符")
+        ok("★ 提前读树成功（首次碰 UIA 发生在 4c~4e 与 4b 之外）", bool(_early),
+           f"{len(str(_early))} 字符")
 
     # ── 4c) ★ 坐标级/键盘注入被**拒绝**，而且指针真的没动 ──
     #
@@ -526,6 +577,13 @@ def main(argv: list[str] | None = None) -> int:
     # ⚠️ 读树这一步在本客体上**偶发卡死**（实测一卡十分钟以上）。卡住时只知道"卡在
     #    读树里"是**不够**的 —— 它内部有好几步跨进程 UIA 调用。所以把子步骤也 trace 出来，
     #    配合 faulthandler 的栈快照，才能指到具体是哪一次调用。
+    # ★ `--prime-uia`：读树之前先用**另一个** UIA 调用建单例（劈开两种卡法，见参数说明）。
+    if args.prime_uia:
+        trace("预热 UIA：import + GetRootControl()（本进程首次碰 UIA 就在这里）")
+        _uia.import_uia().GetRootControl()
+        trace("预热 UIA 完成 ✔")
+        ok("★ 预热 UIA（GetRootControl）没卡", True, "首次碰 UIA 走的是根元素")
+
     trace("读树 1/3：目标窗口 id")
     _hwnd_hint = backend.active_window_id()
     trace(f"读树 1/3 返回 {_hwnd_hint!r}")

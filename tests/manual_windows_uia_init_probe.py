@@ -61,10 +61,12 @@ story 要先跑完会话检查、用户桌面基线、三组启动对照、launc
 
 from __future__ import annotations
 
+import faulthandler
 import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 
 _HERE = pathlib.Path(__file__).resolve()
@@ -77,6 +79,9 @@ _OUT = _HERE.parent.parent / "docs" / "PR" / "windows-driver" / "results" / \
     "_uia_init_probe.txt"
 
 _SLOW = 5.0        # 超过这个秒数就标出来（**只是标注，不是判据**）
+
+# 卡死自证：探针的每一步正常都是毫秒级，90s 没动就肯定不对了（详见 main() 里的说明）。
+_HANG_DUMP_S = 90.0
 
 
 def say(msg: str) -> None:
@@ -133,6 +138,12 @@ def phase_b() -> None:
     say("--- 阶段 B：隐藏桌面 + 它上面的应用 + 首次 UIA（= story 的顺序）---")
     from computer_use_mcp.backend.windows.driver import desktop
 
+    # ★ 碰 UIA **之前**记一次线程数：story 里那段 4b 会用 `_timed()` 起**可抛弃的
+    #   守护线程**（超时就不 join 了，线程留在那儿跑完为止），所以"碰 UIA 时进程里有
+    #   几个在跑的线程"是一个真实存在、且 story 与探针**不同**的变量。
+    #   记下来是为了让"线程数"这个假设**可证伪**，而不是靠猜。
+    say(f"B.threads_before_uia={threading.active_count()}")
+
     timed("B.ensure_isolated", lambda: desktop.ensure_isolated().get("name"))
     timed("B.spawn_winver", lambda: desktop.spawn(["winver.exe"], dict(os.environ)).get("pid"))
     time.sleep(1.5)
@@ -156,6 +167,61 @@ def phase_b() -> None:
     desktop.release()
 
 
+def _idle(seconds: float) -> None:
+    """纯空转 —— 只抬高"进程已经活了多久"这一个变量，不做任何别的事。"""
+    say(f"--- 预热 A：纯空转 {seconds:.0f}s（只抬高进程存活时间）---")
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        time.sleep(5.0)
+        say(f"  idle {time.time() - t0:.0f}s threads={threading.active_count()}")
+    say("预热 A 结束")
+
+
+def _work(seconds: float) -> None:
+    """
+    做**与 story 同类**的事 ~N 秒（起/杀应用、枚举窗口），但**不碰 UIA**。
+
+    这是在复制 story 与探针之间**唯一的、成规模的结构性差异**：story 在首次碰 UIA 之前
+    已经跑了 90 秒以上的活（会话检查 → 桌面基线 → 三组启动对照 → launch_app → 4c~4e），
+    而探针 B 是进程起来 ~2 秒就碰。
+
+    ⚠️ 刻意**复刻 story 那个 `_timed()` 的"可抛弃守护线程"形状**（超时不 join、线程留着
+    跑完）：那是进程内累积的状态，也正是"进程跑了多久"这个变量里最难用 sleep 模拟的部分。
+    """
+    say(f"--- 预热 B：做 story 同类的活 ~{seconds:.0f}s（不碰 UIA）---")
+    from computer_use_mcp.backend.windows.driver import desktop
+
+    desktop.ensure_isolated()
+    t0 = time.time()
+    rounds = 0
+    while time.time() - t0 < seconds:
+        rounds += 1
+        _fire_and_forget(lambda: subprocess.Popen(["winver.exe"]))  # noqa: S603
+        time.sleep(0.4)
+        _fire_and_forget(lambda: subprocess.run(  # noqa: S603,S607
+            ["taskkill", "/F", "/IM", "winver.exe"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False))
+        _fire_and_forget(lambda: len(desktop.enumerate_target()))
+    say(f"预热 B 结束：{rounds} 轮，threads={threading.active_count()}")
+
+
+def _fire_and_forget(fn) -> None:  # noqa: ANN001
+    """
+    在**守护线程**里跑 `fn` 且**不等它** —— 复刻 story 里 `_timed()` 超时后的形状。
+
+    ⚠️ 用 `daemon=True` 是为了不给进程退出添麻烦，但这**不能**让"线程还在跑"这件事消失：
+    它照样在执行里，照样可能持着锁/句柄。这正是我们要不要证伪的东西。
+    """
+    threading.Thread(target=lambda: _swallow(fn), daemon=True).start()
+
+
+def _swallow(fn) -> None:  # noqa: ANN001
+    try:
+        fn()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def phase_c() -> None:
     """同一进程内再量一次：看有没有"越跑越糟"（UIA 已预热，这一条量的是复用量级）。"""
     say("--- 阶段 C：同进程内复量（有没有越跑越糟）---")
@@ -169,6 +235,16 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", choices=("a", "b", "c", "all"), default="all",
                     help="只跑某一阶段（a/b 建议各起一个进程，见模块 docstring）")
+    ap.add_argument("--idle-before", type=float, default=0.0,
+                    help="碰 UIA 之前纯空转 N 秒（只抬高进程存活时间）")
+    ap.add_argument("--work-before", type=float, default=0.0,
+                    help="碰 UIA 之前做 story 同类的活 N 秒（起/杀应用、枚举窗口，不碰 UIA）")
+    # ★ 单变量对照：story 在碰 UIA 之前会先 `_uia.ensure_dpi_awareness()` 把进程设成
+    #   PER_MONITOR_AWARE_V2（产品代码，`WindowsBackend.__init__` 里就调），
+    #   而探针 A/B 从没设过它 —— 这是"story 卡、探针不卡"之间**最纯粹的一个差异**。
+    #   带上它 = 只改这一个变量。
+    ap.add_argument("--set-dpi", action="store_true",
+                    help="碰 UIA 之前先设 PER_MONITOR_AWARE_V2（复刻 story 的那一步）")
     args = ap.parse_args(argv)
 
     try:
@@ -177,10 +253,27 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         pass
 
-    say(f"=== only={args.only} pid={os.getpid()} ===")
+    # ★ 卡死自证（与 story 同一条纪律：卡住时必须留下"卡在哪一次调用"这条事实）。
+    #   本探针**不设看门狗退出** —— 它跑的次数少、且我们正想看它卡（卡住本身是数据）。
+    #   但要有个比故事里短的阈值：探针的正常一步是毫秒级，90s 没动就肯定不对了。
+    faulthandler.dump_traceback_later(_HANG_DUMP_S, repeat=True, exit=False)
+
+    say(f"=== only={args.only} pid={os.getpid()} "
+        f"idle_before={args.idle_before:.0f} work_before={args.work_before:.0f} ===")
     say(f"py={sys.version.split()[0]} exe={sys.executable}")
     say(f"coinit_flags={getattr(sys, 'coinit_flags', 'unset')!r} "
         f"（unset = 由 comtypes/第一个用 COM 的线程决定公寓）")
+    say(f"threads_at_start={threading.active_count()}")
+
+    # ⚠️ 预热必须在**碰 UIA 之前**，否则它就不是在抬高那个变量了。
+    if args.set_dpi:
+        from computer_use_mcp.backend.windows.driver import win32
+        r = win32.set_dpi_awareness_v2()
+        say(f"已设 DPI={r}（复刻 story 的 `_uia.ensure_dpi_awareness()`）")
+    if args.idle_before > 0:
+        _idle(args.idle_before)
+    if args.work_before > 0:
+        _work(args.work_before)
 
     if args.only in ("a", "all"):
         phase_a()
@@ -193,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
     say("A 就慢        -> 客体环境病态（与我们的调用序列无关）")
     say("只有 B 慢     -> 我们的调用序列（隐藏桌面/上面的应用）与 UIA 初始化有交互")
     say("C 比 A 慢很多 -> 越跑越糟（最值得改的一种）")
+    say("带预热时 B 慢 -> '首次碰 UIA 之前进程已经跑了多久'就是那个变量")
     say("DONE")
     return 0
 
