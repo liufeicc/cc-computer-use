@@ -61,15 +61,39 @@ info "  日志     : $LOG_LOCAL_REL"
 # 旧日志先删：否则「脚本根本没跑起来」会被上一轮的残留伪装成"跑过了"
 rm -f "$LOG_LOCAL"
 
-# ── 1. 建 /IT 计划任务并触发 ──────────────────────────────────────────
-# `schtasks /tr` 里套一层带引号的路径时引号会被 cmd 吃掉（实测报
-# 「无效参数/选项 - '-NoProfile'」，任务根本没建起来）。隔一层**不含空格**的 .bat
-# 之后这个问题从根上不存在 —— 这也是本仓库既有脚本一律这么做的原因。
+# ── 1. 注册交互式计划任务并触发 ──────────────────────────────────────
+# ⚠️ **一律走 `packaging/windows/run-scheduled-task.ps1`，不要退回 `schtasks /create`。**
+#
+# ① ★ 电池闸门（2026-10-02 实测踩到的**静默失败**）：`schtasks /create` 装出来的任务
+#    默认 `DisallowStartIfOnBatteries=true`，而 schtasks 命令行**没有任何开关能改它**。
+#    宿主是笔记本且**正在用电池**时，客体随之报 `PowerLineStatus=Offline`，于是任务被
+#    Task Scheduler 一直挂在**「已排队」**、**永远不启动** —— 表现只是「结果文件不出现」，
+#    与"脚本自己崩了"长得一模一样（本轮为此绕了很久）。同一台客体、同一用户、
+#    同为 InteractiveToken，只差电池那两行的对照见 run-scheduled-task.ps1 的注释。
+# ② `schtasks /tr` 里套一层带引号的路径时引号会被 cmd 吃掉（实测报「无效参数/选项 -
+#    '-NoProfile'」，任务根本没建起来）。隔一层**不含空格**的 .bat 就不会有这个问题 ——
+#    那也是本仓库既有脚本一律这么做的原因。改走 PowerShell 参数化调用后这条从根上不存在，
+#    但 .bat 这一层**仍然保留**（客体侧好写好查，也是各探针的统一入口）。
 info
-info "=== [1/3] 建交互式计划任务并触发 ==="
-g_run 'C:\Windows\System32\cmd.exe' /c \
-  "schtasks /create /tn $TASK_NAME /tr \"${GUEST_REPO}\\${BAT_GUEST_REL}\" /sc once /st 23:59 /it /f & schtasks /run /tn $TASK_NAME" \
-  | tail -3
+info "=== [1/3] 注册交互式计划任务并触发 ==="
+reg_out="$(g_run 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' \
+  -NoProfile -ExecutionPolicy Bypass \
+  -File "${GUEST_REPO}\\packaging\\windows\\run-scheduled-task.ps1" \
+  -Target "${GUEST_REPO}\\${BAT_GUEST_REL}" -TaskName "$TASK_NAME" 2>&1 || true)"
+printf '%s\n' "$reg_out" | tail -5
+printf '%s\n' "$reg_out" | grep -q 'TASKREG|' \
+  || die "计划任务没注册成功（客体没回 TASKREG| 那行）—— 上面是客体原话。"
+# 判据取**实际挂上去的设置**，不是"任务建出来了"：本轮踩的正是后者。
+printf '%s\n' "$reg_out" | grep -q 'on_batteries_disallow=False' \
+  || die "★ 任务带着电池闸门装上了 —— 宿主用电池时它会被一直排队、永远不跑。
+   去修 packaging/windows/run-scheduled-task.ps1，别在这里绕过去。"
+# ② ★ 必须**隐藏窗口**起目标（经 run-hidden.vbs）：直接起 .bat 会带出一个控制台窗口，
+#    而那个窗口会成为**用户桌面的前台窗口** —— 隔离 story 里「用户的前台窗口没变」
+#    那条判据于是为一件与产品无关的事变红。实测同一份代码连跑两轮：
+#    '新通知'→'新通知' 通过，下一轮 'Program Manager'→'C:\WINDOWS\SYSTEM32\cmd.exe' 失败。
+printf '%s\n' "$reg_out" | grep -q 'hidden_launcher=True' \
+  || die "★ 任务没有走隐藏启动器 —— 它会在用户桌面上弹一个控制台窗口并抢前台，
+   让隔离 story 的『前台没变』判据假红。去修 packaging/windows/run-scheduled-task.ps1。"
 
 # ── 2. 等客体跑完 ────────────────────────────────────────────────────
 # 完成信号是探针自己在日志末尾写的 `=== DONE ===`（由 .bat 落笔）。

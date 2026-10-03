@@ -34,7 +34,7 @@ CC_CU_VM_PASS='<密码>' bash packaging/windows/verify-install.sh
 
 ---
 
-## 十条踩过的坑（都写进了代码与守卫测试）
+## 十二条踩过的坑（都写进了代码与守卫测试）
 
 ### 1. 纯 Python 的包不在磁盘上，在内嵌的 `PYZ.pyz` 里
 
@@ -166,13 +166,67 @@ UIA 初始化）实测会超过 30 秒。
 ⚠️ 顺带一个**方向相反的**坑：`claude doctor` 是个**交互式 TUI**，它**永远不会自己退出**
 （实测跑到 300 秒超时）。**别在任何自动化里调它。**
 
+### 11. 计划任务永远停在「已排队」= 宿主的电池闸门（2026-10-02）
+
+**症状**：宿主脚本报「任务创建成功、已触发」，客体上 `schtasks /query` 显示状态
+`已排队`，而结果文件**永远不出现** —— 与「脚本自己崩了」长得一模一样。
+
+**根因不在客体，在宿主**：`schtasks /create` 装出来的任务默认
+`DisallowStartIfOnBatteries=true`，而 **schtasks 命令行没有任何开关能改它**。
+宿主是笔记本、且**正在用电池**时，客体随之报 `PowerLineStatus=Offline`，
+于是 Task Scheduler 把这个任务一直挂着不启动。
+
+**实测对照**（同一台客体、同一用户、同为 `InteractiveToken`，只差电池那两行）：
+
+| 注册方式 | 电池设置 | 结果 |
+|---|---|---|
+| `schtasks /create ... /it /f` | `DisallowStartIfOnBatteries=true` | 状态 `已排队`，**永不运行** |
+| `Register-ScheduledTask` + 本仓库的助手 | `...=false` | 状态 `Ready`，**立刻跑完** |
+
+排查时先怀疑错的方向（共享盘掉挂、客体没登录、任务名冲突）都白花时间 ——
+**判据是客体的电源状态**：`[System.Windows.Forms.SystemInformation]::PowerStatus`。
+
+**处置**：注册一律走 `packaging/windows/run-scheduled-task.ps1`
+（`New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`），
+宿主侧再断言它回显的 `on_batteries_disallow=False`。
+⚠️ **别把这条读成"虚拟机不该报电池"** —— 报不报是宿主/虚拟化的事，
+而驱动脚本**不该依赖宿主当前的供电状态**，所以修在注册侧。
+
+守卫：`test_scheduled_task_registration_is_battery_exempt` +
+`test_no_script_registers_tasks_through_schtasks_create`（全仓库不许再出现 `schtasks /create`）。
+
+### 12. 我们自己那个控制台窗口会抢用户的前台（2026-10-02）
+
+计划任务起 `.bat` 时，cmd.exe 一定会带一个控制台窗口，而 Task Scheduler
+**没法抑制它** —— 那个窗口会成为**用户桌面的前台窗口**。
+
+后果落在隔离 story 的一条判据上：「用户的前台窗口没变」。实测**同一份代码连跑两轮**：
+
+```
+一轮   '新通知' → '新通知'                                       通过
+下一轮 'Program Manager' → 'C:\WINDOWS\SYSTEM32\cmd.exe'        失败
+```
+
+而后者正是**我们自己那个批处理的控制台标题** —— 一条纯粹的脚手架假红，
+却长得像「产品抢了用户前台」，而那正是我们要证明不存在的事。
+
+**处置**：经 `run-hidden.vbs` 起目标。`wscript.exe` 本身无窗口
+（不像 `cscript.exe` 会分配控制台），配合 `WScript.Shell.Run(cmd, 0, True)`
+的 `0 = SW_HIDE` 就彻底解决；`WScript.Quit` 还把子进程退出码带回去。
+
+**真机验证**：用隐藏启动器起一个批处理，批处理里每秒采样一次 `GetForegroundWindow()`，
+15 次全部是 `Program Manager`（桌面）—— 全程没有任何控制台窗口出现在用户前台。
+
+守卫：`test_scheduled_task_launches_the_target_with_a_hidden_window`；
+`.vbs` 也一并纳入「纯 ASCII」那条编码纪律（wscript 同样按系统 ANSI 解脚本文件）。
+
 ---
 
 ## 守卫与反证
 
 ```bash
-PYTHONNOUSERSITE=1 $PY -m pytest tests/test_packaging_windows.py -q   # 45 条结构性守卫
-PYTHONNOUSERSITE=1 $PY tests/manual_windows_guards_reverse.py         # 58 条反证
+PYTHONNOUSERSITE=1 $PY -m pytest tests/test_packaging_windows.py -q   # 52 条结构性守卫
+PYTHONNOUSERSITE=1 $PY tests/manual_windows_guards_reverse.py         # 64 条反证
 ```
 
 反证那步不是可选的：这些守卫的判据都是「没有坏东西」，而"守卫坏了"与"代码没问题"
@@ -180,12 +234,17 @@ PYTHONNOUSERSITE=1 $PY tests/manual_windows_guards_reverse.py         # 58 条�
 反证脚本本身也会过期（生产代码一改，「替换目标串」就对不上了），所以它**对不上时硬失败**，
 而不是静默跳过。
 
-⚠️ 反证现在有**三种手法**（58 条 = packaging 源码替换 36 + **`src/` 源码替换 4** +
+⚠️ 反证现在有**三种手法**（64 条 = packaging 源码替换 42 + **`src/` 源码替换 4** +
 运行期破坏 18）。中间那 4 条是 2026-09-30 为「默认不碰用户键鼠」那批**顺序判据**新加的：
 那批判据读的是 `src/` 下的生产代码（"闸门必须早于注入原语"），而原来的替换机制只拷
 `packaging/`，够不着。挂载点是 `test_global_input_gate.GG._TEST_SRC` —— 那几条判据
 取源码路径时**必须**经 `_src_root()`（直接用模块级 `_SRC` 的话反证会永远跑在真实源码上，
 于是又变回"坏了也看不出来"）。
+
+⚠️ **临时目录现在还会拷 `tests/*.sh`**（2026-10-02 补）：坑 11/12 那几条守卫要读
+`tests/run_windows_probe.sh`，不拷进来的话它会以 `FileNotFoundError` 收场 ——
+**红是红了，红的理由却与真实缺陷无关**。这与当年「只拷 `packaging/` 时那条 ASCII 守卫
+先撞上自己的数量正控」是同一个病，同一个脚本上犯第二次。
 
 ---
 

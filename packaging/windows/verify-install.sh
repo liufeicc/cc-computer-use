@@ -67,20 +67,39 @@ g_run() {
     --wait-stdout --wait-stderr -- "$@"
 }
 
-# ── 1. 写参数文件、建 /IT 计划任务并触发 ──────────────────────────────
-# 参数**经文件传**，不塞进 `/tr` 的命令行里：`/tr "<命令行>"` 里再套一层带引号的路径,
-# 引号会被 cmd 吃掉 —— 实测报「无效参数/选项 - '-NoProfile'」，任务根本没建起来。
-# 隔一层不含空格的 .cmd（`verify-interactive.cmd`）之后这个问题从根上不存在。
+# ── 1. 写参数文件、注册交互式计划任务并触发 ──────────────────────────
+# 参数**经文件传**，不塞进任务命令行里：`verify-interactive.cmd` 自己从 verify-params.txt
+# 读它们。历史上这么做是为了绕开 `schtasks /tr "<命令行>"` 的引号问题（`/tr` 里再套一层
+# 带引号的路径，引号会被 cmd 吃掉 —— 实测报「无效参数/选项 - '-NoProfile'」，
+# 任务根本没建起来）。现在改走 PowerShell 参数化调用后那条从根上不存在，但
+# **参数经文件传这一层保留**（客体侧的命令行引号规则太容易踩，不值得回头去省）。
+#
+# ⚠️ 注册一律走 `packaging/windows/run-scheduled-task.ps1`，**不要退回 `schtasks /create`**：
+# 后者装出来的任务默认 `DisallowStartIfOnBatteries=true`，而 schtasks 命令行**没有开关能改它**。
+# 宿主是笔记本且在用电池时，任务会被永远挂在「已排队」、结果文件永不出现 ——
+# 表现与"验收脚本自己崩了"一模一样（2026-10-02 实测，详见该脚本的注释）。
 #
 # 结果文件先清掉：否则「脚本根本没跑起来」会被上一轮的残留伪装成"跑过了"。
 rm -f "$RESULT_LOCAL"
 printf 'Setup=%s\nResult=%s\n' "$SETUP_GUEST" "$RESULT_GUEST" > "$ROOT/dist/windows/verify-params.txt"
 
 info
-info "=== [1/3] 建交互式计划任务并触发 ==="
-g_run 'C:\Windows\System32\cmd.exe' /c \
-  "schtasks /create /tn $TASK_NAME /tr \"${GUEST_REPO}\\packaging\\windows\\verify-interactive.cmd\" /sc once /st 23:59 /it /f & schtasks /run /tn $TASK_NAME" \
-  | tail -3
+info "=== [1/3] 注册交互式计划任务并触发 ==="
+reg_out="$(g_run 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' \
+  -NoProfile -ExecutionPolicy Bypass \
+  -File "${GUEST_REPO}\\packaging\\windows\\run-scheduled-task.ps1" \
+  -Target "${GUEST_REPO}\\packaging\\windows\\verify-interactive.cmd" \
+  -TaskName "$TASK_NAME" 2>&1 || true)"
+printf '%s\n' "$reg_out" | tail -5
+printf '%s\n' "$reg_out" | grep -q 'TASKREG|' \
+  || die "计划任务没注册成功（客体没回 TASKREG| 那行）—— 上面是客体原话。"
+printf '%s\n' "$reg_out" | grep -q 'on_batteries_disallow=False' \
+  || die "★ 任务带着电池闸门装上了 —— 宿主用电池时它会被一直排队、永远不跑。
+   去修 packaging/windows/run-scheduled-task.ps1，别在这里绕过去。"
+# 隐藏启动器：直接起 .cmd 会弹一个控制台窗口抢走用户前台（详见 run-hidden.vbs）。
+printf '%s\n' "$reg_out" | grep -q 'hidden_launcher=True' \
+  || die "★ 任务没有走隐藏启动器 —— 它会在用户桌面上弹一个控制台窗口并抢前台。
+   去修 packaging/windows/run-scheduled-task.ps1，别在这里绕过去。"
 
 # ── 2. 等结果文件出现并稳定下来 ──────────────────────────────────────
 info

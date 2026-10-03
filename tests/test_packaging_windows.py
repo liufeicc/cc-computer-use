@@ -114,6 +114,7 @@ def _joined(src: str, comment: str = "#", whole_line: bool = False) -> str:
 #   · .cmd 反过来：cmd.exe 对 BOM 与 UTF-8 都不友好，所以客体上的 .cmd 必须**纯 ASCII**。
 _NEEDS_BOM = (
     (_WIN + ("build-on-windows.ps1",)),
+    (_WIN + ("run-scheduled-task.ps1",)),
     (_WIN + ("installer.iss",)),
     (_WIN + ("payload", "bin", "cc-computer-use-setup.ps1")),
     (_WIN + ("payload", "bin", "cc-computer-use-doctor.ps1")),
@@ -132,19 +133,26 @@ def test_guest_scripts_are_utf8_with_bom(path):
 
 
 def _batch_files() -> list[tuple[str, ...]]:
-    """**客体上会被 cmd.exe 执行**的批处理清单：`packaging/` 的 .cmd + `tests/` 的 .bat。
+    """**客体上会被 cmd.exe / wscript.exe 执行**的脚本清单。
+
+    `packaging/windows/` 的 `.cmd` 与 `.vbs` + `tests/` 的 `.bat`。
 
     ⚠️ `tests/*.bat` 必须一起收进来（2026-09-30 补）：它们是**驱动 story 的唯一入口**
     （经计划任务 `/IT` 在客体上跑），走的正是 cmd.exe —— 与 `packaging/` 的 .cmd 同一类。
     本规则原先只写在上面那段注释里、没有任何测试盯着，而本仓库当时已经有 **6 个**
     `tests/*.bat` 在裸奔：谁哪天在里面写一行中文注释，就会得到"cmd 执行了一堆乱码"，
     而**报错完全指不到原因**。
+
+    ⚠️ `.vbs` 一起收（2026-10-02 补）：`run-hidden.vbs` 由 wscript.exe 读，它按**系统 ANSI
+    代码页**解析脚本文件（除非带 Unicode BOM），与 cmd 读 .bat 是同一类编码陷阱。
+    实测本坑的先例就在眼前：`verify-interactive.cmd` 里写了 12 行中文 `rem`，
+    而它自己的注释正要求纯 ASCII。
     """
     out: list[tuple[str, ...]] = []
     win = os.path.join(REPO, *_WIN)
     if os.path.isdir(win):
         for name in sorted(os.listdir(win)):
-            if name.endswith(".cmd"):
+            if name.endswith((".cmd", ".vbs")):
                 out.append(_WIN + (name,))
     # ⚠️ 目录不存在时**跳过而不是抛**：反证脚本会把一份只有 `packaging/` 的副本挂在
     #    `REPO` 上（它只拷那一棵树），这里抛异常会让那几条反证以 `FileNotFoundError`
@@ -153,14 +161,14 @@ def _batch_files() -> list[tuple[str, ...]]:
     tests_dir = os.path.join(REPO, "tests")
     if os.path.isdir(tests_dir):
         for name in sorted(os.listdir(tests_dir)):
-            if name.endswith(".bat"):
+            if name.endswith((".bat", ".vbs")):
                 out.append(("tests", name))
     return out
 
 
 def test_guest_batch_files_are_pure_ascii():
     """
-    ★ 客体上跑的 `.bat` / `.cmd` 必须**纯 ASCII**。
+    ★ 客体上跑的 `.bat` / `.cmd` / `.vbs` 必须**纯 ASCII**。
 
     ═══ 为什么（这是"信息丢失"而不是洁癖）═══
 
@@ -169,12 +177,13 @@ def test_guest_batch_files_are_pure_ascii():
     但只要文件是 UTF-8 存的（本仓库的默认！），cmd 就会把它按 GBK 解 ——
     后果是 `REM` 注释里的某个 UTF-8 字节序列翻译出一个**能吞掉后面那个 ASCII 字符**的
     字节，于是下一行命令被拼坏，cmd 去执行一段谁也不认识的东西。
+    `wscript.exe` 读 `.vbs` 同理（除非文件带 Unicode BOM，那又会让别的工具读不懂）。
 
     ⚠️ 措辞刻意是"**可以**恰好能跑"：这条的性质与上面那条 BOM 规则一样，
     是**在目标机上才暴露、在开发机上时灵时不灵**的那一类 —— 所以不能靠"我这儿跑得好好的"来判。
 
-    处置法则很简单：`.bat`/`.cmd` 里**一律只写 ASCII**，中文说明放进同名 `.py` 的
-    docstring（那才是给人读的地方，且没有编码陷阱）。
+    处置法则很简单：这些文件里**一律只写 ASCII**，中文说明放进同名 `.py` 的
+    docstring 或 `.ps1`（那才是给人读的地方，且没有编码陷阱）。
 
     正控：清单必须**真的收到了东西**，否则「全部通过」只是"扫了个空"。
     """
@@ -1059,3 +1068,156 @@ def test_setup_does_not_claim_the_shell_error_is_a_context_artifact():
     assert "requires either Git for Windows" in body, (
         "Show-ShellHintIfNeeded 的函数体没抓到 —— 守卫正在空转"
     )
+
+
+# ==================== ⑦ 在客体交互式会话里起脚本的两条硬约束 ====================
+#
+# 这两条都是**静默失败**型的坑（2026-10-02 实测），共同点是：
+#   「命令成功、看着一切正常，可实际上什么都没发生（或者发生了别的事）」。
+# 它们是本项目最贵的一类 bug，所以各自钉一条守卫。
+
+def test_scheduled_task_registration_is_battery_exempt():
+    """
+    ★ 注册客体计划任务必须**豁免电池策略**，不许退回 `schtasks /create`。
+
+    ═══ 为什么 ═══
+
+    `schtasks /create` 装出来的任务默认 `DisallowStartIfOnBatteries=true`，
+    而 **schtasks 命令行没有任何开关能改它**（只能导 XML 或走 PowerShell 的
+    `New-ScheduledTaskSettingsSet`）。后果：宿主是笔记本且**正在用电池**时，
+    客体随之报 `PowerLineStatus=Offline`，任务被 Task Scheduler 一直挂在
+    **「已排队」**、**永远不启动** —— 表现只是「结果文件不出现」，
+    与"脚本自己崩了"长得一模一样。实测为此刻意绕了很久（先怀疑了共享盘、
+    客体登录态、任务名冲突，全不对）。
+
+    实测对照（同一台客体、同一用户、同为 `InteractiveToken`，只差电池那两行）：
+        schtasks /create        DisallowStartIfOnBatteries=true   → 已排队，永不运行
+        Register-ScheduledTask  ...=false（现在这条）            → Ready，立刻跑完
+
+    ⚠️ **别把这条读成"虚拟机不该报电池"**：报不报是宿主/虚拟化的事，
+    而我们的驱动脚本**不该依赖宿主当前的供电状态**，所以修在注册侧。
+
+    判据（缺一不可）：
+      ① 用的是 `Register-ScheduledTask`；
+      ② 显式带上 `-AllowStartIfOnBatteries` 与 `-DontStopIfGoingOnBatteries`；
+      ③ **整个仓库脚本里不许再有 `schtasks /create`** —— 那是最容易被顺手写回去的形态。
+    """
+    src = _read(*(_WIN + ("run-scheduled-task.ps1",)))
+    live = "\n".join(_live_lines(src))
+    assert "Register-ScheduledTask" in live, (
+        "run-scheduled-task.ps1 没用 Register-ScheduledTask —— `schtasks /create` 装出来的任务"
+        "默认带电池闸门，宿主用电池时会被永远排队、永不运行"
+    )
+    for flag in ("-AllowStartIfOnBatteries", "-DontStopIfGoingOnBatteries"):
+        assert flag in live, (
+            f"run-scheduled-task.ps1 没有 {flag} —— 缺了它就是那个"
+            f"「任务建出来了却永远不跑」的静默失败"
+        )
+    # 回显里必须带上实际生效的值：宿主侧靠它断言（判据不能是"任务建出来了"）
+    assert "on_batteries_disallow=" in live, (
+        "run-scheduled-task.ps1 没有回显实际生效的电池设置 —— "
+        "宿主侧就只能断言「任务建出来了」，而本轮踩的恰恰是那条判据不够用"
+    )
+
+
+def test_no_script_registers_tasks_through_schtasks_create():
+    """
+    `schtasks /create` 在本仓库里**已被逐出**（全仓库扫描）。
+
+    ⚠️ 为什么不只查那一个脚本：本坑的要害是**那个命令行开关不存在**，
+    所以任何人、任何脚本里再写一次 `schtasks /create`，都会原样重现
+    「宿主用电池 → 任务永远排队」的静默失败。拦住形态比拦住文件可靠。
+
+    （`schtasks /query` 与 `schtasks /delete` 仍在用，它们没有这个问题 ——
+    前者只读，后者的清理是尽力而为。）
+    """
+    offenders: list[str] = []
+    scanned = 0
+    for rel in ("tests/run_windows_probe.sh", "packaging/windows/verify-install.sh",
+                "packaging/windows/build-windows.sh",
+                "packaging/windows/run-scheduled-task.ps1"):
+        p = os.path.join(REPO, rel)
+        if not os.path.isfile(p):
+            continue
+        scanned += 1
+        body = open(p, encoding="utf-8").read()
+        # shell 脚本注释符是 #，PS 也是 —— 注释里保留旧结论的解释是合法的，剥掉再判
+        for ln in _live_lines(body, comment="#"):
+            if re.search(r"schtasks\s+/create\b", ln):
+                offenders.append(f"{rel}: {ln.strip()[:100]}")
+    assert scanned >= 3, f"只扫到 {scanned} 个脚本 —— 守卫的选择器过期了"
+    assert not offenders, (
+        "这些地方又用 `schtasks /create` 注册任务了 —— 它装出来的任务默认"
+        "`DisallowStartIfOnBatteries=true`，而该命令行**没有开关能改**；"
+        "宿主用电池时任务会被永远排在「已排队」、结果文件永不出现，"
+        "与「脚本自己崩了」无从分辨。请走 packaging/windows/run-scheduled-task.ps1：\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_scheduled_task_launches_the_target_with_a_hidden_window():
+    """
+    ★ 计划任务必须以**隐藏窗口**起目标（经 `run-hidden.vbs`）。
+
+    ═══ 为什么 ═══
+
+    .bat 一定会带一个控制台窗口，而 Task Scheduler（InteractiveToken）**没法抑制它** ——
+    那个窗口会成为**用户桌面的前台窗口**。于是隔离 story 里那条
+    「用户的前台窗口没变」会为一件与产品无关的事变红。实测（同一份代码连跑两轮）：
+        一轮  '新通知' → '新通知'                                          通过
+        下一轮 'Program Manager' → 'C:\\WINDOWS\\SYSTEM32\\cmd.exe'          失败
+    而后者正是**我们自己那个批处理的控制台标题** —— 一条纯粹的测试脚手架假红，
+    却长得像"产品抢了用户前台"（那正是我们要证明不存在的事）。
+
+    `wscript.exe` 本身无窗口（不像 `cscript.exe` 会分配控制台），
+    配合 `WScript.Shell.Run(cmd, 0, True)` 的 `0 = SW_HIDE` 就彻底解决。
+
+    真机验证：用 `run-hidden.vbs` 起一个批处理，批处理里每秒钟采样一次
+    `GetForegroundWindow()`，15 次全部是 `Program Manager`（桌面）——
+    全程没有任何控制台窗口出现在用户前台。
+    """
+    live = "\n".join(_live_lines(_read(*(_WIN + ("run-scheduled-task.ps1",)))))
+    assert "run-hidden.vbs" in live, (
+        "run-scheduled-task.ps1 没有经 run-hidden.vbs 起目标 —— 直接起 .bat 会在用户桌面上"
+        "弹一个控制台窗口并抢前台，让隔离 story 的『前台没变』判据假红"
+    )
+    assert "wscript" in live, (
+        "run-scheduled-task.ps1 没有用 wscript.exe —— 它是无窗口宿主（cscript 会分配控制台）"
+    )
+
+    vbs = _read(*(_WIN + ("run-hidden.vbs",)))
+    assert "SW_HIDE" in vbs or re.search(r"\.Run\([^)]*,\s*0\s*,", vbs), (
+        "run-hidden.vbs 里没看到隐藏窗口的调用（`Run(cmd, 0, True)` 的 0 = SW_HIDE）—— "
+        "它名字叫 hidden，可实际会弹窗"
+    )
+    # 正控：这个 .vbs 真有内容，不是空壳
+    assert "WScript.Quit" in vbs, (
+        "run-hidden.vbs 没有 WScript.Quit —— 退出码传不出去，守卫的选择器也可能过期了"
+    )
+
+
+def test_host_drivers_register_through_the_shared_helper_and_check_what_it_echoed():
+    """
+    两个宿主驱动脚本必须**共用**注册助手，并断言它回显的**实际生效值**。
+
+    判据有两层，第二层才是要害：
+      ① 走 `run-scheduled-task.ps1`（而不是各自再写一份注册逻辑 —— 那样两条链路会漂移，
+         而漂移的那一侧会重新长出上面那两个坑）；
+      ② 断言 `on_batteries_disallow=False` 与 `hidden_launcher=True`。
+         ⚠️ **不能只断言"任务建出来了"**：本轮踩的两次静默失败，任务都建出来了。
+    """
+    for rel in ("tests/run_windows_probe.sh", "packaging/windows/verify-install.sh"):
+        src = _read(*(rel.split("/")))
+        live = "\n".join(_live_lines(src))
+        assert "run-scheduled-task.ps1" in live, (
+            f"{rel} 没有走共享的注册助手 run-scheduled-task.ps1 —— "
+            f"各自写一份注册逻辑，迟早重新长出电池闸门/可见控制台那两个坑"
+        )
+        for probe, why in (
+            ("on_batteries_disallow=False", "电池闸门"),
+            ("hidden_launcher=True", "隐藏启动器"),
+        ):
+            assert probe in live, (
+                f"{rel} 没有断言 {probe}（{why}）—— "
+                f"只断言「任务建出来了」是拦不住那两个静默失败的，实测两次都建出来了"
+            )

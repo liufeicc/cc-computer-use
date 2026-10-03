@@ -77,6 +77,60 @@ CASES: list[tuple[str, str, str | None, str | None, str, tuple, bool]] = [
         (),
         False,
     ),
+    # ── ⑦ 计划任务的注册形态（2026-10-02 那两条静默失败）──────────────────
+    (
+        "test_guest_scripts_are_utf8_with_bom",
+        "packaging/windows/run-scheduled-task.ps1", None, None,
+        "run-scheduled-task.ps1 的 BOM 被去掉（PS 5.1 会按 ANSI 读，中文变乱码）",
+        (("packaging", "windows", "run-scheduled-task.ps1"),),
+        False,
+    ),
+    (
+        "test_guest_batch_files_are_pure_ascii",
+        "packaging/windows/run-hidden.vbs",
+        "' ASCII ONLY -- keep it that way, same reason as the .bat files.",
+        "' 警告：本文件必须纯 ASCII。",
+        "run-hidden.vbs 里写进了中文（wscript 按 ANSI 解脚本文件；这条同时证明 .vbs 真在扫描清单里）",
+        (),
+        False,
+    ),
+    (
+        "test_scheduled_task_registration_is_battery_exempt",
+        "packaging/windows/run-scheduled-task.ps1",
+        "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries",
+        "$settings = New-ScheduledTaskSettingsSet -DontStopIfGoingOnBatteries",
+        "电池豁免被摘掉（宿主用电池时任务会被永远排在「已排队」，结果文件永不出现）",
+        (),
+        False,
+    ),
+    (
+        "test_scheduled_task_launches_the_target_with_a_hidden_window",
+        "packaging/windows/run-scheduled-task.ps1",
+        "$launcher = Join-Path $here 'run-hidden.vbs'",
+        "$launcher = Join-Path $here 'run-visible.vbs'",
+        "隐藏启动器被换掉（目标会带一个控制台窗口出来并抢用户前台，story 的『前台没变』假红）",
+        (),
+        False,
+    ),
+    (
+        "test_no_script_registers_tasks_through_schtasks_create",
+        "packaging/windows/verify-install.sh",
+        "printf '%s\\n' \"$reg_out\" | tail -5",
+        "schtasks /create /tn X /tr Y /sc once /st 23:59 /it /f\n"
+        "printf '%s\\n' \"$reg_out\" | tail -5",
+        "有人又在宿主脚本里写回 `schtasks /create`（它装出来的任务默认带电池闸门，命令行改不了）",
+        (),
+        False,
+    ),
+    (
+        "test_host_drivers_register_through_the_shared_helper_and_check_what_it_echoed",
+        "tests/run_windows_probe.sh",
+        "grep -q 'hidden_launcher=True'",
+        "grep -q 'hidden_launcher='",
+        "宿主脚本不再断言「实际挂上去的设置」（只断言任务建出来了 —— 那两次静默失败都建出来了）",
+        (),
+        False,
+    ),
     (
         "test_installer_uninstallrun_has_run_once_id",
         "packaging/windows/installer.iss",
@@ -712,9 +766,15 @@ def main() -> int:
             #    实测踩到：只拷那一棵树时，那条守卫会先撞上它自己的数量正控
             #    （"只找到 1 个批处理"）—— **红是红了，但红的理由与真实缺陷无关**。
             #    那正是本脚本存在的理由所要防的假通过，只不过这次假通过发生在**反证自己**身上。
+            #
+            # ⚠️ `tests/*.sh` 同理（2026-10-02 补）：`test_host_drivers_*` 那几条要读
+            #    `tests/run_windows_probe.sh`，不拷进来的话它会以 `FileNotFoundError` 收场 ——
+            #    又是一个"红得不是地方"。同一条教训，第二次踩。
             (tmp / "tests").mkdir(exist_ok=True)
             for bat in (_REPO / "tests").glob("*.bat"):
                 shutil.copy2(bat, tmp / "tests" / bat.name)
+            for sh in (_REPO / "tests").glob("*.sh"):
+                shutil.copy2(sh, tmp / "tests" / sh.name)
             target = tmp / relpath
             raw = target.read_bytes()
 
