@@ -26,8 +26,8 @@ PY=$HOME/anaconda3/envs/cc-computer-use/bin/python
 #    现已改走 X11 才真正安全——**改动时务必不要把 AT-SPI 应用枚举加回 selftest**。
 PYTHONNOUSERSITE=1 "$PY" -m computer_use_mcp.server --selftest
 
-# 全量测试（共 551 项；单测无需桌面，端到端需 X11 + zenity + Xephyr，不满足自动 skip）
-# ✅ 两条路径都全绿：默认 542 passed / 9 skipped；下面带 e2e 开关的 547 passed / 3 skipped
+# 全量测试（共 558 项；单测无需桌面，端到端需 X11 + zenity + Xephyr，不满足自动 skip）
+# ✅ 两条路径都全绿：默认 548 passed / 10 skipped；下面带 e2e 开关的 554 passed / 4 skipped
 PYTHONNOUSERSITE=1 "$PY" -m pytest -q
 
 # e2e 需显式 opt-in（默认在沙箱内跑、不碰真实桌面）
@@ -447,14 +447,42 @@ Windows = `"window"`。两条理由缺一不可：用户桌面上同时开着浏
 ```bash
 CC_CU_VM_PASS='<密码>' bash packaging/windows/build-windows.sh    # 宿主驱动客体构建
 CC_CU_VM_PASS='<密码>' bash packaging/windows/verify-install.sh   # 装→自检→查注册→卸载
-PYTHONNOUSERSITE=1 "$PY" -m pytest tests/test_packaging_windows.py -q   # 45 条结构性守卫
-PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 58 条反证
+PYTHONNOUSERSITE=1 "$PY" -m pytest tests/test_packaging_windows.py -q   # 52 条结构性守卫
+PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 64 条反证
 ```
 
 **验收状态（2026-09-29）：从干净前置状态跑完 15 项全过、`RESULT|ok`** —— 装完
 `claude mcp list` 显示 `cc-computer-use: … - √ Connected`，卸载后注册项被摘掉。
 
-完整说明（含客体环境、十条踩过的坑）见 [`packaging/windows/README.md`](packaging/windows/README.md)。
+### 在客体「交互式会话」里起脚本：两条静默失败（`run-scheduled-task.ps1`）
+
+客体上 `guestcontrol run` 拉起的进程落在**服务会话**（没有真桌面，UIA 根子级恒为 0、
+`PrintWindow` 全黑，且**什么都不报错**）。要跑真实形态，就得经**计划任务**进交互式会话。
+注册一律走 **`packaging/windows/run-scheduled-task.ps1`**（宿主脚本都调它），
+因为 `schtasks /create` 会带出下面两个**静默失败**（2026-10-02 实测，各花掉很久）：
+
+- ★ **电池闸门**：`schtasks /create` 装出来的任务默认 `DisallowStartIfOnBatteries=true`，
+  而该命令行**没有任何开关能改它**。宿主是笔记本且**正在用电池**时，客体随之报
+  `PowerLineStatus=Offline` → 任务被一直挂在**「已排队」**、**永不启动** ——
+  表现只是「结果文件不出现」，与"脚本自己崩了"长得一模一样。改成
+  `Register-ScheduledTask` + `-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries` 即可。
+  ⚠️ 这不是"虚拟机不该报电池"：驱动脚本**不该依赖宿主当前的供电状态**。
+- ★ **可见控制台抢前台**：直接起 `.bat` 会带一个控制台窗口，Task Scheduler
+  （InteractiveToken）**没法抑制它**，于是它成为**用户桌面的前台窗口** ——
+  隔离 story 的「用户的前台窗口没变」会为一件与产品无关的事变红。实测同一份代码连跑两轮：
+  一轮 `'新通知'→'新通知'` 通过，下一轮 `'Program Manager'→'C:\WINDOWS\SYSTEM32\cmd.exe'`
+  失败，而后者正是**我们自己那个批处理的控制台标题**。修法是经 `run-hidden.vbs`
+  （`wscript.exe` 无窗口 + `WScript.Shell.Run(cmd, 0, True)`）起目标。
+
+⚠️ **宿主侧的判据必须是「实际挂上去的设置」**（脚本回显 `TASKREG|…|on_batteries_disallow=False|
+|hidden_launcher=True`），**不能是「任务建出来了」** —— 上面两次静默失败里，
+任务都**建出来了**。守卫：`test_scheduled_task_registration_is_battery_exempt`、
+`test_scheduled_task_launches_the_target_with_a_hidden_window`、
+`test_no_script_registers_tasks_through_schtasks_create`（全仓库不许再出现 `schtasks /create`）、
+`test_host_drivers_register_through_the_shared_helper_and_check_what_it_echoed`。
+`.vbs` 也纳入「客体脚本纯 ASCII」那条纪律（wscript 同样按系统 ANSI 解脚本文件）。
+
+完整说明（含客体环境、十二条踩过的坑）见 [`packaging/windows/README.md`](packaging/windows/README.md)。
 **改这几个脚本前必须知道的七条**：
 
 - **纯 .py 的包不在磁盘上，在内嵌的 `PYZ.pyz` 里**：`mss` / `mcp` / `comtypes` 在
@@ -508,7 +536,7 @@ PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 58 条�
 
 | 文件 | 类别 | 说明 |
 |------|------|------|
-| `test_geometry.py`（9） / `test_refs.py`（8） / `test_serializer.py`（13） / `test_spawn_env.py`（2） / `test_i7_i8_i10.py`（11） / `test_atspi_guards.py`（24） / `test_d_guards.py`（15） / `test_e_guards.py`（22） / `test_f_guards.py`（14） / `test_g_guards.py`（21） / `test_h_guards.py`（8） / **`test_coordinator_hooks.py`（15）** / **`test_inject_layer.py`（21）** / **`test_coordinator_seq.py`（27）** / **`test_landing_evidence.py`（7）** / **`test_ocr_and_text.py`（12）** / **`test_display_lifecycle.py`（20）** / **`test_refs_and_values.py`（8）** / **`test_tools_and_backend.py`（24）** / **`test_ring_and_preview.py`（39）** / **`test_packaging.py`（23）** / `test_screen_layer.py`（14） / `test_session_contract.py`（12） / `test_platform_module_boundary.py`（9） / `test_static_health.py`（5） / `test_windows_driver_guards.py`（32） / `test_windows_nodes_mapping.py`（20） / `test_packaging_windows.py`（45） / `test_capture_scope.py`（13） / `test_global_input_gate.py`（41） | pytest 单测 | 不需要桌面，`conftest.py` 会强制 `CC_CU_DISPLAY_MODE=real` 以免弹 Xephyr。`test_spawn_env.py` 是**结构性防漏**：枚举 `src/` 下每一处 subprocess spawn 点，要求 `env=` 源自 `env_for`/`app_env`；`test_i7_i8_i10.py` 是 review 报告那三条的回归集。**加粗的 8 个**由原 `test_optimizations.py`（2238 行）在 2026-09-18 按被测模块拆分而来，跨文件共享的辅助（`_StubBackend` / `_proc` / `_reset_display`）在 `_helpers.py`。**`test_ring_and_preview.py` 守住点击反馈的四条硬契约**：准星必须用「裁剪后原点」反算（屏边裁剪会改原点，写死半宽 = 越靠边指得越离谱）、准星只画在副本上（原始图要复用给 OCR 与点前后对比）、bytes 绝不进 `ActionResult.data`、`click` 工具返回注解必须是 `Any`（`str` 会让 mcp 生成 outputSchema，带图那次返回列表就 ValidationError）。**`conftest.py` 里那个 autouse 夹具 `isolate_at_spi_bus_env` 不能改成依赖 monkeypatch**：`AtspiReader` 会直接写**进程级** `os.environ`（libatspi 只能从那儿读），而 monkeypatch 的 `delenv` 对「本就不存在的键」**不入账**，记下的反而是用例自己写进去的假地址；autouse 夹具**最先实例化**、收尾回调**最后**执行，才排得进 monkeypatch 的 undo 之后 |
+| `test_geometry.py`（9） / `test_refs.py`（8） / `test_serializer.py`（13） / `test_spawn_env.py`（2） / `test_i7_i8_i10.py`（11） / `test_atspi_guards.py`（24） / `test_d_guards.py`（15） / `test_e_guards.py`（22） / `test_f_guards.py`（14） / `test_g_guards.py`（21） / `test_h_guards.py`（8） / **`test_coordinator_hooks.py`（15）** / **`test_inject_layer.py`（21）** / **`test_coordinator_seq.py`（27）** / **`test_landing_evidence.py`（7）** / **`test_ocr_and_text.py`（12）** / **`test_display_lifecycle.py`（20）** / **`test_refs_and_values.py`（8）** / **`test_tools_and_backend.py`（24）** / **`test_ring_and_preview.py`（39）** / **`test_packaging.py`（23）** / `test_screen_layer.py`（14） / `test_session_contract.py`（12） / `test_platform_module_boundary.py`（9） / `test_static_health.py`（5） / `test_windows_driver_guards.py`（32） / `test_windows_nodes_mapping.py`（20） / `test_packaging_windows.py`（52） / `test_capture_scope.py`（13） / `test_global_input_gate.py`（41） | pytest 单测 | 不需要桌面，`conftest.py` 会强制 `CC_CU_DISPLAY_MODE=real` 以免弹 Xephyr。`test_spawn_env.py` 是**结构性防漏**：枚举 `src/` 下每一处 subprocess spawn 点，要求 `env=` 源自 `env_for`/`app_env`；`test_i7_i8_i10.py` 是 review 报告那三条的回归集。**加粗的 8 个**由原 `test_optimizations.py`（2238 行）在 2026-09-18 按被测模块拆分而来，跨文件共享的辅助（`_StubBackend` / `_proc` / `_reset_display`）在 `_helpers.py`。**`test_ring_and_preview.py` 守住点击反馈的四条硬契约**：准星必须用「裁剪后原点」反算（屏边裁剪会改原点，写死半宽 = 越靠边指得越离谱）、准星只画在副本上（原始图要复用给 OCR 与点前后对比）、bytes 绝不进 `ActionResult.data`、`click` 工具返回注解必须是 `Any`（`str` 会让 mcp 生成 outputSchema，带图那次返回列表就 ValidationError）。**`conftest.py` 里那个 autouse 夹具 `isolate_at_spi_bus_env` 不能改成依赖 monkeypatch**：`AtspiReader` 会直接写**进程级** `os.environ`（libatspi 只能从那儿读），而 monkeypatch 的 `delenv` 对「本就不存在的键」**不入账**，记下的反而是用例自己写进去的假地址；autouse 夹具**最先实例化**、收尾回调**最后**执行，才排得进 monkeypatch 的 undo 之后 |
 | `test_env_isolation.py`（1） | pytest 单测（**起子进程**） | 守「测试之间不留下进程级副作用」：自己起一个 pytest 子进程、挂探针插件在 `pytest_sessionfinish` 打印 `AT_SPI_BUS_ADDRESS` 的真实取值，断言为 `None`。**为什么必须起子进程**：判据是「跑完之后环境是否干净」，而那只在**那个会话收尾时**才观测得到——在会话内断言，观测到的是本会话自己的状态，何况 `conftest.py` 的守卫夹具已把本会话擦干净了（等于在测那把本来就该生效的扫帚） |
 | `test_e2e_zenity.py`（6） | pytest 端到端 | 需 X11 + zenity + Xephyr，需 `CC_CU_E2E=1` opt-in，默认在沙箱内跑。**「等应用上树」一律用 `_wait_app_on_tree()` 轮询，别改回固定 `sleep`**：实测沙箱内 zenity 上树耗时 1.60~2.54 秒，**正好跨过**历史上的 2.5 秒魔数，于是同一份代码会在「全绿」与「全红」之间随机翻转（实现在 2026-09-17 的 I-17 修的）。**收尾同理，用 `_wait_window_gone(title)` 轮询等窗口真的从 X 上消失，不要 `terminate()` 完就走人**：SIGTERM 只是请求进程退出，X 端窗口要等客户端断开才被回收——下一个用例开头读到的「活动窗口」于是还是上一个用例**正在死**的对话框，而它会在随后几秒里消失。实测就是这样把 `test_ring_visible_has_hole_and_autoclears` 的「画圈不改变活动窗口」打成偶发红（`assert 'E2EPreview' == None`，3 轮里红 2 轮）；根因不在光圈，在收尾提前离场 |
 | `manual_*.py`（15 个） | **手动 story**（不进 pytest） | 用 MCP stdio 客户端驱动**真实 server/冻结产物**，跑完整任务链路，退出码 0 = 全过 |
@@ -532,7 +560,7 @@ PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 58 条�
 - `manual_windows_directed_probe.py`（32 条判据）—— **定向注入**：UIA 元素级、定向键盘、
   定向鼠标（四种技法）、PrintWindow 黑图率。结论：元素级与定向键盘不打扰且可用；
   **定向鼠标全失效**（对话框与主窗口上分别测过）。
-- `manual_windows_isolated_story.py`（26 条判据）—— **应用起在隔离桌面上**：判据是
+- `manual_windows_isolated_story.py`（23 条判据，带 `--prime-uia` 时 24 条）—— **应用起在隔离桌面上**：判据是
   **同一进程里的两次枚举**（用户桌面的 `EnumWindows` 看不到它、目标桌面看得到它），
   外加「用户桌面窗口数不变 / 前台不变 / 指针不动」与「起了之后照样读树、截图、
   元素级 Invoke」。4c 节逐个验**八个会动用户键鼠的入口全部被拒绝**，并断言
@@ -554,11 +582,23 @@ PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 58 条�
   脚本放共享盘 vs 客体本地盘、空闲 90s、story 式起杀进程 90s（到了 18s，变慢但没卡死）、
   单独设 DPI V2（2.76s）、把首次碰 UIA 提到 4b/2/3 之前（`--tree-early`，**仍然卡**）。
   卡点已钉死：`ControlFromHandle` 里**本进程第一次碰 UIA** 的 `CoCreateInstance`。
-  **尚未查明为什么**；一条 n=1 的线索是 `--prime-uia`（先用 `GetRootControl()` 建单例）
-  那轮跑通了 —— **要 plain/prime 交替重复 2~3 轮才算数，别当结论用**。
-  再遇到卡死先看看门狗打出的栈，卡点仍在我们自己的行上才需要往下查。
-- `manual_windows_guards_reverse.py`（58 条反证）—— 给守卫做**反证**（把坏东西种进源码，
-  断言守卫真的变红；宿主即可跑）。三种手法：`packaging/` 源码替换 36 条、**`src/` 源码替换
+  **尚未查明为什么**。
+  ⚠️ **2026-10-02 的 A/B 重复实验（`tests/run_iso_ab.bat`，2 plain + 2 prime）收窄了上面这句**：
+  卡点**不止一处**，而且**两处在 import 期**（模块级 `platform.system()` 的 WMI/COM 查询、
+  `typing_extensions` 的导入），都**早于** `CoCreateInstance`。四轮里 prime2 那轮**是废的**
+  （改 `src/` 改了一半，`NameError: name 'sys' is not defined`）——别把它当成论据。
+  ★ **由此推出：`--prime-uia` 那个问题至今没有答案** —— 四轮里**没有任何一轮真正跑到预热那一步**
+  （两轮卡在 import、一轮是自己弄坏的），所以那条 n=1 线索既没被证实也没被推翻。
+  唯一由这条调查推出的产品改动是**平台判定改用 `sys.platform`**（`core/session.py` +
+  `backend/base.py`）：`platform.system()` 在 Windows 上是一次 WMI 查询，全新进程实测
+  **3.0~4.0 秒**，而它在**模块级**（每个 import 到 `core.session` 的进程都要付，含 MCP server 冷启动）。
+  再遇到卡死先看看门狗打出的栈，卡点仍在我们自己的行上才需要往下查
+  （四轮四次卡死里，三次卡在**库代码**、一次是我们自己的半截编辑，**没有一次卡在业务逻辑上**）。
+- `run_iso_ab.bat`（实验脚手架，2 plain + 2 prime 交替）—— 为「`--prime-uia` 是否真的
+  消除首次 UIA 卡死」而做的重复实验。**结果见上一条：问题仍未答，问题本身被证伪了一半**
+  （卡点在 import 期就已经发生过）。跑法：`tests/run_windows_probe.sh "tests\\run_iso_ab.bat" ...`。
+- `manual_windows_guards_reverse.py`（64 条反证）—— 给守卫做**反证**（把坏东西种进源码，
+  断言守卫真的变红；宿主即可跑）。三种手法：`packaging/` 源码替换 42 条、**`src/` 源码替换
   4 条**（为「默认不碰用户键鼠」那批**顺序判据**新加的机制，挂载点是 `GG._TEST_SRC`）、
   运行期破坏 18 条。理由与守卫计数见「Windows 分发」一节与
   [`packaging/windows/README.md`](packaging/windows/README.md)：**"守卫坏了"与"代码没问题"
