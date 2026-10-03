@@ -10,6 +10,21 @@ REM is the whole point of phase B -- if an earlier phase warms it up, B measures
 REM nothing. See the .py module docstring.
 REM
 REM Exit codes: 0 = all phases ran (this probe asserts nothing, it only measures).
+REM
+REM OUTCOME OF THE 2026-10-03 RUN (five fresh processes):
+REM   A      clean room                  first UIA 4.69s
+REM   B0     story order                 first ControlFromHandle 2.86s
+REM   B-idle 90s idle first              first ControlFromHandle 1.68s
+REM   B-work 90s churn first             VOID -- no window appeared, so the UIA
+REM                                      call never ran (it printed a fake 0.38s;
+REM                                      fixed by polling for the window now)
+REM   D1     clean room + DPI V2 first   HUNG, and the whole guest then froze
+REM Two readings, opposite directions:
+REM   * process age is NOT the variable (idle-first was FASTER than not-idling)
+REM   * a hang happened in a CLEAN ROOM too, but n=1 -- the same D1 measured 2.76s
+REM     on 2026-09-30, so do NOT conclude "DPI V2 is the cause".
+REM The hang froze the ENTIRE guest: identical screenshots across 3 minutes and
+REM guestcontrol could not even start a session. Restart the guest first.
 REM ============================================================================
 
 set PY=C:\Users\lf\py312\python.exe

@@ -69,6 +69,37 @@ story 要先跑完会话检查、用户桌面基线、三组启动对照、launc
 ⚠️ 别把这条结论读成"以后再卡就别查了"：**再卡时先看栈**（story 现在有看门狗，
 会直接告诉你卡在哪一次调用）。若哪天卡点变到**我们自己写的**那些行上，那就是另一回事了。
 
+═══ ⚠️ 2026-10-03 更新：五阶段整批跑了一次，**卡在 D1（干净房间 + DPI V2）** ═══
+
+`tests/run_uia_init_probe.bat` 五个全新进程，**前四个都跑完了**：
+
+    A      干净房间                      首次 UIA **4.69s**（本机历史上 2.52s）
+    B0     story 同序（无预热）           首次 ControlFromHandle **2.86s**
+    B-idle 先空转 90s                    首次 ControlFromHandle **1.68s**
+    B-work 先起杀进程 90s                 ❌ **本轮作废**（见下，`no-window`）
+    D1     干净房间 + 先设 DPI V2         **卡住** —— 直到客体整个冻死
+
+★ 两条结论，方向相反，都要记住：
+
+1. **"进程活了多久"不是那个变量**：B-idle（空转 90s）1.68s，比不空转的 B0（2.86s）
+   还快。原 docstring 那条"从进程存活时间入手"的线索**至此可以划掉**。
+2. **卡点在"干净房间"里也出现过** —— D1 除了 `SetProcessDpiAwarenessContext` 什么都没干。
+   这**不能推出"是 DPI V2 的锅"**：同一个 D1 在 2026-09-30 量到的是 **2.76s**，
+   而这次整个客体随后完全冻死（见下）。**n=1，不写结论。**
+
+⚠️ **B-work 那一轮是"没测到却看着像测过"**（已修）：它打出的
+`RESULT|B.ControlFromHandle(hidden)|ok|0.38s|no-window` —— **0.38 秒这个数字是假的**，
+`enumerate_target()` 当时返回 0，所以 `ControlFromHandle` 那一步**根本没执行**。
+固定 `sleep(1.5)` 在慢机器上等不到窗口映射。现在改成**轮询等窗口 + 等不到就抛错**，
+不再让"没测"伪装成"很快"。
+
+⚠️ **卡死那次是"整台客体冻死"，不是我们的进程单独卡**（这是本轮最有用的运维事实）：
+屏幕连续 3 分钟**逐字节相同**（`VBoxManage controlvm screenshotpng` 两次产物大小完全一样），
+`VBoxManage guestcontrol run` 连**会话都起不来**（`Error starting guest session
+(current status is: starting)`），探针的 `faulthandler` 连栈都写不出来（Z: 上的结果文件
+停在卡死前那一行、mtime 不再变）。**判据是这三条一起出现**，任一命中就先去重启客体，
+别再从代码里找答案。
+
 跑法（客体上，交互式会话内；宿主侧用 `tests/run_windows_probe.sh` 驱动）：
     python tests\\manual_windows_uia_init_probe.py --only a
     python tests\\manual_windows_uia_init_probe.py --only b
@@ -142,6 +173,23 @@ def phase_a() -> None:
     timed("A.uia_init+root", _uia_root)
 
 
+def _wait_rows(desktop, timeout: float):  # noqa: ANN001, ANN202
+    """
+    轮询等目标桌面上出现窗口，返回那次枚举结果（可能为空 ⇒ 调用方**必须**当失败处理）。
+
+    为什么不是固定 sleep：本客体会周期性整体变慢，`spawn` 返回 pid 只说明进程起来了，
+    **窗口映射到桌面**还要更久。固定 1.5s 在慢的时候会等不到（实测踩到过）。
+    """
+    deadline = time.time() + timeout
+    rows = []
+    while time.time() < deadline:
+        rows = desktop.enumerate_target()
+        if rows:
+            return rows
+        time.sleep(0.5)
+    return rows
+
+
 def phase_b() -> None:
     """
     与 story **同序**：建隐藏桌面 → 在它上面起应用 → **本进程的首次 UIA 调用**
@@ -161,14 +209,22 @@ def phase_b() -> None:
 
     timed("B.ensure_isolated", lambda: desktop.ensure_isolated().get("name"))
     timed("B.spawn_winver", lambda: desktop.spawn(["winver.exe"], dict(os.environ)).get("pid"))
-    time.sleep(1.5)
-    timed("B.enumerate_target", lambda: len(desktop.enumerate_target()))
+    # ⚠️ **必须轮询等窗口出现，不能固定 sleep 一个魔数**：2026-10-02 的实测里
+    #    `--work-before 90` 那一轮的 `enumerate_target` 返回了 **0**，于是核心那条
+    #    `ControlFromHandle` 走的是 "no-window" 分支、**根本没碰 UIA** —— 而它照样
+    #    打出一行 `RESULT|…|ok|0.38s|no-window`。**0.38s 看着像一个测出来的数字**，
+    #    其实什么都没测到。这正是本仓库最忌讳的那种判据：**通过与否取决于被测对象
+    #    坏没坏**（这里更糟，是"没测"伪装成"很快"）。
+    #    所以：等窗口 + 等不到就**报错**，绝不返回一个像测量结果的数。
+    rows = _wait_rows(desktop, 20.0)
+    timed("B.enumerate_target", lambda: len(rows))
 
     def _first_uia_on_hidden():  # noqa: ANN202
-        import uiautomation
-        rows = desktop.enumerate_target()
         if not rows:
-            return "no-window"
+            raise RuntimeError(
+                f"隐藏桌面上等 {20.0:.0f}s 也没等到窗口 —— 本条**没测到任何东西**，"
+                f"不要把它读成「很快」")
+        import uiautomation
         return type(uiautomation.ControlFromHandle(int(rows[0]))).__name__
     # ★ 这一条是**整个探针的核心**：它慢就说明我们的调用序列有问题。
     timed("B.ControlFromHandle(hidden)：含惰性单例初始化", _first_uia_on_hidden)
