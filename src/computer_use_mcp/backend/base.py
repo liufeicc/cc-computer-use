@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-import platform
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -680,19 +680,23 @@ def get_backend() -> Backend:
       - Windows → WindowsBackend（UIA + SendInput）。
       - 其它平台 → 抛 BackendUnavailableError。
 
-    ⚠️ 这是全仓**仅有的两个**允许出现 `platform.system()` 的地方之一
+    ⚠️ 这是全仓**仅有的两个**允许做平台判定的地方之一
     （另一个是 `core/session.py`）—— 「平台分支在哪」必须只有一个答案，
     否则又要靠 grep 去找散落的 `if platform`。由
     `tests/test_platform_module_boundary.py` 兜住。
+
+    ⚠️ 用 `sys.platform` 而**不是** `platform.system()`：后者在 Windows 上是一次
+    **WMI（COM）查询**，本客体实测 3~4 秒起步、还偶发阻塞数分钟（详见
+    `core/session.py` 里那段注释）。
     """
     from ..utils.errors import BackendUnavailableError
 
-    system = platform.system().lower()
-    if system == "linux":
+    system = sys.platform
+    if system.startswith("linux"):
         from .linux.backend import LinuxBackend
 
         return LinuxBackend()
-    if system == "windows":
+    if system == "win32":
         from .windows.backend import WindowsBackend
 
         return WindowsBackend()

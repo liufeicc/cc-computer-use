@@ -34,7 +34,7 @@ Linux（Xephyr 那套，**同一个对象**，见下）、Windows（隐藏桌面
 
 from __future__ import annotations
 
-import platform
+import sys
 from typing import Any
 
 from .session_types import (  # noqa: F401  —— 再导出，调用方一律 `from .. import session`
@@ -51,11 +51,19 @@ from .session_types import (  # noqa: F401  —— 再导出，调用方一律 `
 )
 from ..utils.errors import GlobalInputRefusedError
 
-# 平台判定：全仓**只有本文件与 backend/base.py** 允许出现 `platform.system()`。
+# 平台判定：全仓**只有本文件与 backend/base.py** 允许做平台分支。
 # 其它模块（含 `_bootstrap.py`）要判断平台，一律消费本常量——这样「平台分支在哪」
 # 永远只有一个答案，而不是靠 grep 去找散落的 `if platform`。
-IS_LINUX = platform.system().lower() == "linux"
-IS_WINDOWS = platform.system().lower() == "windows"
+#
+# ⚠️ 用 `sys.platform`（编译期常量）而**不是** `platform.system()` —— 后者在 Windows 上
+# 是一次 **WMI 查询**（`platform.py::_get_machine_win32` → `_wmi_query` → `_wmi.pyd` 的 COM 调用）。
+# 实测（2026-10-02，本客体，Python 3.12.10）：全新进程里它要 **3.0~4.0 秒**；更糟的是
+# 真机 story 里栈直接停在这一行**超过 90 秒**（看门狗打出来的）——与 UIA 那次
+# `CoCreateInstance` 是同一种「本进程首次 COM 激活偶发阻塞数分钟」的客体病态。
+# 而这两行是**模块级**语句：每一个 import 到 `core.session` 的进程都要先付这笔钱，
+# MCP server 冷启动也不例外。`sys.platform` 不可能阻塞，且对本项目要回答的问题完全等价。
+IS_LINUX = sys.platform.startswith("linux")
+IS_WINDOWS = sys.platform == "win32"
 
 
 def _stripped_env() -> dict[str, str]:
