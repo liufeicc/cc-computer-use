@@ -581,8 +581,8 @@ PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 64 条�
   「隐藏桌面 + 起应用 + 首次挂树」这一串本身不慢。真正被排除的是下面这些**逐条对照**：
   脚本放共享盘 vs 客体本地盘、空闲 90s、story 式起杀进程 90s（到了 18s，变慢但没卡死）、
   单独设 DPI V2（2.76s）、把首次碰 UIA 提到 4b/2/3 之前（`--tree-early`，**仍然卡**）。
-  卡点已钉死：`ControlFromHandle` 里**本进程第一次碰 UIA** 的 `CoCreateInstance`。
-  **尚未查明为什么**。
+  当时以为卡点钉死在 `ControlFromHandle` 里**本进程第一次碰 UIA** 的 `CoCreateInstance`，
+  **但 2026-10-03 的重跑把这条也推翻了**（见下：同一客体重启后 D1 只要 1.23s）。
   ⚠️ **2026-10-02 的 A/B 重复实验（`tests/run_iso_ab.bat`，2 plain + 2 prime）收窄了上面这句**：
   卡点**不止一处**，而且**两处在 import 期**（模块级 `platform.system()` 的 WMI/COM 查询、
   `typing_extensions` 的导入），都**早于** `CoCreateInstance`。四轮里 prime2 那轮**是废的**
@@ -594,9 +594,32 @@ PYTHONNOUSERSITE=1 "$PY" tests/manual_windows_guards_reverse.py        # 64 条�
   **3.0~4.0 秒**，而它在**模块级**（每个 import 到 `core.session` 的进程都要付，含 MCP server 冷启动）。
   再遇到卡死先看看门狗打出的栈，卡点仍在我们自己的行上才需要往下查
   （四轮四次卡死里，三次卡在**库代码**、一次是我们自己的半截编辑，**没有一次卡在业务逻辑上**）。
+  ⚠️ **2026-10-03 客体重启后两个探针原样重跑，都全绿** —— 这一轮把上面几条线索**收口**了：
+  · 探针五阶段 `EXITCODE=0`：A 3.01s、B0 1.24s、B-idle 0.99s、**D1（+DPI V2）1.23s**。
+    上一轮 D1 卡住并**随后整台客体冻死**，同一个单变量这次 1.23s（2026-09-30 是 2.76s）
+    → **DPI V2 无罪**，"卡点在干净房间也会出现"那条也不该当线索（那次是客体在垮）。
+  · `run_iso_ab.bat` 四轮**全过、无卡死**（plain 25.6/14.6s 23/23，prime 17.7/14.6s 24/24）。
+    **prime 那个问题仍然没答** —— 不是预热无效，是**这次没有卡死可供它预防**。
+  · ★ 由此立住了那个一直缺的**基线**：**健康客体上整个 story 只要 15~26 秒**，首次 UIA
+    调用紧跟 `4b` 的 spawn 对照与 `launch_app`。所以原文档"story 要先跑 90 秒以上、
+    `4c~4e` 在读树之前"是**记错的**（`4c~4e` 在读树**之后**），据此推出的
+    "从进程存活时间入手"那条线索**作废**（B-idle 比不加预热还快）。**换一台健康的客体、
+    或者先重启，这个故事就是二十来秒的事**；`--prime-uia` 保持排查开关、别写进正常验收。
+  ⚠️ **别在客体正跑一个 .bat 的时候改那个 .bat**（2026-10-03 踩到）：cmd.exe 是**按字节
+  偏移增量读**批处理文件的，改了长度就会错行 —— 那轮结论只能作废、重跑一遍。
+  本仓库的 .bat 都在 `Z:` 共享盘上、宿主随时可改，所以这条尤其容易踩。
+  ⚠️ **B-work 那条 `taskkill /F /IM winver.exe` 竞态**：它跑在 `_fire_and_forget` 的守护
+  线程里、按**镜像名**杀，可能在 `_work` 返回后才落地，于是把 `phase_b()` 刚起的 winver
+  **一起杀掉** → 窗口永不出现 → 核心判据**连续两轮测不到数**。已改成收尾 join 那些线程，
+  **但这条修法至今没在真机验过**（修完那轮被外部中断在 B-idle，而 B-work 是唯一验证点）。
+  下次跑先看 B-work 那行：仍是 `ERR … 没测到` 就说明没修住，去找是不是**别的**东西在杀 winver。
 - `run_iso_ab.bat`（实验脚手架，2 plain + 2 prime 交替）—— 为「`--prime-uia` 是否真的
-  消除首次 UIA 卡死」而做的重复实验。**结果见上一条：问题仍未答，问题本身被证伪了一半**
-  （卡点在 import 期就已经发生过）。跑法：`tests/run_windows_probe.sh "tests\\run_iso_ab.bat" ...`。
+  消除首次 UIA 卡死」而做的重复实验。**结果：问题仍未答**（2026-10-02 四轮里没有一轮跑到
+  预热那一步；2026-10-03 重跑四轮全过、无卡死可测）。跑法：
+  `tests/run_windows_probe.sh "tests\\run_iso_ab.bat" "docs/PR/windows-driver/results/_iso_ab_console.log"`。
+  ⚠️ **它必须把进度镜像到 `%LOG%`**（`_iso_ab_console.log`）：宿主驱动只认它被指派的那个
+  日志文件里的 `=== DONE ===`，而进度本来只写在客体本地盘的 `C:\ccu_runs\ab.txt` ——
+  没有镜像时宿主会白等满超时，然后对一次**其实已经跑完**的运行报假失败。
 - `manual_windows_guards_reverse.py`（64 条反证）—— 给守卫做**反证**（把坏东西种进源码，
   断言守卫真的变红；宿主即可跑）。三种手法：`packaging/` 源码替换 42 条、**`src/` 源码替换
   4 条**（为「默认不碰用户键鼠」那批**顺序判据**新加的机制，挂载点是 `GG._TEST_SRC`）、

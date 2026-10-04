@@ -20,6 +20,22 @@ REM     prime2  INVALID -- a half-applied edit of src/ broke that one run
 REM   So do not read a "prime failed again" out of this. Re-run it on a day when
 REM   the guest is behaving, and record the hang points again; they move.
 REM
+REM OUTCOME OF THE 2026-10-03 RE-RUN (after the guest was hard-restarted):
+REM   ALL FOUR ROUNDS PASSED, none hung, EXITCODE=0. 23/23 checks plain, 24/24
+REM   primed (--prime-uia adds one check of its own).
+REM     plain1  25.6s     prime1  17.7s     plain2  14.6s     prime2  14.6s
+REM   * So this did NOT answer the --prime-uia question either -- there was no
+REM     hang for priming to prevent. What it DID establish is the baseline that
+REM     was missing: a HEALTHY guest runs the whole story in 15-26 seconds, and
+REM     the first UIA touch sits right after the 4b spawn comparisons and
+REM     launch_app -- there is no 90-second prelude (that figure was wrong, and
+REM     the "process age" lead it fed is dead: the probe's 90s-idle-first run is
+REM     FASTER than the not-idling one).
+REM   * Together with the probe's round 2 (DPI V2: 1.23s, after round 1 hung on
+REM     it and then froze the entire guest), the honest reading is: the 2026-10-02
+REM     hang wave was the GUEST being sick, not the call sequence. Re-run on a
+REM     healthy guest and the story is a ~20-second affair.
+REM
 REM Each run gets its OWN directory (plain1/prime1/plain2/prime2) because the story
 REM writes its trace as `_isolated_story_trace.log` NEXT TO --out -- a fixed name.
 REM Sharing one directory would make each run overwrite the previous run's trace,
@@ -33,6 +49,15 @@ REM
 REM Straight-line only: no CALL subroutines, no IF blocks. An earlier version used
 REM them and produced no output at all, which cost a full wait cycle.
 REM
+REM WHY %LOG% EXISTS (2026-10-03): run_windows_probe.sh watches the log file it was
+REM given and only stops when it sees `=== DONE ===` in it. The progress lines live
+REM in C:\ccu_runs\ab.txt (guest-local on purpose -- the per-run console logs are big
+REM and writing them to Z: would perturb the timings the story measures). Without a
+REM mirror on the shared folder the host driver waited the full timeout and then
+REM reported a false failure for a run that had actually finished. So after every
+REM stage we copy ab.txt over to %LOG%; that also means a hang still leaves the
+REM last completed stage visible from the host.
+REM
 REM ASCII only (cmd.exe reads .bat in the system ANSI codepage).
 REM ============================================================================
 
@@ -41,6 +66,7 @@ set REPO=Z:\cc-computer-use
 set T=%REPO%\tests\manual_windows_isolated_story.py
 set L=C:\ccu_runs
 set D=%REPO%\docs\PR\windows-driver\results
+set LOG=%D%\_iso_ab_console.log
 
 if not exist "%L%" mkdir "%L%"
 if not exist "%L%\plain1" mkdir "%L%\plain1"
@@ -53,26 +79,34 @@ set RC=0
 
 echo === RUN %DATE% %TIME% === > "%L%\ab.txt"
 "%PY%" -c "import sys;print(sys.version);print(sys.executable)" >> "%L%\ab.txt" 2>&1
+copy /Y "%L%\ab.txt" "%LOG%" > NUL 2>&1
 
 echo %TIME% plain1-start >> "%L%\ab.txt"
+copy /Y "%L%\ab.txt" "%LOG%" > NUL 2>&1
 taskkill /F /IM winver.exe > NUL 2>&1
 "%PY%" "%T%" --out "%L%\plain1\result.json" > "%L%\plain1\console.log" 2>&1
 echo %TIME% plain1-exit=%errorlevel% >> "%L%\ab.txt"
 set /a RC=RC+%errorlevel%
+copy /Y "%L%\ab.txt" "%LOG%" > NUL 2>&1
 
 echo %TIME% prime1-start >> "%L%\ab.txt"
+copy /Y "%L%\ab.txt" "%LOG%" > NUL 2>&1
 taskkill /F /IM winver.exe > NUL 2>&1
 "%PY%" "%T%" --prime-uia --out "%L%\prime1\result.json" > "%L%\prime1\console.log" 2>&1
 echo %TIME% prime1-exit=%errorlevel% >> "%L%\ab.txt"
 set /a RC=RC+%errorlevel%
+copy /Y "%L%\ab.txt" "%LOG%" > NUL 2>&1
 
 echo %TIME% plain2-start >> "%L%\ab.txt"
+copy /Y "%L%\ab.txt" "%LOG%" > NUL 2>&1
 taskkill /F /IM winver.exe > NUL 2>&1
 "%PY%" "%T%" --out "%L%\plain2\result.json" > "%L%\plain2\console.log" 2>&1
 echo %TIME% plain2-exit=%errorlevel% >> "%L%\ab.txt"
 set /a RC=RC+%errorlevel%
+copy /Y "%L%\ab.txt" "%LOG%" > NUL 2>&1
 
 echo %TIME% prime2-start >> "%L%\ab.txt"
+copy /Y "%L%\ab.txt" "%LOG%" > NUL 2>&1
 taskkill /F /IM winver.exe > NUL 2>&1
 "%PY%" "%T%" --prime-uia --out "%L%\prime2\result.json" > "%L%\prime2\console.log" 2>&1
 echo %TIME% prime2-exit=%errorlevel% >> "%L%\ab.txt"
@@ -85,4 +119,5 @@ echo === DONE === >> "%L%\ab.txt"
 REM The small verdict file goes first so the host's poll can stop here; the bulk
 REM copy of per-run logs is best-effort and must not gate the verdict.
 copy /Y "%L%\ab.txt" "%D%\_iso_ab_result.txt" > NUL 2>&1
+copy /Y "%L%\ab.txt" "%LOG%" > NUL 2>&1
 xcopy /E /I /Y "%L%" "%D%\_iso_ab" > NUL 2>&1

@@ -44,12 +44,21 @@
 要复现得等它自己再犯，不能靠改代码去"修"。
 
 ⚠️ **一条诚实的保留**：探针这 3 个全新进程**一次都没卡过**，而 story 在同一时间段里
-卡了 ~50%。「同样的调用序列」是**逐条**相同的，但不是**逐环境**相同的 —— 最大的结构性
-差异是**首次碰 UIA 之前进程已经跑了多久**：探针 B 是进程起来 ~2 秒就碰，
-story 要先跑完会话检查、用户桌面基线、三组启动对照、launch_app、4c~4e 那一整段（90 秒以上）。
-**若哪天有人要继续查**，就从这里入手（把探针 B 改成"先空转 90 秒再碰 UIA"，
-或把 story 的 4c~4e 整段挪到读树之后），而不是从头再查一遍。
-在没有那个实验之前，**不要**声称"已排除调用序列"以外的更多结论。
+卡了 ~50%。「同样的调用序列」是**逐条**相同的，但不是**逐环境**相同的 —— 当时判断最大的
+结构性差异是**首次碰 UIA 之前进程已经跑了多久**，于是设计了 B-idle（`--idle-before 90`）。
+
+⚠️⚠️ **2026-10-03 更正：这条线索本身建立在两个错误前提上，已划掉**：
+
+1. **B-idle 实测 0.99~1.68s，比不加预热的 B0（1.24~2.86s）还快** —— "进程活了多久"
+   **不是**那个变量。
+2. **那个"90 秒"是记错的**：健康的客体上整个 story 从头跑到尾只要 **15~26 秒**
+   （`run_iso_ab.bat` 四轮实测 25.6 / 17.7 / 14.6 / 14.6s），而 story 的第一处 UIA 调用
+   就在 `4b` 那三组 spawn 对照与 `launch_app` 之后 —— **它前面根本没有 90 秒的活**。
+   原文那句"4c~4e 那一整段排在读树之前"也是反的：`4c~4e` 在读树**之后**。
+
+所以那条"从进程存活时间入手"的建议**不要照做**（照做只是白跑 90 秒）。真要继续查，
+先看看门狗打出的栈 —— 这台机器上的卡点会移动，而且已经观测到**整台客体冻死**
+（见下文 2026-10-03 那节），那已经不是产品代码层面的事了。
 
 ═══ ⚠️ 2026-10-02 更新：上面这条"调用序列没问题"**被后续实测收窄了** ═══
 
@@ -99,6 +108,49 @@ story 要先跑完会话检查、用户桌面基线、三组启动对照、launc
 (current status is: starting)`），探针的 `faulthandler` 连栈都写不出来（Z: 上的结果文件
 停在卡死前那一行、mtime 不再变）。**判据是这三条一起出现**，任一命中就先去重启客体，
 别再从代码里找答案。
+
+═══ ★ 2026-10-03 重启客体后重跑：**五个阶段全绿，D1 只有 1.23s** ═══
+
+客体硬重启（`Boot=10/3 10:41:30`）后原样重跑同一个 `run_uia_init_probe.bat`，
+`EXITCODE=0`（宿主侧 `✅ 探针全过`）：
+
+    阶段               冻死那轮        重启后这轮
+    A   干净房间        4.69s          3.01s
+    B0  story 同序      2.86s          1.24s
+    B-idle 空转 90s     1.68s          0.99s
+    B-work 起杀 90s     ❌ 假数字       ❌ 又是 0 窗口（**但不是同一回事**，见下）
+    D1  + DPI V2        **卡住→冻死**  **1.23s** ✅
+
+**由这轮可以划掉的线索（都不再需要查了）**：
+
+- ★ **DPI V2 无罪**：同一个单变量 D1，冻死那轮"卡住"，这轮 1.23s，2026-09-30 是 2.76s
+  （**两次快、一次卡，且卡的那次客体随后整个冻死**）。原来的"卡点在干净房间里也出现过"
+  这条**至此只能读成"那次客体本来就在垮"**，与 `SetProcessDpiAwarenessContext` 无关。
+- **"干净房间 A 也慢"这条同理**：A 从 4.69s 回到 3.01s，与历史 2.52s 同量级。
+- **B0 / B-idle 两轮都稳**（1.24s / 0.99s），第一次碰 UIA 那一下在健康客体上是**秒级**。
+
+★ **由此得到本轮唯一一条有工程价值的判断**：`--prime-uia` 想预热的那一步
+（首次 UIA 调用）**本身就是快的** —— 它快不是因为预热过，而是因为它本来就是 1 秒级。
+所以"预热"能挡住的只有**长尾**，而那类长尾已经在别处被观测成**整台客体变慢/冻死**
+（连 `typing_extensions` 的裸 import 都卡过）。**判据落在环境上，改产品代码改不动它。**
+
+⚠️ **B-work 这轮又没测到 —— 但这次不是"环境没给窗口"，是探针自己的竞态**（已修）：
+`_work` 里那条 `taskkill /F /IM winver.exe` 是**按镜像名**杀的，它挂在守护线程里、
+可能在 `_work` 返回后才真正执行 —— 于是把 `phase_b()` 刚起的 winver **一起杀了**，
+窗口永远不出现，核心那条判据**连续两轮都测不到数**。
+修法：`_fire_and_forget` 返回线程对象，`_work` 收尾时把它们 join 掉。
+（"churn 期间不 join"那个形状是刻意复刻 story 的，保留；只清在飞的。）
+
+🔴 **这条修法至今没在真机上验过**（2026-10-03 诚实记录）：修完再跑的那一轮
+只走到 B-idle 就被外部中断（客体随后关机），而那唯一的验证点是 **B-work**
+（`--only b --work-before 90`）—— 它排在 B-idle 之后，**根本没轮到**。
+所以"join 之后 B-work 就能测到数"目前**只是推断**。下次跑这个 .bat 时**先看 B-work 那行**：
+仍出现 `ERR … 没测到任何东西` 就说明 join 没修住，要去查是不是**别的**东西在杀 winver。
+（顺带记下那一轮中断前拿到的两个数：**A 2.30s、B0 0.34s** —— B0 是目前最快的一次，
+与"首次碰 UIA 在健康客体上是亚秒级"一致；但那一批**没跑完**，不能当一整个对照轮用。）
+
+⚠️ 本次修正了上一版文档里一句会被误读的话（原文把 D1 的卡住与"卡点在干净房间也会出现"
+并列当成一条线索）：那**不是**线索，那是客体在垮。
 
 跑法（客体上，交互式会话内；宿主侧用 `tests/run_windows_probe.sh` 驱动）：
     python tests\\manual_windows_uia_init_probe.py --only a
@@ -252,12 +304,23 @@ def _work(seconds: float) -> None:
     """
     做**与 story 同类**的事 ~N 秒（起/杀应用、枚举窗口），但**不碰 UIA**。
 
-    这是在复制 story 与探针之间**唯一的、成规模的结构性差异**：story 在首次碰 UIA 之前
-    已经跑了 90 秒以上的活（会话检查 → 桌面基线 → 三组启动对照 → launch_app → 4c~4e），
-    而探针 B 是进程起来 ~2 秒就碰。
+    原本是为复制 story 与探针之间**唯一的、成规模的结构性差异**：当时以为"story 在首次碰
+    UIA 之前已经跑了 90 秒以上的活"，而探针 B 是进程起来 ~2 秒就碰。
+
+    ⚠️ **那个前提是错的（2026-10-03 更正）**：整个 story 跑完只要 **15~26 秒**，
+    首次 UIA 调用就在 `4b` 的 spawn 对照与 `launch_app` 之后 —— 前面没有 90 秒的活。
+    加上 B-idle 实测比 B0 还快，"进程跑了多久"这条线索**已被划掉**（见模块 docstring）。
+    所以本阶段现在只作为**一个已跑过的对照留档**，`--work-before` 不是需要复现的用法。
 
     ⚠️ 刻意**复刻 story 那个 `_timed()` 的"可抛弃守护线程"形状**（超时不 join、线程留着
-    跑完）：那是进程内累积的状态，也正是"进程跑了多久"这个变量里最难用 sleep 模拟的部分。
+    跑完）：那是进程内累积的状态，也是"进程跑了多久"这个变量里最难用 sleep 模拟的部分。
+
+    ⚠️⚠️ **但收尾时必须把这些线程 join 掉**（2026-10-03 实测踩到）：
+    循环里那条 `taskkill /F /IM winver.exe` 是**按镜像名**杀的 —— 它若还挂在半路，
+    就会把随后 `phase_b()` 刚起的那扇 winver **一起杀掉**，窗口永远不出现，
+    于是 `B.ControlFromHandle` 那条核心判据**永远测不到数**（实测连续两轮都是
+    `enumerate_target → 0`）。这不是环境问题，是**探针自己的竞态**。
+    形状（churn 期间不 join）保留，只在返回前把在飞的清干净。
     """
     say(f"--- 预热 B：做 story 同类的活 ~{seconds:.0f}s（不碰 UIA）---")
     from computer_use_mcp.backend.windows.driver import desktop
@@ -265,25 +328,35 @@ def _work(seconds: float) -> None:
     desktop.ensure_isolated()
     t0 = time.time()
     rounds = 0
+    fliers: list[threading.Thread] = []
     while time.time() - t0 < seconds:
         rounds += 1
-        _fire_and_forget(lambda: subprocess.Popen(["winver.exe"]))  # noqa: S603
+        fliers.append(_fire_and_forget(lambda: subprocess.Popen(["winver.exe"])))  # noqa: S603
         time.sleep(0.4)
-        _fire_and_forget(lambda: subprocess.run(  # noqa: S603,S607
+        fliers.append(_fire_and_forget(lambda: subprocess.run(  # noqa: S603,S607
             ["taskkill", "/F", "/IM", "winver.exe"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False))
-        _fire_and_forget(lambda: len(desktop.enumerate_target()))
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)))
+        fliers.append(_fire_and_forget(lambda: len(desktop.enumerate_target())))
     say(f"预热 B 结束：{rounds} 轮，threads={threading.active_count()}")
 
+    # 等在飞的线程全部落地 —— 特别是最后那条 taskkill，它必须在 phase_b 起应用**之前**跑完。
+    for th in fliers:
+        th.join(timeout=30.0)
+    say(f"预热 B 收尾：{len(fliers)} 个线程已 join，threads={threading.active_count()}")
 
-def _fire_and_forget(fn) -> None:  # noqa: ANN001
+
+def _fire_and_forget(fn) -> threading.Thread:  # noqa: ANN001
     """
     在**守护线程**里跑 `fn` 且**不等它** —— 复刻 story 里 `_timed()` 超时后的形状。
 
     ⚠️ 用 `daemon=True` 是为了不给进程退出添麻烦，但这**不能**让"线程还在跑"这件事消失：
     它照样在执行里，照样可能持着锁/句柄。这正是我们要不要证伪的东西。
+
+    返回线程对象，让调用方能在**该收尾的时候**收尾（见 `_work` 末尾为什么必须 join）。
     """
-    threading.Thread(target=lambda: _swallow(fn), daemon=True).start()
+    th = threading.Thread(target=lambda: _swallow(fn), daemon=True)
+    th.start()
+    return th
 
 
 def _swallow(fn) -> None:  # noqa: ANN001
