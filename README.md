@@ -300,6 +300,39 @@ Concretely:
 type at "whatever has focus", and on a hidden desktop that is always you). Element-level `set_value`
 is the replacement.
 
+#### What each setting actually does
+
+Three rows, no fourth. Measured on a real Windows 11 machine:
+
+| Setting | Can you watch it work? | Does it take your mouse / keyboard? | Apps with no a11y tree |
+|---|---|---|---|
+| `isolated` — **the default** | ❌ no | ✅ **no** — the action is *refused*, not "attempted carefully" | ❌ unsupported |
+| `isolated` + `CC_CU_ALLOW_GLOBAL_INPUT=1` | ❌ no | ⚠️ **yes**, and every result says so | ✅ works |
+| `CC_CU_DISPLAY_MODE=real` | ✅ yes | ⚠️ **yes** — and there is no per-call warning | ✅ works |
+
+**Why there is no fourth row.** Synthesized input is delivered to a *session's* input queue, and one
+logon session has exactly one. So either the agent has a session of its own (a second Windows: a VM,
+Windows Sandbox, …) or it shares yours — and if it shares yours, every action that needs a pointer
+necessarily goes through *your* pointer.
+
+This is not a gap in this implementation. Windows defines the **input desktop** as the one desktop that
+receives input, and it is by definition *the one you are looking at* — so a hidden desktop cannot have
+input of its own. Two consequences follow, and they are worth stating plainly:
+
+- **On Windows, "don't disturb me" and "drive apps that expose no accessibility tree" cannot both
+  hold.** Element-level actions and directed key messages never touch your input devices — they are
+  safe, but they need a tree. Coordinate clicking needs no tree, but it needs a pointer.
+- **The only way to have both is a second Windows** (VM / Windows Sandbox). That is a different
+  product shape: it is not *your* desktop being driven, and your installed apps are not in it.
+
+**Also Windows-only: you cannot watch it work.** On Linux the sandbox is a real Xephyr window on your
+screen — you can see what the agent is doing, and you can even reach in with your own mouse. On a
+hidden desktop there is nothing to look at, so ask the agent for a screenshot or a tree readout
+instead. This is a stated cost of the design, not an oversight.
+
+The default resolves the trade-off in favour of **not disturbing you**. When an app you need has no
+tree, `CC_CU_DISPLAY_MODE=real` is the intended escape hatch — with the caveat above made explicit.
+
 #### Building and installing the Windows package
 
 ```bash
