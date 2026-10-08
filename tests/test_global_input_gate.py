@@ -36,6 +36,7 @@ import pathlib
 
 import pytest
 
+from computer_use_mcp.backend.base import Rect, TextBlock
 from computer_use_mcp.backend.windows.backend import WindowsBackend
 from computer_use_mcp.backend.windows.driver import actions as w_actions
 from computer_use_mcp.backend.windows.driver import desktop as w_desktop
@@ -779,6 +780,118 @@ def test_coordinator_reports_the_loud_note_when_globally_allowed(monkeypatch):
     b = _StubBackend()
     res = Coordinator(b).click_xy(5, 6, preview=False)
     assert note in res.message, f"结果里没带上全局注入的提醒：{res.message!r}"
+
+
+# ── ⑥′ OCR 的返回里那句「可直接 click」也是这个能力边界的一个出口 ──────────────
+
+def _ocr_stub():
+    """
+    一个能从 OCR 通道读出一块文本的 backend 桩（返回里于是**带得回可点的 ref**）。
+
+    ⚠️ 必须真的读出块来：`get_screen_text` 在"一块都没读到"时走的是**另一条**返回路径，
+    而那条路径上没有 ref 可点，提醒也就无从谈起（产品代码里这个分支是刻意分开的）。
+    用空结果去测，会得到一个"提醒没出现"的**假绿** —— 与"提醒逻辑坏了"分不开。
+    """
+    b = _StubBackend()
+    b.active_window_rect = lambda: None
+    b.read_text = lambda region=None, min_conf=40.0: [
+        TextBlock(text="保存", rect=Rect(862, 571, 26, 14), conf=88),
+    ]
+    return b
+
+
+def test_get_screen_text_warns_when_the_session_has_no_coordinate_channel(monkeypatch):
+    """★ 坐标点不了的会话里，OCR 的返回**不许承诺"可直接 click"**。
+
+    `get_screen_text` 的末尾原本无条件写着「坐标已是屏幕绝对坐标，可直接 click(x=..,y=..)」。
+    在 Windows 隔离模式（隐藏桌面）下那句话是假的：那边没有把输入送进目标会话的通道，
+    按 ref 点只会降级到坐标、然后撞闸门被拒。模型看到的只是"点失败了"，最自然的推断
+    是**自己点偏了** —— 于是换个坐标重试，白烧好几轮。
+
+    这里用**真的** `WindowsDesktopSession`（而不是手搓桩）跑一遍：判据要能证伪
+    "环境变量 → 能力申报 → 文案"这一整条链，而桩只能证明文案本身。
+    """
+    monkeypatch.setenv("CC_CU_DISPLAY_MODE", "isolated")
+    monkeypatch.delenv("CC_CU_ALLOW_GLOBAL_INPUT", raising=False)
+    monkeypatch.setattr(session, "MANAGER", WindowsDesktopSession())
+    from computer_use_mcp.core.coordinator import Coordinator
+
+    txt = Coordinator(_ocr_stub()).get_screen_text()
+    assert "没有坐标级通道" in txt, f"该提醒没出现：{txt!r}"
+    assert "可直接 click" not in txt, f"点不了就别承诺能点：{txt!r}"
+    # 提醒必须给出**出路**，否则模型只会反复重试同一件事（这一类报错最贵的地方）。
+    assert "元素级" in txt and "CC_CU_DISPLAY_MODE=real" in txt, f"缺出路：{txt!r}"
+
+
+def test_get_screen_text_keeps_its_click_promise_when_coordinates_work(monkeypatch):
+    """★ 反向正控：坐标**能用**的会话里，那句承诺照旧、提醒一个字都不许有。
+
+    没有这条，"提醒出现了"可能只是"提醒恒出现"—— 而那会把一条好端端的能力说成不可用。
+    """
+    monkeypatch.setenv("CC_CU_DISPLAY_MODE", "real")
+    monkeypatch.delenv("CC_CU_ALLOW_GLOBAL_INPUT", raising=False)
+    monkeypatch.setattr(session, "MANAGER", WindowsDesktopSession())
+    from computer_use_mcp.core.coordinator import Coordinator
+
+    txt = Coordinator(_ocr_stub()).get_screen_text()
+    assert "可直接 click(x=..,y=..)" in txt, f"坐标能用就该照常承诺：{txt!r}"
+    assert "没有坐标级通道" not in txt, f"这里是 real 模式，不该有这个提醒：{txt!r}"
+
+
+def test_the_warning_follows_the_capability_claim_not_the_isolated_flag(monkeypatch):
+    """★★ 判据是**能力申报**，不是「是不是 isolated」—— Linux 的隔离**有**坐标通道。
+
+    ⚠️ 这是本条最容易写错的地方：把判据写成 `display_mode == "isolated"` 会在 **Linux**
+    上误报 —— 那边 XTEST 注入进的是 Xephyr 那块**虚拟屏**，用户碰不到它，
+    坐标点击/键盘注入一切照旧。误报的代价是模型从此弃用坐标级、退到
+    「截图 + 目测坐标」那条最贵的路（实测一次 DBeaver 任务 8.3 分钟里工具只占 21 秒），
+    而这一切**不报任何错**、也没有人会去怀疑。
+
+    故造一个「isolated **但**坐标可用」的会话（形状取自 Linux 的
+    `core/display/provider.py`：`target='isolated'` 且 `unimplemented` 为空），
+    断言提醒**不许**出现。判据落在"申报里有没有那一项"上，平台差异自动跟着走。
+
+    ⚠️ 环境变量**必须显式设成 isolated**（而不是靠默认值）：`conftest.py` 在非 e2e 时
+    `setdefault` 了 `CC_CU_DISPLAY_MODE=real`，不设的话这个用例在
+    "判据被写成读环境变量"那种坏实现下**照样能过** —— 环境是 real、提醒本就不该出现，
+    于是它量不到任何东西（实测：这么写时把判据改成 `mode != "real"` 仍然全绿）。
+    """
+    monkeypatch.setenv("CC_CU_DISPLAY_MODE", "isolated")
+    monkeypatch.delenv("CC_CU_ALLOW_GLOBAL_INPUT", raising=False)
+
+    class _IsolatedButClickable(_RefusingSession):
+        def capabilities(self):  # noqa: ANN201
+            return SessionCapabilities(
+                target="isolated", input_isolated=True, screen_isolated=True,
+                a11y_isolated=True, strong_mode=True, unimplemented=(),
+            )
+
+        def require(self, op, *, kind=OP_INJECT):  # noqa: ANN001, ANN201
+            return None                      # 这个会话里坐标能点，闸门不该拦
+
+    monkeypatch.setattr(session, "MANAGER", _IsolatedButClickable())
+    from computer_use_mcp.core.coordinator import Coordinator
+
+    txt = Coordinator(_ocr_stub()).get_screen_text()
+    assert "没有坐标级通道" not in txt, (
+        f"这个会话是 isolated 但坐标**能**用（Linux 的形状），不该误报：{txt!r}"
+    )
+    assert "可直接 click(x=..,y=..)" in txt, f"能点就该照常承诺：{txt!r}"
+
+
+def test_get_screen_text_stops_warning_once_global_input_is_allowed(monkeypatch):
+    """★ 用户显式放开（`CC_CU_ALLOW_GLOBAL_INPUT=1`）之后，提醒自动消失 —— 因为那是真的了。
+
+    这一条守的是「别再抄一份策略」：`readonly` 读的是能力申报，而申报会随这个开关翻转。
+    若哪天有人把它改成"读环境变量里是不是 isolated"，这里就会立刻变红。
+    """
+    monkeypatch.setenv("CC_CU_DISPLAY_MODE", "isolated")
+    monkeypatch.setenv("CC_CU_ALLOW_GLOBAL_INPUT", "1")
+    monkeypatch.setattr(session, "MANAGER", WindowsDesktopSession())
+    from computer_use_mcp.core.coordinator import Coordinator
+
+    txt = Coordinator(_ocr_stub()).get_screen_text()
+    assert "没有坐标级通道" not in txt, f"放开后坐标真的能点了，不该再提醒：{txt!r}"
 
 
 # ── ⑦ 能力边界要报到**模型开工前就读到**的地方 ──────────────────────────

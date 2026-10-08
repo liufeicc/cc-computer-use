@@ -102,6 +102,47 @@ class CoordinatorBase:
             log.debug("global_input_note 失败（忽略）: %s", exc)
             return None
 
+    def _coordinate_input_unavailable(self) -> bool:
+        """
+        本会话是否**没有坐标级通道**（`True` = 坐标/ref 只能读，点了会被拒）。
+
+        ═══ 为什么需要它：一句写在返回里的假承诺 ═══
+
+        `get_screen_text` 的返回末尾写着「坐标已是**屏幕绝对坐标**，可直接
+        click(x=..,y=..)；也可 click(ref=N)」。在 **Windows 隔离模式（隐藏桌面）** 下
+        **这句话是假的**：那边没有把输入送进目标会话的通道（见 `OP_INJECT_GLOBAL`），
+        于是模型拿着刚读到的 ref 去点 → 协调层降级到坐标 → 撞闸门被拒。而它看到的
+        只是"点失败了"，最自然的推断是**自己点偏了**，于是换个坐标重试 —— 白烧好几轮
+        （这一类报错最贵的从来不是"没做成"，是模型不知道该改什么）。
+
+        ═══ ⚠️ 判据必须读能力申报，绝不能写成「是不是 isolated」═══
+
+        两个平台的隔离**性质不同**，只有一个是"没有通道"：
+          · Linux（Xephyr）：**有**坐标级通道 —— XTEST 注入进的是那块虚拟屏，
+            用户碰不到它，所以一切照旧；
+          · Windows（隐藏桌面）：**没有** —— 那才是本条要提醒的那种。
+        把两者混为一谈的后果是**把 Linux 上一条好端端的能力说成不可用**，
+        模型于是弃用它、退到更贵的那条路（截图 + 目测坐标），而这一切**不报任何错**。
+
+        故判据取 `capabilities().unimplemented` 里的 `COORDINATE_INPUT` ——
+        那是各平台**自己申报**的「我这儿做不了这件事」，也顺带保证了它会跟着策略
+        自动翻转：Windows 一旦设了 `CC_CU_ALLOW_GLOBAL_INPUT=1`，申报里就没这一项了，
+        本方法随之返回 False、提醒自动消失，不需要在这里再抄一份策略。
+
+        ═══ 取不到时按"可用"处理（返回 False）═══
+
+        这条只决定**要不要多说一句话**，而说错的代价是把一条能用路径说成不能用 ——
+        比不说更糟。（这与"宁可保守"那条**申报**原则方向相反，因为错的代价性质不同：
+        那里报错的代价是用户以为自己的电脑没被碰过；这里报错的代价是白白弃用一条通路。）
+        故失败时静默，与 `_global_input_note` 同一条纪律：附加文案绝不拖垮主操作。
+        """
+        try:
+            caps = session.MANAGER.capabilities()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("capabilities() 失败（忽略，按坐标可用处理）: %s", exc)
+            return False
+        return session.COORDINATE_INPUT in caps.unimplemented
+
     # ---------- 目标窗口（「这次操作的是哪一扇窗」）----------
 
     def _remember_target_window(self, window_id: str | None) -> None:

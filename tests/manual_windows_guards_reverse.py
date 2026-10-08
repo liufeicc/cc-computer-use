@@ -605,6 +605,32 @@ def _runtime_cases():
         ca.ActionMixin.type_text = swallowed
         undo.append(lambda: setattr(ca.ActionMixin, "type_text", old))
 
+    # ── OCR 返回里那句「可直接 click」的承诺（同为「默认不碰用户键鼠」的出口）──
+
+    def break_readonly_never(undo):  # noqa: ANN001
+        from computer_use_mcp.core.coordinator.base import CoordinatorBase
+        old = CoordinatorBase._coordinate_input_unavailable
+        CoordinatorBase._coordinate_input_unavailable = lambda self: False
+        undo.append(lambda: setattr(
+            CoordinatorBase, "_coordinate_input_unavailable", old))
+
+    def break_readonly_always(undo):  # noqa: ANN001
+        from computer_use_mcp.core.coordinator.base import CoordinatorBase
+        old = CoordinatorBase._coordinate_input_unavailable
+        CoordinatorBase._coordinate_input_unavailable = lambda self: True
+        undo.append(lambda: setattr(
+            CoordinatorBase, "_coordinate_input_unavailable", old))
+
+    def break_readonly_is_isolation_flag(undo):  # noqa: ANN001
+        from computer_use_mcp.core.coordinator.base import CoordinatorBase
+        from computer_use_mcp.core.session_types import display_mode_from_env
+        old = CoordinatorBase._coordinate_input_unavailable
+        # ← 判据写成"是不是 isolated"（Linux 的 Xephyr 因此被误报成点不了）
+        CoordinatorBase._coordinate_input_unavailable = lambda self: (
+            display_mode_from_env() == "isolated")
+        undo.append(lambda: setattr(
+            CoordinatorBase, "_coordinate_input_unavailable", old))
+
     return [
         (break_win_default_scope, "capture::test_default_capture_scope_is_a_platform_difference", ()),
         (break_mode_parse, "windows::test_display_mode_defaults_to_isolated_and_only_recognises_real", None),
@@ -629,6 +655,13 @@ def _runtime_cases():
         (break_readback, "gate::test_driver_set_value_reports_readback_mismatch", None),
         (break_type_text_swallows_refusal,
          "gate::test_gate_refusal_shape_is_uniform_across_entry_points", None),
+        # OCR 的返回不再承诺"可直接 click"（同一个能力边界，另一个出口）
+        (break_readonly_never,
+         "gate::test_get_screen_text_warns_when_the_session_has_no_coordinate_channel", None),
+        (break_readonly_always,
+         "gate::test_get_screen_text_keeps_its_click_promise_when_coordinates_work", None),
+        (break_readonly_is_isolation_flag,
+         "gate::test_the_warning_follows_the_capability_claim_not_the_isolated_flag", None),
     ]
 
 

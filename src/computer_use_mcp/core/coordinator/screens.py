@@ -222,8 +222,16 @@ class ScreenMixin:
         被遮挡时会读到遮挡者上的字，而且完全不报错）。
 
         ⚠️ 坐标是**快照**：界面变化后（切窗、弹新对话框）请重新调用，不要复用旧 ref。
+
+        ⚠️ **本会话可能没有坐标级通道**（Windows 隔离模式）：那里的 ref 与坐标**只能读**，
+        按它们点击会被闸门拒绝。返回里会**当场说明**这一点（见下方的 `readonly` 分支），
+        绝不留给模型自己撞 —— 撞了之后它只会以为是自己点偏了，然后换个坐标重试。
         """
         reg = tuple(region) if region and len(region) == 4 else None
+        # ★ 本会话的坐标/ref 能不能点。判据在 `_coordinate_input_unavailable`，
+        #   它读的是**能力申报**而不是"是不是隔离模式"——Linux 的 Xephyr 有坐标通道，
+        #   那边一切照旧（详见那个方法的 docstring）。
+        readonly = self._coordinate_input_unavailable()
         scope_used = "region"
         notes: list[str] = []
         blocks: list[Any]
@@ -275,6 +283,23 @@ class ScreenMixin:
                     + (f"\n{conf_note}" if conf_note else "")
                     + (("\n" + "｜".join(notes)) if notes else ""))
 
+        # ★ 坐标点不了的会话，把代价**说在 ref 前面**（而不是只在末尾纠正那句承诺）：
+        #   模型读到一张带 ref 的清单，第一反应就是"点它"。这句话必须在它形成那个
+        #   计划**之前**出现，否则它就是"先照着做、撞了再回来读"——而那正是要避免的往返。
+        #   ⚠️ 单独成段而不是混进 `notes` 那个 `｜` 长串里：那一串已经够长了，
+        #   而这条是**本会话最重要的一句**，混进去等于让它淹没在噪音里。
+        warn = ""
+        if readonly:
+            warn = (
+                "⚠️ 本会话**没有坐标级通道**（隔离模式：程序起在一张你看不见的桌面上，"
+                "本进程发出的鼠标事件只会落到**用户**的桌面上，所以这一下会被闸门拒绝）。"
+                "下面的 ref 与坐标**只能用来读，点不了**（click / scroll / drag 都不行）。\n"
+                "   替代：改用元素级 —— get_ui_tree / find_element 拿 ref 再 click(ref=...)，"
+                "零坐标、也不碰用户键鼠。\n"
+                "   若这个应用**没有无障碍树**（SWT/Java、自绘控件、游戏、远程桌面）："
+                "隔离模式下**做不了**，请让用户设 CC_CU_DISPLAY_MODE=real 后重启 Claude Code。"
+            )
+
         truncated = len(blocks) > max_items
         shown = blocks[:max_items]
         out: list[str] = []
@@ -286,7 +311,20 @@ class ScreenMixin:
                   f"共 {len(blocks)} 块文本" + (f"，已截断显示前 {max_items} 块" if truncated else "")
                   + (f"\n{conf_note}" if conf_note else "")
                   + (("\n" + "｜".join(notes)) if notes else ""))
+        # ⚠️ `warn` 前后各留一个空行：它要挡住的是"看到 ref 就想点"这个动作，
+        #    挤在行文里等于没写。无 `warn` 时这条分支与原文**逐字节相同**。
+        head = f"{header}\n\n{warn}\n\n" if warn else f"{header}\n"
         body = "\n".join(out)
-        return (f"{header}\n{body}\n\n"
-                f"（坐标已是**屏幕绝对坐标**，可直接 click(x=..,y=..)；"
-                f"也可 click(ref=N) 由服务端代点，避免抄错。文字是快照，界面变了请重新识别）")
+        # ⚠️ 末尾这段是**承诺**，本会话兑现不了就不能照样写：`readonly` 时原文那句
+        #    「可直接 click(x=..,y=..)；也可 click(ref=N)」是假的（见上方 `readonly` 的来源）。
+        #    留着的代价不是"少说了一句"，而是**主动误导** —— 模型照着做、被拒、
+        #    然后归因成自己点偏了。
+        if readonly:
+            howto = ("（坐标已是**屏幕绝对坐标**，但本会话**没有坐标级通道**："
+                     "上面这些 ref/坐标只能读，点不了。要操作请改用元素级 ref。"
+                     "文字是快照，界面变了请重新识别）")
+        else:
+            howto = ("（坐标已是**屏幕绝对坐标**，可直接 click(x=..,y=..)；"
+                     "也可 click(ref=N) 由服务端代点，避免抄错。"
+                     "文字是快照，界面变了请重新识别）")
+        return f"{head}{body}\n\n{howto}"

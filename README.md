@@ -2,13 +2,13 @@
 
 [中文文档](README.zh-CN.md) | **English**
 
-An MCP server that lets an AGENT (Claude Code, etc.) drive a Linux desktop — **without taking over
-yours**.
+An MCP server that lets an AGENT (Claude Code, etc.) drive **your Linux or Windows desktop** —
+**without taking over yours**.
 
 Most computer-use servers do the same thing: they seize your mouse, your keyboard and your screen for
-the whole run. This one puts the agent on **its own private virtual screen** by default, so you keep
-working while it does. When you *do* want it driving the real desktop, one environment variable
-switches it over.
+the whole run. This one puts the agent on **its own private virtual screen** (Linux/X11: a Xephyr
+nested server; Windows: a hidden desktop) by default, so you keep working while it does. When you *do*
+want it driving the real desktop, one environment variable switches it over.
 
 | | Conventional computer-use MCP | This project |
 |---|---|---|
@@ -129,13 +129,16 @@ feedback below is attached automatically by `backend.click_at`.
 
 ## 2. Requirements
 
+Two supported platforms, **two different isolation mechanisms** (see §4, *Windows: a hidden desktop*):
+
 | Item | Requirement |
 |------|-------------|
-| OS | Linux (Phase 1 is Linux only; Windows is Phase 3) |
-| Session type | **X11** (under Wayland, global input injection is restricted) |
+| OS | **Linux/X11** (isolation = a Xephyr virtual screen) or **Windows 10/11** (isolation = a hidden desktop) |
+| Session type | Linux: **X11** (under Wayland, global input injection is restricted). Windows: an **interactive logon session** — UIA and window capture need a real desktop, so a headless/service session will not work |
 | Python | 3.12+ |
-| System components | `xdotool` (injection), `xserver-xephyr` (sandbox virtual screen), `xclip` (clipboard path for non-ASCII input), `wmctrl` (app enumeration), `tesseract-ocr` + `chi_sim` (OCR grey-area sensing), `zenity` (tests), AT-SPI (`gir1.2-atspi-2.0` / `libatspi`) |
-| Accessibility | Must be enabled (see below) |
+| Linux system components | `xdotool` (injection), `xserver-xephyr` (virtual screen), `xclip` (clipboard path for non-ASCII input), `wmctrl` (app enumeration), `tesseract-ocr` + `chi_sim` (OCR grey-area sensing), `zenity` (tests), AT-SPI (`gir1.2-atspi-2.0` / `libatspi`) |
+| Windows system components | **None** — the Windows backend shells out to nothing: UIA (`uiautomation`), `PrintWindow` and the built-in `Windows.Media.Ocr` engine. No bundled binaries, no OCR install |
+| Accessibility | Linux: must be enabled (see below). Windows: nothing to enable — UIA needs no switch |
 
 > **Key constraint**: AT-SPI depends on the system's `libatspi` and the `Atspi` typelib — OS-level
 > components that cannot be bundled into a single binary. `_bootstrap.py` points `GI_TYPELIB_PATH` at
@@ -253,6 +256,61 @@ sandboxed apps ──── private sandbox AT-SPI bus ── the MCP's a11y rea
 > libatspi's `atspi_init()` can only ever bind once per process — so a11y stays permanently
 > unavailable for the rest of that session, leaving only OCR + coordinate clicking. Restarting Claude
 > Code is the only recovery.
+
+### Windows: a hidden desktop instead of a virtual screen
+
+Windows has no second display: one logon session has exactly one set of input devices. The equivalent
+of Xephyr here is a **hidden desktop** (`CreateDesktopW`) — apps the agent starts live on a desktop you
+can't see and can't reach with your mouse or keyboard, while the server (running on your desktop)
+still enumerates them, reads their UIA tree, and invokes their elements. Measured on a real machine:
+the agent's windows do not appear in your window list, and **your pointer and foreground window never
+move**.
+
+The same `CC_CU_DISPLAY_MODE` knob selects the mode (`isolated` is the default; only the literal
+`real` turns isolation off — a typo therefore stays isolated).
+
+#### The capability boundary — read this before planning a task
+
+**In isolated mode there is no channel to deliver synthesized input into the hidden desktop.**
+`SendInput` fails there (error 5), and all four directed-mouse techniques are inert. This is not a
+"worse quality" situation, it is a "the channel does not exist" situation — which is why the server
+**refuses** rather than trying: a `SendInput` from our process can only ever land on *your* desktop,
+so "just try it anyway" would literally be clicking your mouse.
+
+| The app exposes… | Isolated mode (`isolated`, default) | `CC_CU_DISPLAY_MODE=real` |
+|---|---|---|
+| A UIA tree (most Win32 / WPF / WinUI apps) | ✅ element-level only: `get_ui_tree` → `click(ref=…)` / `set_value` / Invoke. Zero coordinates, never touches your keyboard or mouse | ✅ everything |
+| **No tree** (SWT/Java, custom-drawn widgets, games, remote-desktop canvases) | ❌ **not supported** — coordinate clicking is the only channel there, and it is refused | ✅ coordinate clicking works (it really moves your mouse) |
+
+So the two settings are **not** "safe" and "safe but better" — there is no setting that is both fully
+capable and fully isolated, and the server reports which one you have rather than pretending otherwise.
+Concretely:
+
+- `capabilities()` reports `input_isolated=True` **and** `unimplemented=("coordinate_input",)` at the
+  same time — two axes, both truthful.
+- The MCP `instructions` carry the caveat, so the model knows **before it starts** to go element-level
+  instead of learning it by hitting a refusal.
+- `get_screen_text` says so in its result: in this mode those refs and coordinates are
+  **read-only** — clicking them is refused. (On Linux this does *not* apply: XTEST injects into the
+  Xephyr screen, which you can't touch, so coordinate clicking works normally.)
+- `CC_CU_ALLOW_GLOBAL_INPUT=1` opens the gate — and every result then carries a loud note that **this
+  click landed on your real mouse/keyboard/focus**. Default is off; only the literal `1` counts.
+
+`type_text` / `press_key` are refused outright in isolated mode (no per-target variant exists — they
+type at "whatever has focus", and on a hidden desktop that is always you). Element-level `set_value`
+is the replacement.
+
+#### Building and installing the Windows package
+
+```bash
+CC_CU_VM_PASS='<password>' bash packaging/windows/build-windows.sh    # build on the guest
+CC_CU_VM_PASS='<password>' bash packaging/windows/verify-install.sh   # install → self-check → register → uninstall
+```
+
+The artifact is a single `cc-computer-use-<version>-setup.exe` (Inno Setup) that installs per-user to
+`%LOCALAPPDATA%\Programs\cc-computer-use` and registers itself with Claude Code. It must be built **on
+Windows** (PyInstaller cannot cross-compile). See
+[`packaging/windows/README.md`](packaging/windows/README.md) for the twelve traps hit along the way.
 
 ---
 
@@ -445,9 +503,13 @@ Claude Code / MCP client
 │                     (in-process cache)            │
 └───────┬──────────────────────────────────────────┘
         │ backend/base.py  abstract contract
-┌───────▼──────────┐
-│ backend/linux/   │  AT-SPI reads (atspi.py) + xdotool injection (inject/)
-└──────────────────┘  (Windows backend = Phase 3)
+┌───────▼──────────────────┐
+│ backend/linux/           │  AT-SPI reads + xdotool injection (inject/)
+└──────────────────────────┘
+┌──────────────────────────┐
+│ backend/windows/         │  UIA reads (driver/tree.py) + element-level
+│                          │  actions + PrintWindow capture + WinRT OCR
+└──────────────────────────┘
 ```
 
 **The three-tier fallback (`coordinator.click`)**:
@@ -521,6 +583,11 @@ modules by responsibility. Their public namespaces are unchanged (`display.MANAG
 - **Non-ASCII input goes through the clipboard**: `xdotool type` rewrites the global keyboard mapping
   for CJK input, which makes the user's physical keyboard unresponsive for the duration and races with
   input-method XKB state. Only pure ASCII uses `xdotool type`.
+- **Windows, isolated mode**: apps with no accessibility tree (SWT/Java, custom-drawn widgets, games,
+  remote-desktop canvases) cannot be driven at all — see §4, *The capability boundary*. Use
+  `CC_CU_DISPLAY_MODE=real` for those.
+- **Windows, not yet verified**: multi-monitor / negative-origin coordinates, and elevated (UIPI) apps
+  — launching one necessarily raises a UAC prompt, so it cannot be exercised unattended.
 
 ---
 
@@ -530,7 +597,9 @@ modules by responsibility. Their public namespaces are unchanged (`display.MANAG
 - ✅ **Phase 1** Linux MVP (this project: 17 tools + backend + core + packaging)
 - ✅ **Phase 1.5** Isolation sandbox (Xephyr virtual screen by default + private AT-SPI bus + `launch_app`)
 - ⬜ **Phase 2** Precision hardening + token optimization (tree diffing, uinput, focus handling)
-- ⬜ **Phase 3** Windows backend (UIA + SendInput)
+- ✅ **Phase 3** Windows backend (UIA + element-level actions + `PrintWindow` capture + hidden-desktop
+  isolation + `Windows.Media.Ocr`). ⚠️ Per-window capture uses `PrintWindow`, **not** `SendInput`;
+  coordinate clicking is deliberately refused in isolated mode (see §4)
 - ⬜ **Phase 4** Visual parsing + further grey-area fallbacks
 
 ---

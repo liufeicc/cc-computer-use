@@ -2,11 +2,12 @@
 
 **中文** | [English](README.md)
 
-让 AGENT（Claude Code 等）**直接使用 Linux 桌面**的 MCP server —— 而且**不抢你的鼠标**。
+让 AGENT（Claude Code 等）**直接使用你的 Linux 或 Windows 桌面**的 MCP server ——
+而且**不抢你的鼠标**。
 
 别的 computer-use server 都做同一件事：运行期间**接管**你的鼠标、键盘和屏幕。本项目默认把
-Agent 放进**它自己的一块私有虚拟屏**，你可以同时继续用电脑。确实需要它操作真实桌面时，
-一个环境变量即可切换。
+Agent 放进**它自己的一块私有虚拟屏**（Linux/X11 用 Xephyr 嵌套 X server；Windows 用隐藏桌面），
+你可以同时继续用电脑。确实需要它操作真实桌面时，一个环境变量即可切换。
 
 | | 传统 computer-use MCP | 本项目 |
 |---|---|---|
@@ -93,13 +94,16 @@ Agent 放进**它自己的一块私有虚拟屏**，你可以同时继续用电�
 
 ## 二、环境要求
 
+支持两个平台，**隔离机制各不相同**（见第四节末尾的「Windows：用隐藏桌面代替虚拟屏」）：
+
 | 项 | 要求 |
 |----|------|
-| 操作系统 | Linux（Phase 1 仅 Linux；Windows 在 Phase 3） |
-| 会话类型 | **X11**（Wayland 下全局输入注入受限） |
+| 操作系统 | **Linux/X11**（隔离 = Xephyr 虚拟屏）或 **Windows 10/11**（隔离 = 隐藏桌面） |
+| 会话类型 | Linux：**X11**（Wayland 下全局输入注入受限）。Windows：**必须已登录的交互式会话** —— UIA 与按窗口抓屏都要求真桌面，无界面的服务会话跑不通 |
 | Python | 3.12+ |
-| 系统组件 | `xdotool`（注入）、`xserver-xephyr`（隔离沙箱虚拟屏）、`xclip`（非 ASCII 输入走剪贴板）、`wmctrl`（应用枚举）、`tesseract-ocr` + `chi_sim`（OCR 灰区感知）、`zenity`（测试）、AT-SPI（`gir1.2-atspi-2.0` / `libatspi`） |
-| 无障碍开关 | 必须开启（见下） |
+| Linux 系统组件 | `xdotool`（注入）、`xserver-xephyr`（虚拟屏）、`xclip`（非 ASCII 输入走剪贴板）、`wmctrl`（应用枚举）、`tesseract-ocr` + `chi_sim`（OCR 灰区感知）、`zenity`（测试）、AT-SPI（`gir1.2-atspi-2.0` / `libatspi`） |
+| Windows 系统组件 | **无需任何外部组件** —— Windows 后端不对任何外部命令起子进程：UIA（`uiautomation`）、`PrintWindow` 抓屏、系统自带的 `Windows.Media.Ocr` OCR 引擎。不随包二进制，也不用装 OCR |
+| 无障碍开关 | Linux：必须开启（见下）。Windows：**没有这个开关** —— UIA 不需要任何授权 |
 
 > **关键约束**：AT-SPI 依赖系统的 `libatspi` 与 `Atspi` typelib（OS 级组件），无法打进单一二进制。本项目通过 `_bootstrap.py` 在运行时设 `GI_TYPELIB_PATH` 指向系统目录来加载——即便冻结成可执行文件，运行时仍需系统提供这些组件。
 
@@ -184,6 +188,54 @@ X11 只有一个物理指针/焦点：Agent 注入时用户无法同时用电脑
 - 验证脚本：`PYTHONNOUSERSITE=1 python tests/manual_a11y_isolation.py`
 
 > **运维后果**：沙箱崩溃并被重建后总线地址必变，而 libatspi 的 `atspi_init()` 每进程只能绑定一次 —— 于是**本会话的 a11y 能力即永久失效**，只剩 OCR + 坐标点击那条最贵的路。唯一恢复手段是重启 Claude Code。
+
+### Windows：用隐藏桌面代替虚拟屏
+
+Windows 没有第二块显示 —— 一个登录会话只有一套输入设备。这里与 Xephyr 对应的是**隐藏桌面**
+（`CreateDesktopW`）：agent 启动的应用开在一块你看不见、键鼠也碰不到的桌面上，而 server
+（跑在你的桌面上）照样能枚举它们、读它们的 UIA 树、调用它们的元素。真机实测：agent 的窗口
+不出现在你的窗口列表里，**你的指针与前台窗口全程不动**。
+
+模式旋钮复用同一个 `CC_CU_DISPLAY_MODE`（默认 `isolated`；**只认 `real` 这个字面量**，
+拼错一律当 `isolated` —— 拼错一个字母就静默失去隔离是不能接受的）。
+
+#### 能力边界 —— 规划任务之前请先读这一段
+
+**隔离模式下没有任何通道能把合成输入送进隐藏桌面。** `SendInput` 在那儿直接失败（error 5），
+定向鼠标四种技法全部失效。这不是「效果差一点」，而是「通道不存在」—— 所以 server 选择
+**拒绝**而不是硬试：我们进程发出的 `SendInput` 只可能落到**你的**桌面上，
+「那就试试看」等于**真去点你的鼠标**。
+
+| 应用有没有无障碍树 | 隔离模式（`isolated`，默认） | `CC_CU_DISPLAY_MODE=real` |
+|---|---|---|
+| **有**（多数 Win32 / WPF / WinUI 应用） | ✅ 只走元素级：`get_ui_tree` → `click(ref=…)` / `set_value` / Invoke。零坐标，完全不碰你的键鼠 | ✅ 全部可用 |
+| **没有**（SWT/Java、自绘控件、游戏、远程桌面画面） | ❌ **不支持** —— 那里唯一的通道是坐标点击，而它被拒绝 | ✅ 坐标点击可用（真的会动你的鼠标） |
+
+所以这两档**不是**「安全」与「更安全」的关系，而是「**没有既能力全、又完全隔离的那一档**」；
+server 如实报告你手上是哪一档，不假装另一档也存在。具体落在四件事上：
+
+- `capabilities()` 会**同时**报 `input_isolated=True` 与 `unimplemented=("coordinate_input",)`
+  —— 两个轴各自如实。
+- MCP `instructions` 里带着这条边界，模型**开工之前**就知道该走元素级，而不是先撞一次拒绝。
+- `get_screen_text` 在返回里写明：这种模式下那些 ref 与坐标**只能读**，点了会被拒。
+  （Linux **不适用**：XTEST 注入进的是 Xephyr 那块虚拟屏，你碰不到，坐标点击照常可用。）
+- `CC_CU_ALLOW_GLOBAL_INPUT=1` 可以明确放开闸门 —— 放开后每次返回都会**响亮标注**
+  「这一下动的是你的真实鼠标/键盘/前台焦点」。默认关闭，且只认字面量 `1`。
+
+`type_text` / `press_key` 在隔离模式下**整条拒绝、没有例外**（它们天然是「打给当前焦点」，
+没有带明确目标的变体；而隐藏桌面上当前焦点一定是你）。替代品是元素级 `set_value`。
+
+#### 打包与安装 Windows 包
+
+```bash
+CC_CU_VM_PASS='<密码>' bash packaging/windows/build-windows.sh    # 在客体上构建
+CC_CU_VM_PASS='<密码>' bash packaging/windows/verify-install.sh   # 装 → 自检 → 查注册 → 卸载
+```
+
+产物是一个 `cc-computer-use-<版本>-setup.exe`（Inno Setup），按用户装到
+`%LOCALAPPDATA%\Programs\cc-computer-use` 并自动注册进 Claude Code。
+**必须在 Windows 上构建**（PyInstaller 不能交叉编译）。踩过的十二条坑见
+[`packaging/windows/README.md`](packaging/windows/README.md)。
 
 ---
 
@@ -336,9 +388,13 @@ Claude Code / MCP 客户端
 │  utils/refs         ref ↔ 活元素 映射（同进程缓存）    │
 └───────┬──────────────────────────────────────────┘
         │ backend/base.py 抽象契约
-┌───────▼──────────┐
-│ backend/linux/   │  AT-SPI 读取(atspi.py) + xdotool 注入(inject/)
-└──────────────────┘  （Windows backend = Phase 3）
+┌───────▼──────────────────┐
+│ backend/linux/           │  AT-SPI 读取 + xdotool 注入 (inject/)
+└──────────────────────────┘
+┌──────────────────────────┐
+│ backend/windows/         │  UIA 读取 (driver/tree.py) + 元素级动作
+│                          │  + PrintWindow 抓屏 + WinRT OCR
+└──────────────────────────┘
 ```
 
 **三级降级（coordinator.click）**：
@@ -401,6 +457,8 @@ cc-computer-use/
 - **Wayland**：MVP 锁定 X11；Wayland 注入受限，需 libei（Phase 2+ 评估）。
 - **uinput 注入**：当前用 xdotool（XTest），覆盖 X11 够用；uinput（需 udev 规则）在 Phase 2.3。
 - **非 ASCII 输入走剪贴板**：`xdotool type` 对中文会临时改写全局键盘映射，输入期间用户物理键盘整体失灵，且与输入法争抢 XKB 状态。纯 ASCII 才走 `xdotool type`。
+- **Windows 隔离模式**：没有无障碍树的应用（SWT/Java、自绘控件、游戏、远程桌面画面）**完全操作不了** —— 见第四节的「能力边界」。这些应用请用 `CC_CU_DISPLAY_MODE=real`。
+- **Windows 仍未验证**：多显示器 / 负原点坐标；提权（UIPI）应用 —— 起提权进程必然弹 UAC，无人值守跑不了。
 
 ---
 
@@ -410,7 +468,9 @@ cc-computer-use/
 - ✅ **Phase 1** Linux MVP（本项目：17 工具 + backend + core + 打包）
 - ✅ **Phase 1.5** 隔离沙箱（Xephyr 虚拟屏默认隔离 + 私有 AT-SPI 总线 + `launch_app`，宿主零干扰）
 - ⬜ **Phase 2** 精度加固 + token 优化（树 diff、uinput、焦点处理）
-- ⬜ **Phase 3** Windows backend（UIA + SendInput）
+- ✅ **Phase 3** Windows backend（UIA + 元素级动作 + `PrintWindow` 抓屏 + 隐藏桌面隔离 +
+  `Windows.Media.Ocr`）。⚠️ 按窗口抓屏走 `PrintWindow`，**不是** `SendInput`；
+  坐标点击在隔离模式下**刻意拒绝**（见第四节）
 - ⬜ **Phase 4** 视觉解析 + 进一步的灰区兜底
 
 ---

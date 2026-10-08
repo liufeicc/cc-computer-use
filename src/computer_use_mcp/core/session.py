@@ -38,6 +38,7 @@ import sys
 from typing import Any
 
 from .session_types import (  # noqa: F401  —— 再导出，调用方一律 `from .. import session`
+    COORDINATE_INPUT,
     OP_CAPTURE,
     OP_INJECT,
     OP_INJECT_GLOBAL,
@@ -256,7 +257,7 @@ class WindowsDesktopSession:
             #   · 放开档：能力有了（故 unimplemented 为空），代价是用户的安全没了
             #     （input_isolated=False）—— 报的是**他失去了什么**。
             #   两个轴各自如实，合起来才是一句完整的话：没有"能力又全、又安全"的那一档。
-            unimplemented=("coordinate_input",) if (iso and not allowed) else (),
+            unimplemented=(COORDINATE_INPUT,) if (iso and not allowed) else (),
             notes=tuple(notes),
         )
 
